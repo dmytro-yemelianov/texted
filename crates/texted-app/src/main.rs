@@ -979,6 +979,7 @@ fn main() {
 
                     let is_ctrl_or_cmd = current_modifiers.control_key() || current_modifiers.super_key();
                     let is_alt = current_modifiers.alt_key();
+                    let is_shift = current_modifiers.shift_key();
 
                     let matches_key = |target_code: KeyCode, target_char: char| -> bool {
                         if let PhysicalKey::Code(code) = physical_key {
@@ -1288,64 +1289,155 @@ fn main() {
                         }
                     }
 
-                    // 3. Document Navigation: Arrows accepting Cmd / Option modifiers
+                    // 3. Document Navigation: Arrows accepting Cmd / Option / Shift modifiers
                     match logical_key {
                         Key::Named(NamedKey::Escape) => {
                             selection.mode = SelectionMode::None;
+                            window.request_redraw();
+                            return;
                         }
-                        Key::Named(NamedKey::ArrowLeft) => {
-                            selection.mode = SelectionMode::None;
-                            if is_ctrl_or_cmd {
-                                let _ = buffer_client.send(BufferRequest::MoveHome); // Cmd+Left: Line start
-                            } else if is_alt {
-                                let _ = buffer_client.send(BufferRequest::MoveWordLeft); // Opt+Left: Word left
-                            } else {
-                                let _ = buffer_client.send(BufferRequest::MoveLeft);
-                            }
-                        }
-                        Key::Named(NamedKey::ArrowRight) => {
-                            selection.mode = SelectionMode::None;
-                            if is_ctrl_or_cmd {
-                                let _ = buffer_client.send(BufferRequest::MoveEnd); // Cmd+Right: Line end
-                            } else if is_alt {
-                                let _ = buffer_client.send(BufferRequest::MoveWordRight); // Opt+Right: Word right
-                            } else {
-                                let _ = buffer_client.send(BufferRequest::MoveRight);
-                            }
-                        }
-                        Key::Named(NamedKey::ArrowUp) => {
-                            selection.mode = SelectionMode::None;
-                            if is_ctrl_or_cmd {
-                                let _ = buffer_client.send(BufferRequest::SetCursorOffset(0)); // Cmd+Up: Doc start
-                            } else if is_alt {
-                                for _ in 0..5 {
+                        Key::Named(NamedKey::ArrowLeft)
+                        | Key::Named(NamedKey::ArrowRight)
+                        | Key::Named(NamedKey::ArrowUp)
+                        | Key::Named(NamedKey::ArrowDown)
+                        | Key::Named(NamedKey::Home)
+                        | Key::Named(NamedKey::End)
+                        | Key::Named(NamedKey::PageUp)
+                        | Key::Named(NamedKey::PageDown) => {
+                            // 1. Shift+Option+Up/Down: Block/Column Selection Mode
+                            if is_shift && is_alt && (matches!(logical_key, Key::Named(NamedKey::ArrowUp)) || matches!(logical_key, Key::Named(NamedKey::ArrowDown))) {
+                                if selection.mode != SelectionMode::Block {
+                                    if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                        let (cur_l, cur_c) = TextBuffer::offset_to_line_col_str(&snap.content, snap.cursor_offset);
+                                        selection.mode = SelectionMode::Block;
+                                        selection.anchor_line = cur_l;
+                                        selection.anchor_col = cur_c;
+                                        selection.active_line = cur_l;
+                                        selection.active_col = cur_c;
+                                    }
+                                }
+                                if matches!(logical_key, Key::Named(NamedKey::ArrowUp)) {
+                                    selection.active_line = selection.active_line.saturating_sub(1);
                                     let _ = buffer_client.send(BufferRequest::MoveUp);
-                                }
-                            } else {
-                                let _ = buffer_client.send(BufferRequest::MoveUp);
-                            }
-                        }
-                        Key::Named(NamedKey::ArrowDown) => {
-                            selection.mode = SelectionMode::None;
-                            if is_ctrl_or_cmd {
-                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                    let _ = buffer_client.send(BufferRequest::SetCursorOffset(snap.total_bytes)); // Cmd+Down: Doc end
-                                }
-                            } else if is_alt {
-                                for _ in 0..5 {
+                                } else {
+                                    selection.active_line += 1;
                                     let _ = buffer_client.send(BufferRequest::MoveDown);
                                 }
-                            } else {
-                                let _ = buffer_client.send(BufferRequest::MoveDown);
+                                window.request_redraw();
+                                return;
                             }
-                        }
-                        Key::Named(NamedKey::Home) => {
-                            selection.mode = SelectionMode::None;
-                            let _ = buffer_client.send(BufferRequest::MoveHome);
-                        }
-                        Key::Named(NamedKey::End) => {
-                            selection.mode = SelectionMode::None;
-                            let _ = buffer_client.send(BufferRequest::MoveEnd);
+
+                            // 2. Stream Range Selection via Shift
+                            if is_shift {
+                                if selection.mode != SelectionMode::Stream {
+                                    if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                        let (cur_l, cur_c) = TextBuffer::offset_to_line_col_str(&snap.content, snap.cursor_offset);
+                                        selection.mode = SelectionMode::Stream;
+                                        selection.anchor_line = cur_l;
+                                        selection.anchor_col = cur_c;
+                                        selection.active_line = cur_l;
+                                        selection.active_col = cur_c;
+                                    }
+                                }
+                            } else {
+                                // If Shift is NOT held, collapse any existing Stream selection
+                                if selection.mode == SelectionMode::Stream {
+                                    if matches!(logical_key, Key::Named(NamedKey::ArrowLeft)) && !is_ctrl_or_cmd && !is_alt {
+                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
+                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                            let _ = buffer_client.send(BufferRequest::SetCursorOffset(off_a.min(off_b)));
+                                        }
+                                        selection.mode = SelectionMode::None;
+                                        window.request_redraw();
+                                        return;
+                                    } else if matches!(logical_key, Key::Named(NamedKey::ArrowRight)) && !is_ctrl_or_cmd && !is_alt {
+                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
+                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                            let _ = buffer_client.send(BufferRequest::SetCursorOffset(off_a.max(off_b)));
+                                        }
+                                        selection.mode = SelectionMode::None;
+                                        window.request_redraw();
+                                        return;
+                                    }
+                                }
+                                selection.mode = SelectionMode::None;
+                            }
+
+                            // 3. Movement execution
+                            match logical_key {
+                                Key::Named(NamedKey::ArrowLeft) => {
+                                    if is_ctrl_or_cmd {
+                                        let _ = buffer_client.send(BufferRequest::MoveHome); // Cmd+Left: Line start
+                                    } else if is_alt {
+                                        let _ = buffer_client.send(BufferRequest::MoveWordLeft); // Opt+Left: Word left
+                                    } else {
+                                        let _ = buffer_client.send(BufferRequest::MoveLeft);
+                                    }
+                                }
+                                Key::Named(NamedKey::ArrowRight) => {
+                                    if is_ctrl_or_cmd {
+                                        let _ = buffer_client.send(BufferRequest::MoveEnd); // Cmd+Right: Line end
+                                    } else if is_alt {
+                                        let _ = buffer_client.send(BufferRequest::MoveWordRight); // Opt+Right: Word right
+                                    } else {
+                                        let _ = buffer_client.send(BufferRequest::MoveRight);
+                                    }
+                                }
+                                Key::Named(NamedKey::ArrowUp) => {
+                                    if is_ctrl_or_cmd {
+                                        let _ = buffer_client.send(BufferRequest::SetCursorOffset(0)); // Cmd+Up: Doc start
+                                    } else if is_alt {
+                                        for _ in 0..5 {
+                                            let _ = buffer_client.send(BufferRequest::MoveUp);
+                                        }
+                                    } else {
+                                        let _ = buffer_client.send(BufferRequest::MoveUp);
+                                    }
+                                }
+                                Key::Named(NamedKey::ArrowDown) => {
+                                    if is_ctrl_or_cmd {
+                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                            let _ = buffer_client.send(BufferRequest::SetCursorOffset(snap.total_bytes)); // Cmd+Down: Doc end
+                                        }
+                                    } else if is_alt {
+                                        for _ in 0..5 {
+                                            let _ = buffer_client.send(BufferRequest::MoveDown);
+                                        }
+                                    } else {
+                                        let _ = buffer_client.send(BufferRequest::MoveDown);
+                                    }
+                                }
+                                Key::Named(NamedKey::PageUp) => {
+                                    for _ in 0..15 {
+                                        let _ = buffer_client.send(BufferRequest::MoveUp);
+                                    }
+                                }
+                                Key::Named(NamedKey::PageDown) => {
+                                    for _ in 0..15 {
+                                        let _ = buffer_client.send(BufferRequest::MoveDown);
+                                    }
+                                }
+                                Key::Named(NamedKey::Home) => {
+                                    let _ = buffer_client.send(BufferRequest::MoveHome);
+                                }
+                                Key::Named(NamedKey::End) => {
+                                    let _ = buffer_client.send(BufferRequest::MoveEnd);
+                                }
+                                _ => {}
+                            }
+
+                            // 4. Update active head of selection if Shift is held
+                            if is_shift {
+                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                    let (cur_l, cur_c) = TextBuffer::offset_to_line_col_str(&snap.content, snap.cursor_offset);
+                                    selection.active_line = cur_l;
+                                    selection.active_col = cur_c;
+                                }
+                            }
+                            window.request_redraw();
+                            return;
                         }
                         Key::Named(NamedKey::Backspace) => {
                             if selection.mode == SelectionMode::Block {
@@ -1713,28 +1805,30 @@ fn main() {
 
                         let lines: Vec<&str> = snap.content.split('\n').collect();
 
-                        for l_idx in s_line..=e_line {
-                            for v_line in &layout.visible_lines {
-                                if v_line.line_index == l_idx {
-                                    let row_y = v_line.y_px as usize;
-                                    let line_len = lines.get(l_idx).map(|l| l.chars().count()).unwrap_or(0);
+                        if (s_line, s_col) != (e_line, e_col) {
+                            for l_idx in s_line..=e_line {
+                                for v_line in &layout.visible_lines {
+                                    if v_line.line_index == l_idx {
+                                        let row_y = v_line.y_px as usize;
+                                        let line_len = lines.get(l_idx).map(|l| l.chars().count()).unwrap_or(0);
 
-                                    let from_c = if l_idx == s_line { s_col } else { 0 };
-                                    let to_c = if l_idx == e_line { e_col } else { line_len };
+                                        let from_c = if l_idx == s_line { s_col } else { 0 };
+                                        let to_c = if l_idx == e_line { e_col } else { line_len };
 
-                                    let sel_x = text_start_x + (from_c as f32 * font_engine.char_width_px).round() as usize;
-                                    let sel_w = (((to_c.saturating_sub(from_c)) as f32 * font_engine.char_width_px).round() as usize).max(4);
+                                        let sel_x = text_start_x + (from_c as f32 * font_engine.char_width_px).round() as usize;
+                                        let sel_w = (((to_c.saturating_sub(from_c)) as f32 * font_engine.char_width_px).round() as usize).max(4);
 
-                                    draw_rect(
-                                        &mut buffer,
-                                        width,
-                                        height,
-                                        sel_x,
-                                        row_y + 2,
-                                        sel_w,
-                                        font_engine.line_height_px as usize,
-                                        COLOR_SELECTION,
-                                    );
+                                        draw_rect(
+                                            &mut buffer,
+                                            width,
+                                            height,
+                                            sel_x,
+                                            row_y + 2,
+                                            sel_w,
+                                            font_engine.line_height_px as usize,
+                                            COLOR_SELECTION,
+                                        );
+                                    }
                                 }
                             }
                         }
