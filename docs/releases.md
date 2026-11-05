@@ -42,8 +42,8 @@ Update the workspace Cargo version, refresh the lockfile if necessary, commit al
 
 ```sh
 # The tag must exactly match the Cargo version, including any prerelease suffix.
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The tagged source is tested and packaged again before publication. A mismatched tag fails before delivery. Rerunning the tag workflow updates the existing release assets.

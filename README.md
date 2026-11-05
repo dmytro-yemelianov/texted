@@ -13,7 +13,7 @@ cargo run --release --bin texted -- path/to/file.txt
 cargo run --release --bin texted
 ```
 
-The current GUI uses macOS fonts and `pbcopy`/`pbpaste`. Running without a path opens a demonstration document. Saving an untitled document writes `note.txt` in the working directory.
+The current GUI uses macOS fonts and `pbcopy`/`pbpaste`. Running without a path opens an empty document. Open and Save As use native macOS dialogs. Opening another file, creating a document or quitting prompts to save unsaved edits. Files can also be dropped onto the window or opened through Finder's Open With menu; Texted edits one document at a time.
 
 ## Implementation
 
@@ -21,7 +21,7 @@ The current GUI uses macOS fonts and `pbcopy`/`pbpaste`. Running without a path 
 - `texted-kernel`: typed blocking request/reply channels and a separate FIFO notification channel preferred over requests. The buffer server blocks while idle. Document edits use one ordered request channel.
 - `texted-layout`: reads only visible rope slices; wrapping, caret placement, hit-testing, and highlight clipping share the same visual-row geometry. The viewport stores a physical top line and a wrapped subrow, so scrolling does not reflow preceding document lines.
 - `texted-io`: streaming UTF-8 loading, internal LF normalization, BOM/newline metadata, and buffered atomic saves through a unique sibling file. Saves flush and sync the file and, on Unix, its parent directory. Existing permissions are preserved.
-- `texted-app`: winit/softbuffer shell; glyph caching and drawing live in `graphics.rs`. Search and replacements run on snapshots in background threads. Replacement commits reject a changed document/cursor. Saves also run in the background.
+- `texted-app`: winit/softbuffer shell; glyph caching and drawing live in `graphics.rs`. Search and replacements run on snapshots in background threads. Replacement commits reject a changed document/cursor. Native dialogs are asynchronous; file loading and saving run in background workers. The saved rope root tracks unsaved edits, including undo back to the saved state.
 
 Snapshots do not flatten the document. Search streams across rope chunks. The unused GPU quad prototype and service registry were removed; there is currently no GPU atlas, renderer supervisor, or memory-mapped document backing.
 
@@ -31,7 +31,10 @@ Snapshots do not flatten the document. Search streams across rope chunks. The un
 |---|---|
 | Copy / cut / paste | Cmd+C / Cmd+X / Cmd+V |
 | Undo / redo | Cmd+Z / Cmd+Shift+Z |
+| New / open | Cmd+N / Cmd+O |
 | Save | Cmd+S |
+| Save As | Cmd+Shift+S |
+| Close / quit | Cmd+W / Cmd+Q |
 | Find / replace | Cmd+F / Cmd+R |
 | Next / previous match | Cmd+G / Cmd+Shift+G |
 | Toggle wrapping | Option+Z |

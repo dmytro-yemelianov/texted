@@ -21,7 +21,12 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+mod documents;
 mod graphics;
+mod native_macos;
+use documents::{Action as DocumentAction, Documents, Effect as DocumentEffect};
+#[derive(Debug, Clone)]
+pub struct AppEvent(DocumentAction);
 mod horizontal_scroll;
 use graphics::{draw_box, draw_rect, FontEngine};
 use horizontal_scroll::{HorizontalScroll, BAR_HEIGHT};
@@ -29,11 +34,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use texted_buffer::{BufferSnapshot, TextBuffer};
-use texted_io::{IoManager, LineEnding};
+use texted_io::LineEnding;
 use texted_kernel::{ChannelEvent, ChannelPair, CH_BUFFER};
 use texted_layout::{LayoutEngine, ViewportConfig};
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoop};
+use winit::event_loop::{ControlFlow, EventLoopBuilder};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::WindowBuilder;
 
@@ -41,6 +46,8 @@ use winit::window::WindowBuilder;
 #[derive(Debug)]
 pub enum BufferRequest {
     Shutdown,
+    BreakUndoGroup,
+    LoadDocument(ropey::Rope),
     Insert {
         offset: usize,
         text: String,
@@ -430,70 +437,34 @@ fn main() {
             return;
         }
         Some("--help" | "-h") => {
-            println!("Texted {}\nUsage: texted [FILE]\n       texted --version\n\nOpen FILE as plain UTF-8 text. Without FILE, open a demonstration document.",env!("CARGO_PKG_VERSION"));
+            println!("Texted {}\nUsage: texted [FILE]\n       texted --version\n\nOpen FILE as plain UTF-8 text. Without FILE, open an empty document.",env!("CARGO_PKG_VERSION"));
             return;
         }
         _ => {}
     }
 
-    let event_loop = EventLoop::new().expect("Failed to initialize winit EventLoop");
+    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event()
+        .build()
+        .expect("Failed to initialize winit EventLoop");
+    native_macos::install(event_loop.create_proxy())
+        .expect("Could not install native document callbacks");
 
     let initial_path = std::env::args().nth(1).map(PathBuf::from);
-    let window_title = match &initial_path {
-        Some(p) => format!(
-            "{} - Texted",
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("document.txt")
-        ),
-        None => "Untitled - Texted".to_string(),
-    };
-
+    let window_title = "Untitled - Texted";
     let window = Arc::new(
         WindowBuilder::new()
-            .with_title(&window_title)
+            .with_title(window_title)
             .with_inner_size(winit::dpi::LogicalSize::new(980.0, 700.0))
             .build(&event_loop)
             .expect("Failed to create application window"),
     );
 
-    // Initial content with full Ukrainian support & demonstration
-    let (initial_content, active_path, file_bom, file_ending) = if let Some(ref path) = initial_path
-    {
-        match IoManager::open_file(path) {
-            Ok(doc) => (
-                doc.content,
-                Some(path.clone()),
-                doc.has_bom,
-                doc.line_ending,
-            ),
-            Err(error) => {
-                eprintln!("Cannot open {}: {error}", path.display());
-                return;
-            }
-        }
-    } else {
-        let sample = "Вітаємо у Texted! (Welcome to Texted!)\n\n\
-Ультра-швидкий мінімальний текстовий редактор на основі мікроядра QNX.\n\
-Повна підтримка української мови: Привіт, світе! Їжак, Євген, Ґрунт, Ігор.\n\n\
-Гарячі клавіші та навігація:\n\
-  - Opt+Left / Opt+Right: Перехід за словами\n\
-  - Cmd+Left / Cmd+Right: На початок / в кінець рядка\n\
-  - Cmd+Up / Cmd+Down: На початок / в кінець документа\n\
-  - Opt+Backspace: Видалити попереднє слово\n\
-  - Cmd+Backspace: Видалити до початку рядка\n\
-  - Alt+Z: Увімкнути/вимкнути перенесення рядків (Word Wrap)\n\
-  - Cmd+F: Знайти (з кнопками [< Попер.] та [Наступн. >])\n\
-  - Cmd+G / Cmd+Shift+G: Наступний / попередній збіг\n\
-  - Cmd+R: Знайти та замінити (Replace)\n\
-  - Cmd+B (або Alt+перетягування): Блочне прямокутне виділення\n\
-  - Cmd+A: Виділити все\n\
-  - Cmd+C / Cmd+V: Копіювати / Вставити\n\
-  - Cmd+Z / Cmd+Shift+Z: Undo / Redo\n\
-  - Cmd+S: Зберегти файл атомарно\n\n\
-Спробуйте затиснути Alt/Option та виділити стовпчик мишею, або натисніть Cmd+F для пошуку!\n";
-        (sample.into(), None, false, LineEnding::Lf)
-    };
+    let initial_content = ropey::Rope::new();
+    let mut documents = Documents::new(initial_content.clone(), None, false, LineEnding::Lf);
+    let mut file_actions = std::collections::VecDeque::new();
+    if let Some(path) = initial_path {
+        file_actions.push_back(DocumentAction::OpenPath(path));
+    }
 
     // 1. Initialize Microkernel Channels (QNX ChannelCreate)
     let buffer_channel: ChannelPair<BufferRequest, BufferResponse> = ChannelPair::new(CH_BUFFER);
@@ -511,6 +482,14 @@ fn main() {
                 match event {
                     ChannelEvent::Pulse(_) => {}
                     ChannelEvent::Message(req) => match req.payload {
+                        BufferRequest::BreakUndoGroup => {
+                            buffer.break_undo_group();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::LoadDocument(ref text) => {
+                            buffer.load_document(text.clone());
+                            req.reply(BufferResponse::Success);
+                        }
                         BufferRequest::Shutdown => {
                             req.reply(BufferResponse::Success);
                             break;
@@ -659,7 +638,6 @@ fn main() {
     let mut current_modifiers = ModifiersState::empty();
     let mut last_caret_blink = Instant::now();
     let mut caret_visible = true;
-    let mut current_file_path = active_path;
 
     // Viewport auto-scroll pacing: decoupled from passive mouse scrolling
     let mut snap_to_cursor_needed = false;
@@ -684,7 +662,6 @@ fn main() {
 
     let shutdown_client = buffer_client.clone();
     let mut last_present: Option<Instant> = None;
-    let mut save_result: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>> = None;
     let _ = event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::WaitUntil(
             if search_state.pending || search_state.mutation.is_some() {
@@ -697,18 +674,12 @@ fn main() {
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::CloseRequested => {
-                    if let Some(rx) = search_state.mutation.take() {
-                        let _ = rx.recv();
-                    }
-                    if let Some(rx) = save_result.take() {
-                        if let Ok(Err(error)) = rx.recv() {
-                            eprintln!("Save failed: {error}");
-                            window.set_title(&format!("Save failed: {error} - Texted"));
-                            return;
-                        }
-                    }
-                    let _ = buffer_client.send(BufferRequest::Shutdown);
-                    elwt.exit();
+                    file_actions.push_back(DocumentAction::Close);
+                    window.request_redraw();
+                }
+                WindowEvent::DroppedFile(path) => {
+                    file_actions.push_back(DocumentAction::OpenPath(path));
+                    window.request_redraw();
                 }
                 WindowEvent::ModifiersChanged(mods) => {
                     current_modifiers = mods.state();
@@ -757,6 +728,9 @@ fn main() {
                     window.request_redraw();
                 }
                 WindowEvent::CursorMoved { position, .. } => {
+                    if documents.locked() {
+                        return;
+                    }
                     last_mouse_pos = (position.x as f32, position.y as f32);
 
                     if let Some(bar) = current_scrollbar {
@@ -894,6 +868,9 @@ fn main() {
                     button: MouseButton::Left,
                     ..
                 } => {
+                    if documents.locked() {
+                        return;
+                    }
                     if state == ElementState::Released && horizontal.end_drag() {
                         window.request_redraw();
                         return;
@@ -1134,6 +1111,9 @@ fn main() {
                         },
                     ..
                 } => {
+                    if documents.locked() {
+                        return;
+                    }
                     caret_visible = true;
                     last_caret_blink = Instant::now();
                     snap_to_cursor_needed = true; // Key input centers/snaps viewport to caret
@@ -1423,31 +1403,23 @@ fn main() {
                             };
                             window.request_redraw();
                             return;
+                        } else if matches_key(KeyCode::KeyO, 'o') {
+                            file_actions.push_back(DocumentAction::OpenDialog);
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyN, 'n') {
+                            file_actions.push_back(DocumentAction::New);
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyQ, 'q') || matches_key(KeyCode::KeyW, 'w')
+                        {
+                            file_actions.push_back(DocumentAction::Close);
+                            window.request_redraw();
+                            return;
                         } else if matches_key(KeyCode::KeyS, 's') {
-                            if let Ok(BufferResponse::Snapshot(snap)) =
-                                buffer_client.send(BufferRequest::GetSnapshot)
-                            {
-                                let save_path = current_file_path
-                                    .clone()
-                                    .unwrap_or_else(|| PathBuf::from("note.txt"));
-                                if save_result.is_none() {
-                                    let (tx, rx) = std::sync::mpsc::channel();
-                                    save_result = Some(rx);
-                                    let save_window = window.clone();
-                                    thread::spawn(move || {
-                                        let result = IoManager::save_rope(
-                                            &save_path,
-                                            &snap.content,
-                                            file_bom,
-                                            file_ending,
-                                        )
-                                        .map(|()| save_path)
-                                        .map_err(|e| e.to_string());
-                                        let _ = tx.send(result);
-                                        save_window.request_redraw();
-                                    });
-                                }
-                            }
+                            file_actions.push_back(DocumentAction::Save {
+                                save_as: current_modifiers.shift_key(),
+                            });
                             window.request_redraw();
                             return;
                         }
@@ -2012,19 +1984,6 @@ fn main() {
                         }
                         search_state.mutation = None;
                     }
-                    if let Some(result) = save_result.as_ref().and_then(|rx| rx.try_recv().ok()) {
-                        match result {
-                            Ok(path) => {
-                                window.set_title(&format!("{} - Texted", path.display()));
-                                current_file_path = Some(path);
-                            }
-                            Err(error) => {
-                                eprintln!("Save failed: {error}");
-                                window.set_title(&format!("Save failed: {error} - Texted"));
-                            }
-                        }
-                        save_result = None;
-                    }
                     let size = window.inner_size();
                     if size.width == 0 || size.height == 0 {
                         return;
@@ -2082,6 +2041,7 @@ fn main() {
                             snap_to_cursor_needed = true;
                         }
                     }
+                    window.set_title(&documents.title(&snap));
                     let (cur_line, cur_col) = snap.offset_to_line_col(snap.cursor_offset);
 
                     // 2. Viewport auto-scrolling: only triggered on keyboard interaction, decoupled from mouse scrolling
@@ -2736,8 +2696,8 @@ fn main() {
                         status_mode,
                         wrap_text,
                         snap.total_bytes,
-                        if file_bom { "UTF-8 BOM" } else { "UTF-8" },
-                        if file_ending == LineEnding::Crlf {
+                        if documents.bom { "UTF-8 BOM" } else { "UTF-8" },
+                        if documents.ending == LineEnding::Crlf {
                             "CRLF"
                         } else {
                             "LF"
@@ -2885,7 +2845,52 @@ fn main() {
                 }
                 _ => {}
             },
+            Event::UserEvent(AppEvent(action)) => {
+                file_actions.push_back(action);
+                window.request_redraw();
+            }
             Event::AboutToWait => {
+                // Finish an already requested replacement before inspecting dirty state or
+                // replacing/closing its document. RedrawRequested drains its result.
+                if let (None, Ok(BufferResponse::Snapshot(snap))) = (
+                    &search_state.mutation,
+                    buffer_client.send(BufferRequest::GetSnapshot),
+                ) {
+                    let mut effect = documents.poll(&snap, &buffer_client, &window);
+                    if matches!(effect, DocumentEffect::None) {
+                        if let Some(action) = file_actions.pop_front() {
+                            effect = documents.handle(action, &snap, &buffer_client, &window);
+                        }
+                    }
+                    match effect {
+                        DocumentEffect::Close => {
+                            let _ = buffer_client.send(BufferRequest::Shutdown);
+                            elwt.exit();
+                            return;
+                        }
+                        DocumentEffect::Install(document) => {
+                            documents.installed(&document);
+                            let _ =
+                                buffer_client.send(BufferRequest::LoadDocument(document.content));
+                            top_line = 0;
+                            top_wrap_row = 0;
+                            current_view = None;
+                            horizontal.reset();
+                            current_scrollbar = None;
+                            selection = SelectionState::default();
+                            search_state = SearchState::default();
+                            is_mouse_dragging = false;
+                            click_count = 0;
+                            word_drag_anchor = None;
+                            line_drag_anchor = None;
+                            snap_to_cursor_needed = true;
+                            caret_visible = true;
+                            last_caret_blink = Instant::now();
+                            window.request_redraw();
+                        }
+                        DocumentEffect::None => {}
+                    }
+                }
                 if search_state.pending
                     || search_state.mutation.is_some()
                     || last_caret_blink.elapsed() >= Duration::from_millis(500)

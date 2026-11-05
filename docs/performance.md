@@ -8,7 +8,7 @@ Rendering no longer materializes a whole-document `String` or `Vec<&str>`. Index
 
 Replace All and Replace Next preserve undo and valid UTF-8 cursor boundaries. Background replacements commit only when their base revision and cursor still match. Search results are revision/query checked, and highlights visit visible matches/rows. Search uses streaming KMP across rope chunks.
 
-File loading streams into a rope and normalizes CRLF across input buffer boundaries. Atomic saves preserve BOM, requested line endings, trailing-newline count and existing permissions. File-open failures abort rather than exposing a blank document associated with the unreadable path. Save errors are surfaced in the window title and stderr.
+File loading streams into a rope and normalizes CRLF across input buffer boundaries. Atomic saves preserve BOM, requested line endings, trailing-newline count and existing permissions. File-open failures retain the current document. Open and save errors appear in native dialogs and stderr.
 
 The buffer server now sleeps on its channel, and the GUI waits for input or the next caret deadline instead of polling every 16 ms. Search, replacement computation and saving do not run on the UI thread. Ordered edit requests avoid reordering text pulses around navigation requests.
 
@@ -39,3 +39,7 @@ Final validation: 29 unit tests pass, formatting passes, Clippy passes with warn
 
 
 Horizontal scrolling follow-up: the viewport now shares its first visible character column across rendering, caret, mouse hit-testing and selection/search highlights. Trackpad deltas accumulate below a character cell; Shift+wheel redirects the vertical axis. The scrollbar supports thumb dragging and page clicks, clamps after resizing or deletion, and disappears when wrapping is enabled. Native GUI checks covered horizontal wheel scrolling, Cmd+Right caret tracking, scrollbar dragging, and clicking Ukrainian text after a horizontal offset. Model/layout tests also cover Shift routing, stale width results, short lines and wrap mode ignoring the horizontal offset.
+
+File workflow follow-up (v0.2): native Open and Save As sheets run asynchronously on the main thread; loading and saving run in workers. New, open, drop, close and quit share the Save/Discard/Cancel guard. A successful save records the exact written rope root, so edits made during a save remain dirty and undo can return to a clean saved state. Saves break typing groups; installing a document clears history and increments the revision to reject results from the old document. Pending replacement commits finish before lifecycle actions inspect dirty state.
+
+Validation for the file workflow: 40 Rust tests and two packaging tests pass, with formatting and Clippy warnings denied. Packaged-app GUI checks covered Open, Save As, Cancel retaining dirty edits, Discard creating an empty document, and Save on quit. The quit/save check preserved the temporary document's BOM and CRLF bytes exactly. Universal ZIP/DMG packaging and integrity checks pass locally. Finder Open With and drag/drop still need a manual end-to-end check.

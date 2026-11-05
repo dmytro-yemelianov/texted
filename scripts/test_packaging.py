@@ -16,6 +16,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
         self.assertEqual(info["TextedVersion"], "0.1.0-preview.1")
         self.assertEqual(info["CFBundleExecutable"], "texted")
+        self.assertEqual(info["CFBundleDocumentTypes"][0]["LSHandlerRank"], "Alternate")
         self.assertEqual(info["LSMinimumSystemVersion"], package_macos.MINIMUM_MACOS)
         self.assertEqual(plistlib.loads(plistlib.dumps(info)), info)
         with self.assertRaises(ValueError):
