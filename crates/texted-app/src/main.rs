@@ -1029,11 +1029,6 @@ fn main() {
                                     if search_state.active_field == 0 {
                                         search_state.find_query.push_str(&clip);
                                         update_search_matches(&buffer_client, &mut search_state);
-                                        find_next_match(
-                                            &buffer_client,
-                                            &mut search_state,
-                                            &mut selection,
-                                        );
                                     } else {
                                         search_state.replace_query.push_str(&clip);
                                     }
@@ -1292,13 +1287,6 @@ fn main() {
                                 if search_state.active_field == 0 {
                                     search_state.find_query.pop();
                                     update_search_matches(&buffer_client, &mut search_state);
-                                    if !search_state.find_query.is_empty() {
-                                        find_next_match(
-                                            &buffer_client,
-                                            &mut search_state,
-                                            &mut selection,
-                                        );
-                                    }
                                 } else {
                                     search_state.replace_query.pop();
                                 }
@@ -1314,11 +1302,6 @@ fn main() {
                                                 update_search_matches(
                                                     &buffer_client,
                                                     &mut search_state,
-                                                );
-                                                find_next_match(
-                                                    &buffer_client,
-                                                    &mut search_state,
-                                                    &mut selection,
                                                 );
                                             } else {
                                                 search_state.replace_query.push(ch);
