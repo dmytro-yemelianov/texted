@@ -1,162 +1,54 @@
-> Updated 2026-11-05: the implementation changed substantially after this handover. Start with [README](README.md) and [audit follow-up](docs/performance.md). The Piece Table, renderer crate and diagnostics descriptions below are historical.
+# Texted handover — 2026-11-05
 
-# Texted — Agent Handover Document
+Start with [README](README.md), the [hardening results](docs/performance-hardening-results.md), and the [spec/plan](docs/performance-hardening-plan.md). The original design in `HANDOVER.md` and `docs/design-spec.md` is historical: the current buffer is Ropey, the GUI renderer is wgpu/Metal, and the GUI transport is asynchronous.
 
-> [!NOTE]
-> This document serves as a complete briefing and architectural reference for any AI agent or developer continuing work on **Texted**. It outlines the project vision, microkernel architecture, recent implementations, test suite, and upcoming milestones.
+## Current work and delivery
 
----
+`main` still represents the public v0.1 release. The native-file and GPU branches precede the stacked hardening PRs: [3](https://github.com/dmytro-yemelianov/texted/pull/3) → [4](https://github.com/dmytro-yemelianov/texted/pull/4) → [5](https://github.com/dmytro-yemelianov/texted/pull/5) → `feat/editor-hardening`. Review/merge the stack in dependency order. Each PR's Checks and Universal macOS delivery jobs provide the current validation and artifacts. Do not claim an untagged branch is the public release.
 
-## 1. Project Overview & Philosophy
+A0–A11 are implemented. The results document records reference-machine CPU percentiles, deterministic work/memory/ordering gates and native acceptance evidence. No tag or release was created for the hardening work.
 
-**Texted** is an ultra-fast, minimal, crash-resilient text editor written in **Rust**, inspired by the microkernel architecture of **QNX**. Unlike traditional monolithic text editors where UI, document buffers, and layout engines share direct memory and thread execution, Texted isolates its core buffer engine in an independent server thread communicating strictly via synchronous rendezvous IPC and priority pulses.
+## Component map
 
-```mermaid
-graph TD
-    UI[texted-app GUI Frontend: winit + softbuffer]
-    Kernel[texted-kernel: Synchronous Rendezvous IPC]
-    Buffer[texted-buffer Server Thread: Piece Table Engine]
-    Layout[texted-layout: Viewport Slicing & Word Wrap]
-    Render[texted-render: Font Engine & Pixel Rasterizer]
-    IO[texted-io: Atomic Save & Line Endings]
+| Component | Owner / invariant |
+|---|---|
+| `main.rs`, `app.rs` | Bootstrap and native adaptation/scheduling; no editing algorithms or blocking buffer replies |
+| `input.rs`, `commands.rs` | Physical-key shortcuts and typed intents, windowless |
+| `editing.rs`, `selection.rs`, `mouse.rs` | Canonical editor/drag transitions and selection values; shell mouse state tracks only gestures |
+| `buffer_service.rs` | Sole live-buffer owner; bounded admission, completion watermark, published snapshots and fenced bulk commits |
+| `search.rs`, `search_ui.rs` | Bounded workers/checkpoints/coverage plus UI fields and paste stamps |
+| `clipboard.rs`, `transfers.rs` | Snapshot extraction and child I/O off UI; invocation barrier, write-before-cut and context-fenced completion |
+| `documents.rs`, `file_flow.rs` | Native async sheets, background file I/O, saved-root dirty state, command/clipboard barriers |
+| `viewport.rs`, `texted-layout` | Visible geometry, scrolling, caret, compact search coverage and pure highlight clipping |
+| `editor_view.rs`, `graphics.rs`, `gpu.rs` | Immutable drawing-command preparation, bounded glyph caches, ordered Metal submission |
+| `texted-buffer` | Persistent rope, byte-safe coordinates/history, resumable scanner, streaming replacement planner, local word traversal |
+| `texted-io` | Streaming UTF-8/BOM/CRLF load and atomic save |
+| `texted-kernel` | Reusable request/reply primitives retained for tests/benchmarks; not the GUI transport |
 
-    UI -->|BufferRequest / SetCursorOffset / DeleteRange| Kernel
-    Kernel -->|Rendezvous Send / Reply| Buffer
-    Buffer -->|BufferResponse::Snapshot| Kernel
-    Kernel -->|Immutable BufferSnapshot| UI
-    UI --> Layout
-    UI --> Render
-    Buffer --> IO
+## Contracts to preserve
+
+The UI never owns a mutable live buffer. Read the published immutable snapshot; enqueue typed commands. A successful submit means acceptance, with a later completion. Busy/closed admission returns ownership, and the UI reports rejection. The admission limit is 64 undrained commands. File actions wait for the completion prefix, including an earlier worker that finishes after later ordinary edits.
+
+Bulk plans are isolated snapshots, commit once, undo once, and validate document ID, revision, cursor and selection. Ordinary typing may invalidate a plan; report the conflict and keep the newer edit. Escape cancels pending bulk/clipboard work. A committed operation cannot subsequently become cancelled.
+
+Search owns at most one active job, one latest pending job and one result; query limit is 64 KiB, auxiliary budget 8 MiB, scan cancellation quantum 4 KiB. Do not restore a full-match vector in GUI paths. `find_matches` remains a compatibility/reference helper. Coverage stores viewport cells, not all document offsets. Checkpoints retain non-overlap phase.
+
+Clipboard extraction/transfer runs off-thread, with a five-second deadline and 128 MiB capacity. Cut deletes only after write success and a matching invocation context. Paste fences both document context and search-field serial. Save/close must wait for clipboard continuations as well as buffer commands. Subprocess failures/timeouts must leave the document intact and reap the child.
+
+The saved rope root defines clean state. Cursor motion cannot dirty a file. Saving an older snapshot cannot clean later edits. Loading a document clears history and changes identity. Preserve BOM, LF/CRLF and trailing newlines across saves.
+
+## Verification
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+python3 -m unittest discover -s scripts -p 'test_*.py'
+cargo test --release -p texted-app --bin texted metal_renders_clipping_alpha_and_paint_order -- --ignored
+cargo run --locked --release --bin bench -- --hardening
+python3 scripts/package_macos.py
 ```
 
-### Key Core Invariants
-1. **Microkernel Decoupling**: The GUI thread never mutates buffer state directly; it dispatches `BufferRequest` messages or priority `Pulse` signals across `ChannelClient` to the `TextBuffer` server thread.
-2. **Deterministic Immutability**: Rendering and layout calculations operate strictly on immutable `BufferSnapshot` instances taken per frame.
-3. **Zero Layout Interference**: Cursor navigation, mouse selections, gutter widths, and status bars are mathematically bounded so that extreme scales (e.g. 3,000,000+ lines, 200MB+ documents) never overflow or corrupt visual alignment.
+The reference machine is Apple M5 / macOS 27.2 / Rust 1.88.0. Benchmark data are CPU times, not input-to-display latency; search-owned storage excludes shared rope roots and RSS. See [results](docs/performance-hardening-results.md) for sizes, sample counts and percentiles. Existing GPU preview instances can contain user work: use a separate bundle ID and generated temporary documents for native checks.
 
----
-
-## 2. Workspace Crate Architecture
-
-The workspace is structured into six modular crates:
-
-| Crate | Responsibility | Key Symbols / Modules |
-| :--- | :--- | :--- |
-| [crates/texted-kernel](crates/texted-kernel) | Synchronous IPC rendezvous, priority pulses, channel pairs. | `ChannelPair`, `ChannelServer`, `ChannelClient`, `Pulse`, `PULSE_KEY_INPUT` |
-| [crates/texted-buffer](crates/texted-buffer) | Piece Table document model, UTF-8 char/byte offsets, block operations, search & replace. | `TextBuffer`, `BufferSnapshot`, `BufferRequest`, `BufferResponse`, `Piece` |
-| [crates/texted-layout](crates/texted-layout) | Viewport geometry, visible line slicing, word wrapping, continuation rows. | `LayoutEngine`, `ViewportConfig`, `ViewportLayout`, `VisibleLine`, `Rect` |
-| [crates/texted-render](crates/texted-render) | Software rasterizer, glyph batcher, Ukrainian TTF antialiasing. | `RenderBatcher`, `Quad`, `FontEngine`, `softbuffer` integration |
-| [crates/texted-io](crates/texted-io) | Atomic file persistence (write-temp-and-rename), newline detection. | `IoManager`, `LineEnding` (LF/CRLF), `IoError` |
-| [crates/texted-app](crates/texted-app) | Main GUI executable, event loop, mouse/keyboard state machine, diagnostics HUD. | [main.rs](crates/texted-app/src/main.rs), [bench.rs](crates/texted-app/src/bin/bench.rs), `SelectionState` |
-
----
-
-## 3. Key Subsystems & State Machines
-
-### A. Selection State Machine
-The editor supports two primary selection paradigms:
-1. **Stream Selection (`SelectionMode::Stream`)**: Linear character stream selection across lines.
-2. **Column / Block Selection (`SelectionMode::Block`)**: Rectangular column selection across rows, triggered via `Option + Mouse Drag`, `Cmd + B`, or `Option + Shift + Up/Down`.
-
-```mermaid
-stateDiagram-v2
-    [*] --> None
-    None --> Stream: Mouse Drag / Shift+Arrows
-    None --> Stream: Double Click (Word Anchor)
-    None --> Stream: Triple Click (Line Anchor)
-    None --> Block: Option + Mouse Drag
-    None --> Block: Option+Shift+Up/Down
-    None --> Block: Cmd+B Toggle
-
-    Stream --> None: Single Click / Esc / Arrow Key
-    Block --> None: Single Click / Esc / Cmd+B Toggle
-
-    Stream --> Stream: Mouse Drag (Expands by Word/Line if Anchored)
-    Block --> Block: Mouse Drag with Alt Key
-```
-
-### B. Trackpad Micro-Jitter Immunity & Word/Line Anchoring
-- **Problem**: On macOS trackpads, clicking down emits tiny subpixel `CursorMoved` events before the click is released. Previously, `CursorMoved` unconditionally overwrote `selection.active_col` with `hover_col`, causing double-clicked words or triple-clicked lines to truncate to the exact cursor coordinate.
-- **Solution**:
-  - `word_drag_anchor: Option<(usize, usize, usize)>` stores `(click_line, w_start, w_end)`.
-  - `line_drag_anchor: Option<usize>` stores `click_line`.
-  - Inside `find_word_boundaries(line_str, col)`, word boundaries are classified across alphanumeric characters + `_`, whitespace runs, or punctuation blocks.
-  - While dragging, if the pointer stays within the anchor word/line, the full anchor remains selected. If the pointer moves outside, selection expands discretely by whole words or whole lines.
-
-### C. Dynamic Gutter & Right-Aligned Line Numbers
-- **Problem**: In files with >1,000,000 lines, fixed 58px gutters caused 7-digit line numbers (`3125711`) to spill over the gutter border and overwrite buffer text.
-- **Solution**:
-  - `compute_gutter_metrics(total_lines, show_line_numbers, char_w)` calculates:
-    - `digits = total_lines.max(1).to_string().len().max(3);`
-    - `gutter_w = 10.0 + (digits * char_w) + 10.0;`
-    - `text_start_x = gutter_w + 8.0;`
-  - Line numbers are formatted right-aligned via `format!("{:>width$}", line_idx + 1, width = line_digits)` and rendered with a 10px left pad.
-  - Viewport layout, caret position, mouse click detection, search highlights, and selection rendering are strictly anchored to `text_start_x`.
-
-### D. Keyboard Layout Independence
-- Physical keys are evaluated via `KeyCode` first (e.g. `KeyCode::KeyC`, `KeyCode::KeyV`, `KeyCode::KeyZ`, `KeyCode::KeyA`, `KeyCode::KeyF`, etc.) with fallback to character checking.
-- All shortcuts (`Cmd+C`, `Cmd+V`, `Cmd+Z`, `Cmd+Shift+Z`, `Cmd+S`, `Cmd+A`, `Cmd+F`, `Cmd+R`, `Cmd+G`, `Cmd+B`, `Cmd+L`, `Alt+Z`) operate independently of the selected system input language (Ukrainian, English, etc.).
-
----
-
-## 4. Diagnostics & Benchmark Suite
-
-### A. Real-Time HUD (`F3`)
-Pressing `F3` in the GUI activates a translucent diagnostics overlay in the upper-right corner:
-- **FPS**: Real-time rendering frame rate.
-- **Frame time**: Total frame elapsed time in milliseconds.
-- **Layout time**: Viewport calculation latency in microseconds.
-- **Doc bytes**: Exact document payload size in bytes.
-- **RAM footprint**: Process memory baseline.
-
-### B. Benchmark Binary (`bench.rs`)
-Located in [crates/texted-app/src/bin/bench.rs](crates/texted-app/src/bin/bench.rs), this tool tests:
-1. **IPC Rendezvous Latency**: Roundtrip messaging between client and server threads.
-2. **Piece Table Insertions**: Insertion speed at various buffer offsets.
-3. **Viewport Layout Computation**: Latency of `LayoutEngine::compute_layout` with and without Word Wrap across small and large documents.
-
-To run benchmarks:
-```bash
-cargo run --release --bin bench
-```
-
----
-
-## 5. Development & Testing Commands
-
-### Build & Check
-```bash
-# Type check all crates and benchmarks
-cargo check --all-targets
-
-# Run the complete test suite (11 unit tests across crates)
-cargo test --workspace
-
-# Build the release binary
-cargo build --release
-```
-
-### Running the Editor
-```bash
-# Launch without file (opens empty document)
-./target/release/texted
-
-# Launch with a specific file
-./target/release/texted path/to/document.txt
-```
-
----
-
-## 6. Recommended Next Steps for the Next Agent
-
-> [!TIP]
-> The following areas are high-value improvements planned for upcoming iterations:
-
-1. **Syntax Highlighting Engine**:
-   - Integrate Tree-sitter or syntect into a dedicated highlighting server crate (`texted-syntax`) via asynchronous snapshot queries.
-2. **Memory-Mapped Large File Support**:
-   - For files >500MB, implement memory-mapped read-only pieces in `TextBuffer` to eliminate holding the entire raw string in RAM.
-3. **Multi-Tab / Multi-Buffer Session Support**:
-   - Introduce a tab bar interface or buffer switcher (`Cmd+P` / `Cmd+O`) supported by multiple `ChannelClient` sessions.
-4. **Horizontal Scroll Bar (No-Wrap Mode)**:
-   - When Word Wrap is disabled (`Alt+Z`), implement horizontal panning and scroll tracking.
+Known limits: scalar-character cells rather than grapheme/complex-script shaping; no IME composition; whole-file rope loading rather than mmap; history bounded by transaction count. Very long contiguous words and exact search counts necessarily scan their input. No additional features are part of the completed hardening scope.
