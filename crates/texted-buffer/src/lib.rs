@@ -1,5 +1,6 @@
 //! Persistent UTF-8 rope buffer with shared snapshots and bounded transaction history.
 use ropey::{Rope, RopeSlice};
+pub mod search;
 use std::{
     collections::VecDeque,
     fmt,
