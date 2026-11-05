@@ -1,6 +1,6 @@
 # Hardening acceptance — 2026-11-05
 
-A0–A11 are implemented on `feat/editor-hardening`, stacked after the native-file and GPU changes. The review sequence is [viewport highlights](https://github.com/dmytro-yemelianov/texted/pull/3), [bounded search](https://github.com/dmytro-yemelianov/texted/pull/4), [controller extraction](https://github.com/dmytro-yemelianov/texted/pull/5), then [asynchronous integration](https://github.com/dmytro-yemelianov/texted/tree/feat/editor-hardening). Required ARM/Intel checks and universal artifacts are attached to the corresponding PRs; consult their current checks before merging the stack. These branches do not change the existing public release.
+A0–A11 are implemented and merged into `main`, after the native-file and GPU changes. The review sequence was [viewport highlights](https://github.com/dmytro-yemelianov/texted/pull/3), [bounded search](https://github.com/dmytro-yemelianov/texted/pull/4), [controller extraction](https://github.com/dmytro-yemelianov/texted/pull/5), then [asynchronous integration](https://github.com/dmytro-yemelianov/texted/pull/6). All stages passed ARM/Intel checks and universal delivery before integration. The [v0.2.0 preview](https://github.com/dmytro-yemelianov/texted/releases/tag/v0.2.0) packages the integrated source, with the tag workflow repeating validation before publication.
 
 ## Reference run
 

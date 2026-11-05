@@ -4,9 +4,9 @@ Start with [README](README.md), the [hardening results](docs/performance-hardeni
 
 ## Current work and delivery
 
-`main` still represents the public v0.1 release. The native-file and GPU branches precede the stacked hardening PRs: [3](https://github.com/dmytro-yemelianov/texted/pull/3) → [4](https://github.com/dmytro-yemelianov/texted/pull/4) → [5](https://github.com/dmytro-yemelianov/texted/pull/5) → `feat/editor-hardening`. Review/merge the stack in dependency order. Each PR's Checks and Universal macOS delivery jobs provide the current validation and artifacts. Do not claim an untagged branch is the public release.
+The native-file, GPU and hardening stack ([PRs 1–6](https://github.com/dmytro-yemelianov/texted/pulls?q=is%3Apr+is%3Amerged)) is merged into `main`. The v0.2.0 preview packages this integrated source. See [release delivery](docs/releases.md) and the [release page](https://github.com/dmytro-yemelianov/texted/releases/tag/v0.2.0) for public assets; the tag workflow gates publication on ARM/Intel checks and universal-package verification.
 
-A0–A11 are implemented. The results document records reference-machine CPU percentiles, deterministic work/memory/ordering gates and native acceptance evidence. No tag or release was created for the hardening work.
+A0–A11 are implemented. The [results](docs/performance-hardening-results.md) record reference-machine CPU percentiles, deterministic work/memory/ordering gates and native acceptance evidence. Historical feature branches remain available for tracing the staged changes; new work starts from `main`.
 
 ## Component map
 

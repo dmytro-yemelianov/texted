@@ -12,6 +12,18 @@ Each macOS release contains a universal application for Apple Silicon and Intel:
 
 The build deployment target is macOS 11.0. The workflows execute native tests on macOS 15 on both architectures; older OS versions are not tested by CI. Package metadata records the current ad-hoc signature.
 
+## v0.2.0 preview
+
+[Texted v0.2.0 Preview](https://github.com/dmytro-yemelianov/texted/releases/tag/v0.2.0) integrates PRs #1–#6:
+
+- Native Open/Save As, file drop/Open With handling, and Save/Discard/Cancel guards.
+- Metal rendering with a bounded glyph atlas, shared viewport geometry and horizontal scrolling.
+- Asynchronous buffer commands, bulk edits and clipboard transfer, with ordered save/close barriers and stale-result rejection.
+- Bounded search jobs/checkpoints/coverage, streaming replacement and rope-native word selection.
+- Windowless editing/input controllers and a small native bootstrap/router.
+
+Reference measurements and their limits are in the [hardening acceptance report](performance-hardening-results.md). Text still uses Unicode scalar columns; complex-script/grapheme shaping and IME composition remain future work. Exact search counts scan the document in the background, and file loading builds a complete rope. This version is a preview release.
+
 ## CI/CD
 
 [Build and deliver](https://github.com/dmytro-yemelianov/texted/actions/workflows/build.yml) runs for pull requests, pushes to `main`, version tags and manual dispatches.
