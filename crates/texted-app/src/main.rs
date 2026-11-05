@@ -2857,7 +2857,7 @@ fn main() {
                     buffer_client.send(BufferRequest::GetSnapshot),
                 ) {
                     let mut effect = documents.poll(&snap, &buffer_client, &window);
-                    if matches!(effect, DocumentEffect::None) {
+                    if matches!(effect, DocumentEffect::None) && documents.is_idle() {
                         if let Some(action) = file_actions.pop_front() {
                             effect = documents.handle(action, &snap, &buffer_client, &window);
                         }

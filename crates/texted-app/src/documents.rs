@@ -80,6 +80,10 @@ impl Documents {
     pub fn dirty(&self, snapshot: &BufferSnapshot) -> bool {
         !snapshot.content.is_instance(&self.saved_text)
     }
+    /// Accept external lifecycle actions only after a dialog, worker and its continuation finish.
+    pub fn is_idle(&self) -> bool {
+        self.job.is_none() && self.next.is_none()
+    }
     pub fn locked(&self) -> bool {
         self.job
             .as_ref()
@@ -356,6 +360,19 @@ impl Documents {
 mod tests {
     use super::*;
     use texted_buffer::TextBuffer;
+    #[test]
+    fn actions_wait_for_file_work_and_its_continuation() {
+        let mut doc = Documents::new(Rope::new(), None, false, LineEnding::Lf);
+        assert!(doc.is_idle());
+        let (_tx, rx) = mpsc::channel();
+        doc.job = Some(Job::Save(rx));
+        assert!(!doc.is_idle());
+        doc.next = Some(Action::Close);
+        doc.job = None;
+        assert!(!doc.is_idle());
+        doc.next = None;
+        assert!(doc.is_idle());
+    }
     #[test]
     fn undo_to_saved_root_is_clean_and_cursor_changes_are_not_edits() {
         let mut b = TextBuffer::from_string("original".into());
