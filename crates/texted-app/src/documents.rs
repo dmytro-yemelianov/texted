@@ -19,6 +19,7 @@ pub enum Action {
     OpenPath(PathBuf),
     New,
     Save { save_as: bool },
+    ReportError(String),
     Close,
 }
 pub enum Effect {
@@ -143,6 +144,10 @@ impl Documents {
             self.save(snapshot, save_as, client, window);
             return Effect::None;
         }
+        if let Action::ReportError(message) = action {
+            self.error(window, &message);
+            return Effect::None;
+        }
         if self.dirty(snapshot) {
             let future = Box::pin(
                 rfd::AsyncMessageDialog::new()
@@ -187,7 +192,7 @@ impl Documents {
                 self.open(path, window);
                 Effect::None
             }
-            Action::Save { .. } => unreachable!(),
+            Action::Save { .. } | Action::ReportError(_) => unreachable!(),
         }
     }
     fn open(&mut self, path: PathBuf, window: &Arc<Window>) {
