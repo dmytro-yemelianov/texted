@@ -1,5 +1,6 @@
 //! Viewport-bounded layout and a single coordinate mapping for drawing and input.
 use texted_buffer::BufferSnapshot;
+pub mod search;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ViewportConfig {

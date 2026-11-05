@@ -1,5 +1,8 @@
 //! Persistent UTF-8 rope buffer with shared snapshots and bounded transaction history.
 use ropey::{Rope, RopeSlice};
+pub mod replacement;
+pub mod search;
+pub mod word;
 use std::{
     collections::VecDeque,
     fmt,
@@ -325,23 +328,18 @@ impl TextBuffer {
         self.create_snapshot().find_matches(query)
     }
     pub fn find_next(&self, query: &str, start: usize) -> Option<(usize, usize)> {
-        let matches = self.find_matches(query);
-        let start = self.clamp_byte(start);
-        matches
-            .iter()
-            .copied()
-            .find(|&(a, _)| a >= start)
-            .or_else(|| matches.first().copied())
+        search::SearchSession::new(self.create_snapshot(), query, || false)
+            .ok()?
+            .seek(self.clamp_byte(start), true, || false)
+            .ok()?
+            .map(|m| (m.start, m.end))
     }
     pub fn find_prev(&self, query: &str, start: usize) -> Option<(usize, usize)> {
-        let matches = self.find_matches(query);
-        let start = self.clamp_byte(start);
-        matches
-            .iter()
-            .rev()
-            .copied()
-            .find(|&(a, _)| a < start)
-            .or_else(|| matches.last().copied())
+        search::SearchSession::new(self.create_snapshot(), query, || false)
+            .ok()?
+            .seek(self.clamp_byte(start), false, || false)
+            .ok()?
+            .map(|m| (m.start, m.end))
     }
     pub fn replace_next(
         &mut self,
@@ -349,29 +347,36 @@ impl TextBuffer {
         replacement: &str,
         start: usize,
     ) -> Option<(usize, usize)> {
-        let (a, b) = self.find_next(query, start)?;
-        self.checkpoint();
-        self.replace_range_raw(a, b, replacement);
+        let (a, _) = self.find_next(query, start)?;
+        let plan = replacement::plan(
+            &self.create_snapshot(),
+            query,
+            replacement,
+            false,
+            start,
+            || false,
+        )
+        .ok()??;
+        self.install_replacement(plan);
         Some((a, a + replacement.len()))
     }
     pub fn replace_all(&mut self, query: &str, replacement: &str) -> usize {
-        let matches = self.find_matches(query);
-        if matches.is_empty() {
-            return 0;
-        }
-        let old_cursor = self.cursor_offset;
-        let mut cursor = old_cursor as i128;
-        self.checkpoint();
-        for &(a, b) in matches.iter().rev() {
-            self.replace_range_raw(a, b, replacement);
-            if old_cursor >= b {
-                cursor += replacement.len() as i128 - (b - a) as i128;
-            } else if old_cursor > a {
-                cursor += (a + replacement.len()) as i128 - old_cursor as i128;
+        match replacement::plan(&self.create_snapshot(), query, replacement, true, 0, || {
+            false
+        }) {
+            Ok(Some(plan)) => {
+                let count = plan.count;
+                self.install_replacement(plan);
+                count
             }
+            _ => 0,
         }
-        self.cursor_offset = self.clamp_byte(cursor.max(0) as usize);
-        matches.len()
+    }
+    fn install_replacement(&mut self, plan: replacement::ReplacementPlan) {
+        self.checkpoint();
+        self.text = plan.content;
+        self.cursor_offset = self.clamp_byte(plan.cursor);
+        self.revision = self.revision.wrapping_add(1);
     }
     /// Commit background work only while its base document and cursor are current.
     pub fn commit_snapshot(

@@ -83,6 +83,38 @@ pub fn run(legacy: bool) {
     measure("deep wrapped highlights", 30, || {
         black_box(layout.search_highlights(&snap, &config, snap.revision, &matches, None));
     });
+    for bytes in [2_000_000, 64 * 1024 * 1024] {
+        let snap = TextBuffer::from_string("a".repeat(bytes)).create_snapshot();
+        let config = ViewportConfig {
+            left_col: 1_000_000,
+            ..Default::default()
+        };
+        let layout = LayoutEngine::compute_layout(&snap, &config, None);
+        let (wake, ready) = std::sync::mpsc::sync_channel(1);
+        let mut search = texted_app::search::SearchState::new(move || {
+            let _ = wake.try_send(());
+        });
+        search.find_query = "a".into();
+        measure(&format!("bounded count {bytes} bytes"), 30, || {
+            search.close();
+            search.submit(snap.clone());
+            search.set_view(&snap, &layout);
+            while search.pending {
+                search.poll();
+                if search.pending {
+                    ready
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                }
+            }
+            assert_eq!(search.count, Some(bytes));
+            assert!(search.auxiliary_bytes() < texted_app::search::SEARCH_BUDGET);
+        });
+        println!(
+            "bounded search {bytes} bytes: auxiliary={} B",
+            search.auxiliary_bytes()
+        );
+    }
     let mut source = TextBuffer::from_string(format!("{}\n", "x".repeat(2048)).repeat(10_000));
     let base = source.create_snapshot();
     measure("block insert 10k rows / 2048 chars", 30, || {
@@ -100,6 +132,14 @@ pub fn run(legacy: bool) {
         b.insert(0, &paste);
         black_box(b.create_snapshot());
     });
+    let words = TextBuffer::from_string("x ".repeat(5_000_000)).create_snapshot();
+    for col in [0, 9_999_998] {
+        let b = texted_buffer::word::bounds(words.line(0), col);
+        println!("short word col={col}: inspected={}", b.inspected);
+        measure(&format!("rope-native word col={col}"), 30, || {
+            black_box(texted_buffer::word::bounds(words.line(0), col));
+        });
+    }
     let line = "x ".repeat(5_000_000);
     if legacy {
         measure("legacy short-word whole-line copies", 30, || {
