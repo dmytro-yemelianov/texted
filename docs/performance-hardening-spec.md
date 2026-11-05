@@ -1,6 +1,6 @@
 # Performance and architecture hardening specification
 
-Status: proposed implementation contract. None of the acceptance targets below are claims about the current implementation.
+Status: implemented. See [hardening results](performance-hardening-results.md) for validation evidence and remaining limits. The acceptance criteria below retain the original contract.
 
 Baseline: `af9ef43` (`feat/gpu-renderer`), audited 2026-11-05. Implementation sequence: [hardening plan](performance-hardening-plan.md). Historical measurements and implemented work: [performance notes](performance.md).
 

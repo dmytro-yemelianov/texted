@@ -1,5 +1,4 @@
 //! Single-document file lifecycle. Native sheets are polled on main; file I/O runs on snapshots.
-use crate::{BufferRequest, BufferResponse};
 use ropey::Rope;
 use std::{
     future::Future,
@@ -9,9 +8,9 @@ use std::{
     task::{Context, Poll, Wake, Waker},
     thread,
 };
+use texted_app::buffer_service::{BufferClient, Command};
 use texted_buffer::BufferSnapshot;
 use texted_io::{IoManager, LineEnding, LoadedDocument};
-use texted_kernel::ChannelClient;
 use winit::window::Window;
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -131,7 +130,7 @@ impl Documents {
         &mut self,
         action: Action,
         snapshot: &BufferSnapshot,
-        client: &ChannelClient<BufferRequest, BufferResponse>,
+        client: &BufferClient,
         window: &Arc<Window>,
     ) -> Effect {
         if self.job.is_some() {
@@ -211,10 +210,16 @@ impl Documents {
         &mut self,
         snapshot: &BufferSnapshot,
         save_as: bool,
-        client: &ChannelClient<BufferRequest, BufferResponse>,
+        client: &BufferClient,
         window: &Arc<Window>,
     ) {
-        let _ = client.send(BufferRequest::BreakUndoGroup);
+        if client.submit(Command::BreakUndoGroup).is_err() {
+            self.error(
+                window,
+                "Buffer is busy; save was not accepted. Please retry.",
+            );
+            return;
+        }
         if save_as || self.path.is_none() {
             let mut dialog = rfd::AsyncFileDialog::new()
                 .set_parent(window.as_ref())
@@ -260,7 +265,7 @@ impl Documents {
     pub fn poll(
         &mut self,
         snapshot: &BufferSnapshot,
-        client: &ChannelClient<BufferRequest, BufferResponse>,
+        client: &BufferClient,
         window: &Arc<Window>,
     ) -> Effect {
         if let Some(mut job) = self.job.take() {

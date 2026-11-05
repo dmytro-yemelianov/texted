@@ -1355,6 +1355,7 @@ version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "bytemuck",
+ "crossbeam-channel",
  "font8x8",
  "objc2 0.6.5",
  "pollster",

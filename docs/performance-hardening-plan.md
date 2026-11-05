@@ -1,6 +1,6 @@
 # Performance and architecture hardening plan
 
-Status: proposed; implementation has not started. Specification and acceptance criteria: [hardening spec](performance-hardening-spec.md).
+Status: A0–A11 implemented. See [acceptance results](performance-hardening-results.md) for measurements, checks and delivery links. Specification and acceptance criteria: [hardening spec](performance-hardening-spec.md).
 
 Baseline: `af9ef43`, including the native document workflow and Metal renderer. Rebase onto the accepted baseline as those branches advance and rerun characterization checks after conflicts.
 
@@ -24,6 +24,17 @@ Use small PRs with one reviewable purpose. Fix the measured highlight problem fi
 | 6 | A11: Run integrated acceptance and document results | A1–A10 | Before/after report, universal artifacts and updated architecture notes |
 
 These dependencies allow independent work to be scheduled separately; they do not require parallel agents. Each item starts only when its needed interfaces are stable.
+
+## Delivered stages
+
+| Items | Implementation | Review |
+|---|---|---|
+| A0–A1 | Generated fixtures, visible highlight windows and work counters | [PR 3](https://github.com/dmytro-yemelianov/texted/pull/3) |
+| A2–A5 | Resumable scanner, bounded controller, streaming replacement, local rope word bounds | [PR 4](https://github.com/dmytro-yemelianov/texted/pull/4) |
+| A6–A8 | Windowless selection/editing and key intents, immutable view preparation | [PR 5](https://github.com/dmytro-yemelianov/texted/pull/5) |
+| A8–A11 | Thin shell, asynchronous buffer/clipboard, barriers, acceptance and documentation | [Final hardening branch](https://github.com/dmytro-yemelianov/texted/tree/feat/editor-hardening) |
+
+The detailed work items below retain the original acceptance requirements for review. `buffer_service.rs` replaces the temporary synchronous `buffer_host.rs`; `editing.rs` owns canonical selection transitions and drag anchors, while `selection.rs` owns the value type. No legacy GUI RPC adapter remains.
 
 ## Phase 0 — Reproducible baseline
 

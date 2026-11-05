@@ -1,6 +1,6 @@
 # Implementation audit and follow-up — 2026-11-05
 
-The later audit found remaining off-screen highlight work, unbounded search results, blocking bulk commands, the oversized event loop and whole-line word-selection copies. See the proposed [hardening specification](performance-hardening-spec.md) and [implementation plan](performance-hardening-plan.md). The historical changes below do not establish that all highlight work is currently viewport-bounded.
+The later audit's H1–H5 findings are addressed on `feat/editor-hardening`. Start with the [current results and limits](performance-hardening-results.md), [specification](performance-hardening-spec.md) and [implementation plan](performance-hardening-plan.md). The sections below preserve the earlier audit and delivery history; their test counts and measurements describe those earlier stages.
 
 ## Changes
 
@@ -35,7 +35,7 @@ Snapshot benchmarks can produce zero-duration samples at this timer resolution. 
 
 Regression coverage includes Unicode byte offsets, Replace All history, grouped typing, immutable old snapshots, bounded history, background commit conflicts, randomized edits against a String model, cross-chunk search, CRLF/BOM round-trips and wrapped-row caret/click agreement.
 
-The editor now composites text and rectangles on Metal through wgpu and redraws for caret blink. Layout and cache-miss font rasterization remain on the CPU. Plain scalar-character columns are not grapheme/complex-script layout. Loading still parses the complete file into a rope; it is streaming, not lazy mmap. History is bounded by transaction count, not a strict byte quota. Search result storage is proportional to match count. Clipboard subprocesses and very large block-edit commands can still occupy the UI while awaiting their ordered buffer operation. Horizontal scrolling in no-wrap mode slices the visible character range. Longest-line measurement runs in a cancellable background job keyed by document revision; only visible line summaries are read on the UI thread. A temporary range based on visible lines is available while the document-wide range is being measured.
+The editor now composites text and rectangles on Metal through wgpu and redraws for caret blink. Layout and cache-miss font rasterization remain on the CPU. Plain scalar-character columns are not grapheme/complex-script layout. Loading still parses the complete file into a rope; it is streaming, not lazy mmap. History is bounded by transaction count, not a strict byte quota. The later hardening replaces match-count-sized GUI search storage with bounded coverage/checkpoints, and removes clipboard and buffer reply waits from the UI. Horizontal scrolling in no-wrap mode slices the visible character range. Longest-line measurement runs in a cancellable background job keyed by document revision; only visible line summaries are read on the UI thread. A temporary range based on visible lines is available while the document-wide range is being measured.
 
 Final validation: 29 unit tests pass, formatting passes, Clippy passes with warnings denied, and the release binaries build. Native GUI checks covered wrapped-line caret movement, automatic search selection, Replace All followed by a single Undo, and byte-for-byte BOM/CRLF save preservation. GUI checks used an isolated temporary document.
 

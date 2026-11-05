@@ -8,7 +8,7 @@ use std::{
 };
 use texted_buffer::{
     search::{Checkpoint, ScanState, SearchMatch, SearchSession, MAX_QUERY_BYTES},
-    BufferSnapshot, TextBuffer,
+    BufferSnapshot,
 };
 use texted_layout::{
     search::{Coverage, SearchViewport},
@@ -23,7 +23,6 @@ pub enum SearchBarMode {
     Find,
     Replace,
 }
-pub type MutationPlan = Result<(u64, usize, Option<BufferSnapshot>), String>;
 #[derive(Clone, Copy)]
 struct Seek {
     serial: u64,
@@ -291,7 +290,6 @@ pub struct SearchState {
     pub replace_query: String,
     pub active_field: usize,
     pub pending: bool,
-    pub mutation: Option<std::sync::mpsc::Receiver<MutationPlan>>,
     pub submitted: Option<(u64, String)>,
     pub active: Option<SearchMatch>,
     pub count: Option<usize>,
@@ -306,8 +304,6 @@ pub struct SearchState {
     applied_serial: u64,
     target: Option<i128>,
     latest: Option<BufferSnapshot>,
-    mutation_cancel: Arc<AtomicBool>,
-    mutation_revision: Option<u64>,
 }
 impl Default for SearchState {
     fn default() -> Self {
@@ -316,7 +312,6 @@ impl Default for SearchState {
 }
 impl Drop for SearchState {
     fn drop(&mut self) {
-        self.cancel_mutation();
         self.shared.stop.store(true, Ordering::Release);
         self.shared.generation.fetch_add(1, Ordering::AcqRel);
         self.shared.ready.notify_all();
@@ -344,7 +339,6 @@ impl SearchState {
             replace_query: String::new(),
             active_field: 0,
             pending: false,
-            mutation: None,
             submitted: None,
             active: None,
             count: None,
@@ -359,8 +353,6 @@ impl SearchState {
             applied_serial: 0,
             target: None,
             latest: None,
-            mutation_cancel: Arc::new(AtomicBool::new(false)),
-            mutation_revision: None,
         }
     }
     fn invalidate(&mut self) {
@@ -378,7 +370,6 @@ impl SearchState {
         self.shared.ready.notify_all();
     }
     pub fn close(&mut self) {
-        self.cancel_mutation();
         self.mode = SearchBarMode::Closed;
         self.invalidate();
         self.submitted = None;
@@ -391,12 +382,6 @@ impl SearchState {
         self.view_id += 1;
     }
     pub fn submit(&mut self, snap: BufferSnapshot) {
-        if self
-            .mutation_revision
-            .is_some_and(|rev| rev != snap.revision)
-        {
-            self.cancel_mutation();
-        }
         if self.find_query.len() > MAX_QUERY_BYTES {
             self.find_query = self
                 .submitted
@@ -595,46 +580,12 @@ impl SearchState {
             usize::from(slots.result.is_some()),
         )
     }
-    pub fn start_replacement(&mut self, snap: BufferSnapshot, all: bool) {
-        if self.mutation.is_some() || self.find_query.is_empty() {
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.mutation = Some(rx);
-        self.mutation_cancel = Arc::new(AtomicBool::new(false));
-        self.mutation_revision = Some(snap.revision);
-        let cancel = self.mutation_cancel.clone();
-        let query = self.find_query.clone();
-        let replacement = self.replace_query.clone();
-        thread::spawn(move || {
-            let result = texted_buffer::replacement::plan(
-                &snap,
-                &query,
-                &replacement,
-                all,
-                snap.cursor_offset,
-                || cancel.load(Ordering::Acquire),
-            )
-            .map(|plan| {
-                let edited = plan.map(|p| {
-                    let mut b = TextBuffer::from_rope(p.content);
-                    b.set_cursor_offset(p.cursor);
-                    b.create_snapshot()
-                });
-                (snap.revision, snap.cursor_offset, edited)
-            })
-            .map_err(|e| format!("Replacement failed: {e:?}"));
-            let _ = tx.send(result);
-        });
-    }
-    pub fn cancel_mutation(&self) {
-        self.mutation_cancel.store(true, Ordering::Release);
-    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    use texted_buffer::TextBuffer;
     use texted_layout::LayoutEngine;
     fn finish(search: &mut SearchState) -> Option<(u64, (usize, usize))> {
         let deadline = Instant::now() + Duration::from_secs(30);

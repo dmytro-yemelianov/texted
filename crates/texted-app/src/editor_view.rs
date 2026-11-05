@@ -3,6 +3,7 @@ use crate::{
     graphics::{draw_box, draw_rect, DrawList, FontEngine},
     horizontal_scroll::{Scrollbar, BAR_HEIGHT},
     palette::*,
+    search_ui::{CLOSE_X, NEXT_X, PANEL_WIDTH, PREVIOUS_X},
 };
 use std::time::{Duration, Instant};
 use texted_app::{
@@ -399,7 +400,7 @@ fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: 
     if search_state.mode == SearchBarMode::Closed {
         return;
     }
-    let panel_x = width.saturating_sub(496);
+    let panel_x = width.saturating_sub(PANEL_WIDTH + 16);
     let panel_y = 10;
     let panel_h = if search_state.mode == SearchBarMode::Replace {
         68
@@ -412,7 +413,7 @@ fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: 
         height,
         panel_x,
         panel_y,
-        480,
+        PANEL_WIDTH,
         panel_h,
         COLOR_PANEL_BG,
         COLOR_PANEL_BORDER,
@@ -449,7 +450,7 @@ fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: 
         buffer,
         font_engine,
         model,
-        (panel_x + 285, input_y, 52),
+        (panel_x + PREVIOUS_X, input_y, 52),
         "< Prev",
         6,
     );
@@ -457,7 +458,7 @@ fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: 
         buffer,
         font_engine,
         model,
-        (panel_x + 343, input_y, 52),
+        (panel_x + NEXT_X, input_y, 52),
         "Next >",
         6,
     );
@@ -465,7 +466,7 @@ fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: 
         buffer,
         width,
         height,
-        panel_x + 458,
+        panel_x + CLOSE_X,
         input_y + 3,
         "X",
         COLOR_GUTTER_TEXT,
@@ -717,8 +718,5 @@ impl<'a> SnapshotLines<'a> {
     }
     pub(crate) fn get(&self, line: usize) -> Option<ropey::RopeSlice<'a>> {
         (line < self.len()).then(|| self.0.line(line))
-    }
-    pub(crate) fn last(&self) -> Option<ropey::RopeSlice<'a>> {
-        self.get(self.len() - 1)
     }
 }
