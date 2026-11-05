@@ -2700,11 +2700,12 @@ fn main() {
                     let wrap_text = if word_wrap { "Wrap: ON" } else { "Wrap: OFF" };
 
                     let status_text = format!(
-                        "  Ln {}, Col {}    {}    {}    {} chars    100%    {}    {}",
+                        "  Ln {}, Col {}    {}    {}    {} chars / {} B    {}    {}",
                         cur_line + 1,
                         cur_col + 1,
                         status_mode,
                         wrap_text,
+                        snap.content.len_chars(),
                         snap.total_bytes,
                         if documents.bom { "UTF-8 BOM" } else { "UTF-8" },
                         if documents.ending == LineEnding::Crlf {
