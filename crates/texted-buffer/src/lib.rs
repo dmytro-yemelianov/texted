@@ -23,6 +23,7 @@ pub struct TextBuffer {
     redo_stack: Vec<Revision>,
     typing: Option<(usize, Instant)>,
     revision: u64,
+    history_suspended: bool,
 }
 impl Default for TextBuffer {
     fn default() -> Self {
@@ -49,6 +50,7 @@ impl TextBuffer {
             redo_stack: Vec::new(),
             typing: None,
             revision: 0,
+            history_suspended: false,
         }
     }
     pub fn break_undo_group(&mut self) {
@@ -80,6 +82,10 @@ impl TextBuffer {
         self.text.len_lines()
     }
     fn checkpoint(&mut self) {
+        if self.history_suspended {
+            self.typing = None;
+            return;
+        }
         if self.undo_stack.len() == HISTORY_LIMIT {
             self.undo_stack.pop_front();
         }
@@ -89,6 +95,28 @@ impl TextBuffer {
         });
         self.redo_stack.clear();
         self.typing = None;
+    }
+    /// Groups a compound edit into one undo entry, preserving ordinary typing grouping.
+    pub fn transaction<R>(&mut self, edit: impl FnOnce(&mut Self) -> R) -> R {
+        if self.history_suspended {
+            return edit(self);
+        }
+        let before = Revision {
+            text: self.text.clone(),
+            cursor: self.cursor_offset,
+        };
+        self.history_suspended = true;
+        self.typing = None;
+        let result = edit(self);
+        self.history_suspended = false;
+        if !self.text.is_instance(&before.text) {
+            if self.undo_stack.len() == HISTORY_LIMIT {
+                self.undo_stack.pop_front();
+            }
+            self.undo_stack.push_back(before);
+            self.redo_stack.clear();
+        }
+        result
     }
     fn replace_range_raw(&mut self, start: usize, end: usize, text: &str) {
         let a = self.text.byte_to_char(self.clamp_byte(start));
@@ -311,7 +339,7 @@ impl TextBuffer {
         let snap = self.create_snapshot();
         self.checkpoint();
         for l in (a.min(b)..=a.max(b).min(snap.total_lines - 1)).rev() {
-            let len = snap.line(l).chars().count();
+            let len = snap.line(l).len_chars();
             let at = snap.line_col_to_offset(l, col);
             let insertion = format!("{}{}", " ".repeat(col.saturating_sub(len)), text);
             self.replace_range_raw(at, at, &insertion);
