@@ -48,6 +48,17 @@ impl TextBuffer {
             revision: 0,
         }
     }
+    pub fn break_undo_group(&mut self) {
+        self.typing = None;
+    }
+    pub fn load_document(&mut self, text: Rope) {
+        self.text = text;
+        self.cursor_offset = 0;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.typing = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
     pub fn cursor_offset(&self) -> usize {
         self.cursor_offset
     }
@@ -457,6 +468,29 @@ impl BufferSnapshot {
 mod tests {
     use super::*;
 
+    #[test]
+    fn document_load_clears_history_and_invalidates_background_revisions() {
+        let mut b = TextBuffer::from_string("old".into());
+        let base = b.create_snapshot();
+        b.insert(0, "edited");
+        b.load_document(Rope::from_str("new"));
+        let loaded = b.create_snapshot();
+        assert!(loaded.revision > base.revision);
+        assert_eq!(loaded.cursor_offset, 0);
+        assert!(!b.undo());
+        assert!(!b.redo());
+        assert!(!b.commit_snapshot(base.revision, base.cursor_offset, base));
+        assert_eq!(b.to_string(), "new");
+    }
+    #[test]
+    fn save_boundary_keeps_undo_from_crossing_the_saved_typing_group() {
+        let mut b = TextBuffer::new();
+        b.insert(0, "a");
+        b.break_undo_group();
+        b.insert(1, "b");
+        assert!(b.undo());
+        assert_eq!(b.to_string(), "a");
+    }
     #[test]
     fn background_commit_rejects_stale_edits_and_is_undoable() {
         let mut b = TextBuffer::from_string("aб".into());
