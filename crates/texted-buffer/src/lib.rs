@@ -653,13 +653,17 @@ impl TextBuffer {
             let line_str = lines[l_idx];
             let char_count = line_str.chars().count();
 
-            if col > char_count {
-                // Pad with spaces up to col, then insert text
-                let pad_spaces = " ".repeat(col - char_count);
+            if col >= char_count {
+                // Pad with spaces up to col (if col > char_count), then insert text at end of line
+                let pad_spaces = if col > char_count {
+                    " ".repeat(col - char_count)
+                } else {
+                    String::new()
+                };
                 let insert_str = format!("{}{}", pad_spaces, text);
                 self.insert(line_byte_start + line_str.len(), &insert_str);
             } else {
-                let mut byte_offset = 0;
+                let mut byte_offset = line_str.len();
                 for (i, (b_idx, _)) in line_str.char_indices().enumerate() {
                     if i == col {
                         byte_offset = b_idx;
@@ -840,6 +844,23 @@ mod tests {
         // Block delete columns 0..4 on lines 0..2 (removes "[x] ")
         buf.block_delete(0, 2, 0, 4);
         assert_eq!(buf.to_string(), "Apple\nBanana\nCherry");
+
+        // Test inserting at exact end of line does NOT prepend
+        let mut buf2 = TextBuffer::from_string("Apple\nPeach".to_string());
+        buf2.block_insert(0, 0, 5, "!"); // col 5 is exact end of "Apple"
+        assert_eq!(buf2.to_string(), "Apple!\nPeach");
+
+        // Test block replacement (delete selected block, then insert)
+        let mut buf3 = TextBuffer::from_string("Hello World\nHello Rust\nHello Block".to_string());
+        buf3.block_delete(0, 2, 6, 11);
+        buf3.block_insert(0, 2, 6, "Zed");
+        assert_eq!(buf3.to_string(), "Hello Zed\nHello Zed\nHello Zed");
+
+        // Test block replacement with Ukrainian Cyrillic
+        let mut buf_ua = TextBuffer::from_string("Привіт Світ\nПривіт Руст\nПривіт Блок".to_string());
+        buf_ua.block_delete(0, 2, 7, 11);
+        buf_ua.block_insert(0, 2, 7, "Друг");
+        assert_eq!(buf_ua.to_string(), "Привіт Друг\nПривіт Друг\nПривіт Друг");
     }
 
     #[test]

@@ -1056,7 +1056,19 @@ fn main() {
                                     }
                                 } else if selection.mode == SelectionMode::Block {
                                     let min_l = selection.anchor_line.min(selection.active_line);
+                                    let max_l = selection.anchor_line.max(selection.active_line);
                                     let min_c = selection.anchor_col.min(selection.active_col);
+                                    let max_c = selection.anchor_col.max(selection.active_col);
+
+                                    if min_c < max_c {
+                                        let _ = buffer_client.send(BufferRequest::BlockDelete {
+                                            start_line: min_l,
+                                            end_line: max_l,
+                                            start_col: min_c,
+                                            end_col: max_c,
+                                        });
+                                    }
+
                                     let clip_lines: Vec<&str> = clip.split('\n').collect();
                                     for (idx, line_text) in clip_lines.iter().enumerate() {
                                         let target_l = min_l + idx;
@@ -1067,6 +1079,11 @@ fn main() {
                                             text: line_text.to_string(),
                                         });
                                     }
+                                    let max_clip_line_len = clip_lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+                                    selection.anchor_line = min_l;
+                                    selection.active_line = (min_l + clip_lines.len().saturating_sub(1)).max(max_l);
+                                    selection.anchor_col = min_c + max_clip_line_len;
+                                    selection.active_col = min_c + max_clip_line_len;
                                 } else {
                                     if selection.mode == SelectionMode::Stream {
                                         if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
@@ -1391,6 +1408,13 @@ fn main() {
                                     });
                                     selection.anchor_col = min_c;
                                     selection.active_col = min_c;
+                                } else {
+                                    let _ = buffer_client.send(BufferRequest::BlockDelete {
+                                        start_line: min_l,
+                                        end_line: max_l,
+                                        start_col: min_c,
+                                        end_col: min_c + 1,
+                                    });
                                 }
                             } else if selection.mode == SelectionMode::Stream {
                                 if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
@@ -1410,6 +1434,21 @@ fn main() {
                             }
                         }
                         Key::Named(NamedKey::Enter) => {
+                            if selection.mode == SelectionMode::Block {
+                                let min_l = selection.anchor_line.min(selection.active_line);
+                                let max_l = selection.anchor_line.max(selection.active_line);
+                                let min_c = selection.anchor_col.min(selection.active_col);
+                                let max_c = selection.anchor_col.max(selection.active_col);
+
+                                if min_c < max_c {
+                                    let _ = buffer_client.send(BufferRequest::BlockDelete {
+                                        start_line: min_l,
+                                        end_line: max_l,
+                                        start_col: min_c,
+                                        end_col: max_c,
+                                    });
+                                }
+                            }
                             selection.mode = SelectionMode::None;
                             let _ = buffer_client.send(BufferRequest::Insert {
                                 offset: usize::MAX,
@@ -1421,14 +1460,26 @@ fn main() {
                                 let min_l = selection.anchor_line.min(selection.active_line);
                                 let max_l = selection.anchor_line.max(selection.active_line);
                                 let min_c = selection.anchor_col.min(selection.active_col);
+                                let max_c = selection.anchor_col.max(selection.active_col);
+
+                                if min_c < max_c {
+                                    let _ = buffer_client.send(BufferRequest::BlockDelete {
+                                        start_line: min_l,
+                                        end_line: max_l,
+                                        start_col: min_c,
+                                        end_col: max_c,
+                                    });
+                                }
                                 let _ = buffer_client.send(BufferRequest::BlockInsert {
                                     start_line: min_l,
                                     end_line: max_l,
                                     col: min_c,
                                     text: "    ".to_string(),
                                 });
-                                selection.anchor_col += 4;
-                                selection.active_col += 4;
+                                selection.anchor_line = min_l;
+                                selection.active_line = max_l;
+                                selection.anchor_col = min_c + 4;
+                                selection.active_col = min_c + 4;
                             } else {
                                 let _ = buffer_client.send(BufferRequest::Insert {
                                     offset: usize::MAX,
@@ -1444,6 +1495,18 @@ fn main() {
                                             let min_l = selection.anchor_line.min(selection.active_line);
                                             let max_l = selection.anchor_line.max(selection.active_line);
                                             let min_c = selection.anchor_col.min(selection.active_col);
+                                            let max_c = selection.anchor_col.max(selection.active_col);
+
+                                            if min_c < max_c {
+                                                let _ = buffer_client.send(BufferRequest::BlockDelete {
+                                                    start_line: min_l,
+                                                    end_line: max_l,
+                                                    start_col: min_c,
+                                                    end_col: max_c,
+                                                });
+                                                selection.anchor_col = min_c;
+                                                selection.active_col = min_c;
+                                            }
 
                                             let _ = buffer_client.send(BufferRequest::BlockInsert {
                                                 start_line: min_l,
@@ -1451,6 +1514,8 @@ fn main() {
                                                 col: min_c,
                                                 text: ch.to_string(),
                                             });
+                                            selection.anchor_line = min_l;
+                                            selection.active_line = max_l;
                                             selection.anchor_col = min_c + 1;
                                             selection.active_col = min_c + 1;
                                         } else {
