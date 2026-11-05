@@ -146,7 +146,7 @@ impl LayoutEngine {
         }
     }
 
-    fn offset_to_line_col(text: &str, target_offset: usize) -> (usize, usize) {
+    pub fn offset_to_line_col(text: &str, target_offset: usize) -> (usize, usize) {
         let mut cur_line = 0;
         let mut line_start_offset = 0;
 

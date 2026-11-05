@@ -610,6 +610,83 @@ impl TextBuffer {
         self.cursor_offset = Self::line_col_to_offset_str(&full, min_l, col + text.chars().count());
     }
 
+    /// Finds all byte ranges (start, end) matching `query`
+    pub fn find_matches(&self, query: &str) -> Vec<(usize, usize)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let full = self.to_string();
+        full.match_indices(query)
+            .map(|(offset, s)| (offset, offset + s.len()))
+            .collect()
+    }
+
+    /// Finds next match starting at or after `start_offset`, with wrap-around
+    pub fn find_next(&self, query: &str, start_offset: usize) -> Option<(usize, usize)> {
+        if query.is_empty() {
+            return None;
+        }
+        let full = self.to_string();
+        if start_offset < full.len() {
+            if let Some(pos) = full[start_offset..].find(query) {
+                let m_start = start_offset + pos;
+                return Some((m_start, m_start + query.len()));
+            }
+        }
+        // Wrap around from beginning
+        if let Some(pos) = full[..start_offset.min(full.len())].find(query) {
+            return Some((pos, pos + query.len()));
+        }
+        None
+    }
+
+    /// Finds previous match before `start_offset`, with wrap-around
+    pub fn find_prev(&self, query: &str, start_offset: usize) -> Option<(usize, usize)> {
+        if query.is_empty() {
+            return None;
+        }
+        let full = self.to_string();
+        if start_offset > 0 {
+            let slice = &full[..start_offset.min(full.len())];
+            if let Some(pos) = slice.rfind(query) {
+                return Some((pos, pos + query.len()));
+            }
+        }
+        // Wrap around from end
+        full.rfind(query).map(|pos| (pos, pos + query.len()))
+    }
+
+    /// Replaces the next occurrence of `query` at or after `start_offset`
+    pub fn replace_next(&mut self, query: &str, replacement: &str, start_offset: usize) -> Option<(usize, usize)> {
+        if let Some((start, end)) = self.find_next(query, start_offset) {
+            self.delete(start, end);
+            self.insert(start, replacement);
+            let new_end = start + replacement.len();
+            self.cursor_offset = new_end;
+            Some((start, new_end))
+        } else {
+            None
+        }
+    }
+
+    /// Replaces all occurrences of `query` with `replacement`
+    pub fn replace_all(&mut self, query: &str, replacement: &str) -> usize {
+        if query.is_empty() {
+            return 0;
+        }
+        let full = self.to_string();
+        let matches: Vec<usize> = full.match_indices(query).map(|(i, _)| i).collect();
+        let count = matches.len();
+        if count == 0 {
+            return 0;
+        }
+        let new_content = full.replace(query, replacement);
+        let cursor = self.cursor_offset.min(new_content.len());
+        *self = Self::from_string(new_content);
+        self.cursor_offset = cursor;
+        count
+    }
+
     /// Create an immutable snapshot for layout and render servers
     pub fn create_snapshot(&self) -> BufferSnapshot {
         BufferSnapshot {
@@ -698,5 +775,27 @@ mod tests {
         // Block delete columns 0..4 on lines 0..2 (removes "[x] ")
         buf.block_delete(0, 2, 0, 4);
         assert_eq!(buf.to_string(), "Apple\nBanana\nCherry");
+    }
+
+    #[test]
+    fn test_search_and_replace() {
+        let mut buf = TextBuffer::from_string("apple orange apple banana apple".to_string());
+        
+        let matches = buf.find_matches("apple");
+        assert_eq!(matches.len(), 3);
+
+        // Find next after 6 -> finds second apple at 13
+        let next = buf.find_next("apple", 6);
+        assert_eq!(next, Some((13, 18)));
+
+        // Replace next
+        let rep = buf.replace_next("apple", "peach", 13);
+        assert_eq!(rep, Some((13, 18)));
+        assert_eq!(buf.to_string(), "apple orange peach banana apple");
+
+        // Replace all remaining "apple" with "grape"
+        let count = buf.replace_all("apple", "grape");
+        assert_eq!(count, 2);
+        assert_eq!(buf.to_string(), "grape orange peach banana grape");
     }
 }

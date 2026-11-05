@@ -4,9 +4,16 @@
 //! - QNX-inspired Microkernel IPC bus
 //! - Full Ukrainian & Unicode typography via TrueType font rasterizer (ab_glyph)
 //! - Complete Mouse interactions: single click, double click word, triple click line, drag
-//! - Block Select (Column / Rectangular selection): Alt/Option + drag or keyboard toggle
-//! - Multi-line block typing, block deletion, block copy/cut/paste
-//! - Zero-copy Piece Table buffer engine
+//! - Block Select (Column / Rectangular selection): Alt/Option + drag or Cmd+B
+//! - Full Shortcut Suite:
+//!   - Cmd+C: Copy (stream and block column)
+//!   - Cmd+V: Paste (stream and block column)
+//!   - Cmd+A: Select All
+//!   - Cmd+F: Find (interactive search bar with real-time highlights)
+//!   - Cmd+G / Cmd+Shift+G: Find Next / Find Previous
+//!   - Cmd+R: Replace (interactive Find & Replace bar)
+//!   - Cmd+Z / Cmd+Shift+Z: Undo / Redo
+//!   - Cmd+S: Save file atomically
 
 use std::collections::HashMap;
 use std::fs;
@@ -51,6 +58,11 @@ pub enum BufferRequest {
     BlockInsert { start_line: usize, end_line: usize, col: usize, text: String },
     BlockDelete { start_line: usize, end_line: usize, start_col: usize, end_col: usize },
     BlockExtract { start_line: usize, end_line: usize, start_col: usize, end_col: usize },
+    FindMatches { query: String },
+    FindNext { query: String, start_offset: usize },
+    FindPrev { query: String, start_offset: usize },
+    ReplaceNext { query: String, replacement: String, start_offset: usize },
+    ReplaceAll { query: String, replacement: String },
 }
 
 /// Responses from the Buffer Server
@@ -58,6 +70,9 @@ pub enum BufferRequest {
 pub enum BufferResponse {
     Snapshot(BufferSnapshot),
     Text(String),
+    Matches(Vec<(usize, usize)>),
+    Match(Option<(usize, usize)>),
+    Count(usize),
     Success,
 }
 
@@ -70,6 +85,12 @@ const COLOR_TEXT: u32 = 0x00111111;            // Deep charcoal text
 const COLOR_CARET: u32 = 0x00000000;           // Solid black caret
 const COLOR_SELECTION: u32 = 0x00CCE2FF;       // Soft Windows selection blue
 const COLOR_BLOCK_SELECTION: u32 = 0x00BBDDFF; // Rectangular block select blue
+const COLOR_SEARCH_MATCH: u32 = 0x00FFF2A8;    // Soft yellow search highlight
+const COLOR_SEARCH_ACTIVE: u32 = 0x00FFB74D;   // Gold/orange active match
+const COLOR_PANEL_BG: u32 = 0x00F9F9F9;        // Floating find bar background
+const COLOR_PANEL_BORDER: u32 = 0x00B8B8B8;    // Floating find bar border
+const COLOR_INPUT_BG: u32 = 0x00FFFFFF;        // Input field white
+const COLOR_INPUT_BORDER: u32 = 0x00888888;    // Input field border
 const COLOR_STATUS_BG: u32 = 0x00F0F0F0;       // Status bar background
 const COLOR_STATUS_BORDER: u32 = 0x00D0D0D0;   // Status bar border
 const COLOR_STATUS_TEXT: u32 = 0x00333333;     // Status bar text
@@ -99,6 +120,35 @@ impl Default for SelectionState {
             anchor_col: 0,
             active_line: 0,
             active_col: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchBarMode {
+    Closed,
+    Find,
+    Replace,
+}
+
+pub struct SearchState {
+    pub mode: SearchBarMode,
+    pub find_query: String,
+    pub replace_query: String,
+    pub active_field: usize, // 0 = Find, 1 = Replace
+    pub matches: Vec<(usize, usize)>,
+    pub current_match_idx: Option<usize>,
+}
+
+impl Default for SearchState {
+    fn default() -> Self {
+        Self {
+            mode: SearchBarMode::Closed,
+            find_query: String::new(),
+            replace_query: String::new(),
+            active_field: 0,
+            matches: Vec::new(),
+            current_match_idx: None,
         }
     }
 }
@@ -176,7 +226,6 @@ impl FontEngine {
             let line_h = (ascent - descent + line_gap).ceil().max(scale_px * 1.25);
             (h_advance.round().max(8.0), line_h, ascent)
         } else {
-            // Fallback metrics
             (scale_px * 0.6, scale_px * 1.3, scale_px)
         };
 
@@ -324,6 +373,24 @@ fn draw_rect(
     }
 }
 
+fn draw_box(
+    buffer: &mut [u32],
+    stride: usize,
+    max_height: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    bg_color: u32,
+    border_color: u32,
+) {
+    draw_rect(buffer, stride, max_height, x, y, width, height, bg_color);
+    draw_rect(buffer, stride, max_height, x, y, width, 1, border_color);
+    draw_rect(buffer, stride, max_height, x, y + height.saturating_sub(1), width, 1, border_color);
+    draw_rect(buffer, stride, max_height, x, y, 1, height, border_color);
+    draw_rect(buffer, stride, max_height, x + width.saturating_sub(1), y, 1, height, border_color);
+}
+
 // System clipboard helpers via macOS pbcopy / pbpaste
 fn copy_to_system_clipboard(text: &str) {
     if let Ok(mut child) = Command::new("pbcopy")
@@ -345,6 +412,94 @@ fn get_system_clipboard() -> Option<String> {
     }
 }
 
+fn update_search_matches(
+    client: &texted_kernel::ChannelClient<BufferRequest, BufferResponse>,
+    search: &mut SearchState,
+) {
+    if search.find_query.is_empty() {
+        search.matches.clear();
+        search.current_match_idx = None;
+        return;
+    }
+
+    if let Ok(BufferResponse::Matches(matches)) = client.send(BufferRequest::FindMatches {
+        query: search.find_query.clone(),
+    }) {
+        search.matches = matches;
+        if search.matches.is_empty() {
+            search.current_match_idx = None;
+        } else if search.current_match_idx.map_or(true, |idx| idx >= search.matches.len()) {
+            search.current_match_idx = Some(0);
+        }
+    }
+}
+
+fn jump_to_match(
+    client: &texted_kernel::ChannelClient<BufferRequest, BufferResponse>,
+    search: &mut SearchState,
+    selection: &mut SelectionState,
+    match_idx: usize,
+) {
+    if let Some(&(start, end)) = search.matches.get(match_idx) {
+        search.current_match_idx = Some(match_idx);
+        if let Ok(BufferResponse::Snapshot(snap)) = client.send(BufferRequest::GetSnapshot) {
+            let (s_line, s_col) = LayoutEngine::offset_to_line_col(&snap.content, start);
+            let (e_line, e_col) = LayoutEngine::offset_to_line_col(&snap.content, end);
+
+            *selection = SelectionState {
+                mode: SelectionMode::Stream,
+                anchor_line: s_line,
+                anchor_col: s_col,
+                active_line: e_line,
+                active_col: e_col,
+            };
+            let _ = client.send(BufferRequest::SetCursorOffset(end));
+        }
+    }
+}
+
+fn find_next_match(
+    client: &texted_kernel::ChannelClient<BufferRequest, BufferResponse>,
+    search: &mut SearchState,
+    selection: &mut SelectionState,
+) {
+    if search.matches.is_empty() {
+        update_search_matches(client, search);
+    }
+    if search.matches.is_empty() {
+        return;
+    }
+    let next_idx = match search.current_match_idx {
+        Some(cur) => (cur + 1) % search.matches.len(),
+        None => 0,
+    };
+    jump_to_match(client, search, selection, next_idx);
+}
+
+fn find_prev_match(
+    client: &texted_kernel::ChannelClient<BufferRequest, BufferResponse>,
+    search: &mut SearchState,
+    selection: &mut SelectionState,
+) {
+    if search.matches.is_empty() {
+        update_search_matches(client, search);
+    }
+    if search.matches.is_empty() {
+        return;
+    }
+    let prev_idx = match search.current_match_idx {
+        Some(cur) => {
+            if cur == 0 {
+                search.matches.len() - 1
+            } else {
+                cur - 1
+            }
+        }
+        None => 0,
+    };
+    jump_to_match(client, search, selection, prev_idx);
+}
+
 fn main() {
     let event_loop = EventLoop::new().expect("Failed to initialize winit EventLoop");
 
@@ -357,7 +512,7 @@ fn main() {
     let window = Rc::new(
         WindowBuilder::new()
             .with_title(&window_title)
-            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 680.0))
+            .with_inner_size(winit::dpi::LogicalSize::new(980.0, 700.0))
             .build(&event_loop)
             .expect("Failed to create application window"),
     );
@@ -372,18 +527,21 @@ fn main() {
         let sample = "Вітаємо у Texted! (Welcome to Texted!)\n\n\
 Ультра-швидкий мінімальний текстовий редактор на основі мікроядра QNX.\n\
 Повна підтримка української мови: Привіт, світе! Їжак, Євген, Ґрунт, Ігор.\n\n\
-Взаємодія з мишею та виділення:\n\
-  - Одинарний клік: встановити курсор\n\
-  - Подвійний клік: виділити слово\n\
-  - Потрійний клік: виділити весь рядок\n\
-  - Звичайне перетягування: виділити текст потоком\n\
-  - Alt/Option + перетягування: БЛОЧНЕ (стовпчикове / прямокутне) виділення!\n\n\
+Гарячі клавіші та функції:\n\
+  - Cmd+C: Копіювати (звичайний або блочний виділений текст)\n\
+  - Cmd+V: Вставити (зі системного буфера обміну pbpaste)\n\
+  - Cmd+A: Виділити все\n\
+  - Cmd+F: Знайти (Find з підсвічуванням у реальному часі)\n\
+  - Cmd+G / Cmd+Shift+G: Наступний / Попередній збіг (Find Next / Prev)\n\
+  - Cmd+R: Замінити (Find & Replace)\n\
+  - Cmd+B (або Alt+перетягування): Блочне / стовпчикове виділення\n\
+  - Cmd+Z / Cmd+Shift+Z: Undo / Redo\n\
+  - Cmd+S: Зберегти файл атомарно\n\n\
 Блочне редагування (Block Select):\n\
   - Стовпчик 1: [x] Завдання 1\n\
   - Стовпчик 2: [x] Завдання 2\n\
   - Стовпчик 3: [x] Завдання 3\n\n\
-Спробуйте затиснути Alt/Option та виділити стовпчик \"[x]\", а потім натиснути клавішу чи Backspace!\n\
-Гарячі клавіші: Cmd+Z (Undo), Cmd+Y (Redo), Cmd+S (Зберегти), Cmd+L (Нумерація)\n";
+Спробуйте затиснути Alt/Option та виділити стовпчик \"[x]\", а потім друкувати!\n";
         (sample.to_string(), None)
     };
 
@@ -488,6 +646,26 @@ fn main() {
                                 let extracted = buffer.block_extract(start_line, end_line, start_col, end_col);
                                 req.reply(BufferResponse::Text(extracted));
                             }
+                            BufferRequest::FindMatches { ref query } => {
+                                let matches = buffer.find_matches(query);
+                                req.reply(BufferResponse::Matches(matches));
+                            }
+                            BufferRequest::FindNext { ref query, start_offset } => {
+                                let m = buffer.find_next(query, start_offset);
+                                req.reply(BufferResponse::Match(m));
+                            }
+                            BufferRequest::FindPrev { ref query, start_offset } => {
+                                let m = buffer.find_prev(query, start_offset);
+                                req.reply(BufferResponse::Match(m));
+                            }
+                            BufferRequest::ReplaceNext { ref query, ref replacement, start_offset } => {
+                                let m = buffer.replace_next(query, replacement, start_offset);
+                                req.reply(BufferResponse::Match(m));
+                            }
+                            BufferRequest::ReplaceAll { ref query, ref replacement } => {
+                                let count = buffer.replace_all(query, replacement);
+                                req.reply(BufferResponse::Count(count));
+                            }
                         },
                     }
                 } else {
@@ -512,12 +690,13 @@ fn main() {
 
     // Mouse & Selection Tracking
     let mut selection = SelectionState::default();
+    let mut search_state = SearchState::default();
     let mut is_mouse_dragging = false;
     let mut last_click_time = Instant::now();
     let mut click_count = 0usize;
     let mut last_mouse_pos = (0.0f32, 0.0f32);
 
-    println!("[Texted] GUI editor running with Ukrainian & Block Select support.");
+    println!("[Texted] GUI editor running with Cmd+ C/V/A/F/G/R shortcuts.");
 
     let _ = event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
@@ -582,6 +761,30 @@ fn main() {
                     let gutter_w = if show_line_numbers { 58.0 } else { 12.0 };
                     let rel_y = (last_mouse_pos.1 - 4.0).max(0.0);
                     let rel_x = (last_mouse_pos.0 - gutter_w - 6.0).max(0.0);
+
+                    // Check if clicked close button on search bar
+                    if search_state.mode != SearchBarMode::Closed {
+                        let size = window.inner_size();
+                        let panel_w = 440.0f32;
+                        let panel_x = (size.width as f32 - panel_w - 12.0).max(0.0);
+                        let panel_h = if search_state.mode == SearchBarMode::Replace { 68.0 } else { 36.0 };
+                        if last_mouse_pos.0 >= panel_x && last_mouse_pos.0 <= panel_x + panel_w
+                            && last_mouse_pos.1 >= 8.0 && last_mouse_pos.1 <= 8.0 + panel_h
+                        {
+                            if state == ElementState::Pressed {
+                                // Clicked inside search bar: check if clicked close or switch field
+                                if last_mouse_pos.0 >= panel_x + panel_w - 28.0 && last_mouse_pos.1 <= 36.0 {
+                                    search_state.mode = SearchBarMode::Closed;
+                                } else if search_state.mode == SearchBarMode::Replace && last_mouse_pos.1 > 38.0 {
+                                    search_state.active_field = 1;
+                                } else {
+                                    search_state.active_field = 0;
+                                }
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                    }
 
                     let click_line = (rel_y / font_engine.line_height_px).floor() as usize + top_line;
                     let click_col = (rel_x / font_engine.char_width_px).round() as usize;
@@ -681,7 +884,291 @@ fn main() {
                     last_caret_blink = Instant::now();
                     let is_ctrl_or_cmd = current_modifiers.control_key() || current_modifiers.super_key();
 
+                    // 1. Check Global Shortcuts
+                    if is_ctrl_or_cmd {
+                        if let Key::Character(ref s) = logical_key {
+                            match s.to_lowercase().as_str() {
+                                "a" => {
+                                    // Cmd+A: Select All
+                                    if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                        let lines: Vec<&str> = snap.content.split('\n').collect();
+                                        let total_lines = lines.len();
+                                        let last_line_len = lines.last().map(|l| l.chars().count()).unwrap_or(0);
+                                        selection = SelectionState {
+                                            mode: SelectionMode::Stream,
+                                            anchor_line: 0,
+                                            anchor_col: 0,
+                                            active_line: total_lines.saturating_sub(1),
+                                            active_col: last_line_len,
+                                        };
+                                        let _ = buffer_client.send(BufferRequest::SetCursorOffset(snap.total_bytes));
+                                    }
+                                    window.request_redraw();
+                                    return;
+                                }
+                                "c" => {
+                                    // Cmd+C: Copy
+                                    if selection.mode == SelectionMode::Block {
+                                        let min_l = selection.anchor_line.min(selection.active_line);
+                                        let max_l = selection.anchor_line.max(selection.active_line);
+                                        let min_c = selection.anchor_col.min(selection.active_col);
+                                        let max_c = selection.anchor_col.max(selection.active_col);
+                                        if let Ok(BufferResponse::Text(extracted)) = buffer_client.send(BufferRequest::BlockExtract {
+                                            start_line: min_l,
+                                            end_line: max_l,
+                                            start_col: min_c,
+                                            end_col: max_c,
+                                        }) {
+                                            copy_to_system_clipboard(&extracted);
+                                        }
+                                    } else if selection.mode == SelectionMode::Stream {
+                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
+                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                            let min_off = off_a.min(off_b);
+                                            let max_off = off_a.max(off_b);
+                                            if min_off < max_off && max_off <= snap.content.len() {
+                                                copy_to_system_clipboard(&snap.content[min_off..max_off]);
+                                            }
+                                        }
+                                    }
+                                    window.request_redraw();
+                                    return;
+                                }
+                                "v" => {
+                                    // Cmd+V: Paste
+                                    if let Some(clip) = get_system_clipboard() {
+                                        if selection.mode == SelectionMode::Block {
+                                            let min_l = selection.anchor_line.min(selection.active_line);
+                                            let min_c = selection.anchor_col.min(selection.active_col);
+                                            let clip_lines: Vec<&str> = clip.split('\n').collect();
+                                            for (idx, line_text) in clip_lines.iter().enumerate() {
+                                                let target_l = min_l + idx;
+                                                let _ = buffer_client.send(BufferRequest::BlockInsert {
+                                                    start_line: target_l,
+                                                    end_line: target_l,
+                                                    col: min_c,
+                                                    text: line_text.to_string(),
+                                                });
+                                            }
+                                        } else {
+                                            if selection.mode == SelectionMode::Stream {
+                                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                                    let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
+                                                    let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                                    let _ = buffer_client.send(BufferRequest::DeleteRange { start: off_a.min(off_b), end: off_a.max(off_b) });
+                                                }
+                                                selection.mode = SelectionMode::None;
+                                            }
+                                            let _ = buffer_client.send(BufferRequest::Insert {
+                                                offset: usize::MAX,
+                                                text: clip,
+                                            });
+                                        }
+                                    }
+                                    window.request_redraw();
+                                    return;
+                                }
+                                "x" => {
+                                    // Cmd+X: Cut
+                                    if selection.mode == SelectionMode::Block {
+                                        let min_l = selection.anchor_line.min(selection.active_line);
+                                        let max_l = selection.anchor_line.max(selection.active_line);
+                                        let min_c = selection.anchor_col.min(selection.active_col);
+                                        let max_c = selection.anchor_col.max(selection.active_col);
+                                        if let Ok(BufferResponse::Text(extracted)) = buffer_client.send(BufferRequest::BlockExtract {
+                                            start_line: min_l,
+                                            end_line: max_l,
+                                            start_col: min_c,
+                                            end_col: max_c,
+                                        }) {
+                                            copy_to_system_clipboard(&extracted);
+                                            let _ = buffer_client.send(BufferRequest::BlockDelete {
+                                                start_line: min_l,
+                                                end_line: max_l,
+                                                start_col: min_c,
+                                                end_col: max_c,
+                                            });
+                                        }
+                                        selection.mode = SelectionMode::None;
+                                    } else if selection.mode == SelectionMode::Stream {
+                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
+                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                            let min_off = off_a.min(off_b);
+                                            let max_off = off_a.max(off_b);
+                                            if min_off < max_off && max_off <= snap.content.len() {
+                                                copy_to_system_clipboard(&snap.content[min_off..max_off]);
+                                                let _ = buffer_client.send(BufferRequest::DeleteRange { start: min_off, end: max_off });
+                                            }
+                                        }
+                                        selection.mode = SelectionMode::None;
+                                    }
+                                    window.request_redraw();
+                                    return;
+                                }
+                                "f" => {
+                                    // Cmd+F: Find
+                                    search_state.mode = SearchBarMode::Find;
+                                    search_state.active_field = 0;
+                                    // If selection active in stream mode, copy to find query
+                                    if selection.mode == SelectionMode::Stream {
+                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
+                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                            let min_off = off_a.min(off_b);
+                                            let max_off = off_a.max(off_b);
+                                            if min_off < max_off && max_off - min_off < 100 {
+                                                search_state.find_query = snap.content[min_off..max_off].to_string();
+                                                update_search_matches(&buffer_client, &mut search_state);
+                                            }
+                                        }
+                                    }
+                                    window.request_redraw();
+                                    return;
+                                }
+                                "r" => {
+                                    // Cmd+R: Replace
+                                    search_state.mode = if search_state.mode == SearchBarMode::Replace {
+                                        SearchBarMode::Closed
+                                    } else {
+                                        SearchBarMode::Replace
+                                    };
+                                    search_state.active_field = 0;
+                                    window.request_redraw();
+                                    return;
+                                }
+                                "g" => {
+                                    // Cmd+G: Find Next (or Find Prev if shift held)
+                                    if current_modifiers.shift_key() {
+                                        find_prev_match(&buffer_client, &mut search_state, &mut selection);
+                                    } else {
+                                        find_next_match(&buffer_client, &mut search_state, &mut selection);
+                                    }
+                                    window.request_redraw();
+                                    return;
+                                }
+                                "z" => {
+                                    if current_modifiers.shift_key() {
+                                        let _ = buffer_client.send(BufferRequest::Redo);
+                                    } else {
+                                        let _ = buffer_client.send(BufferRequest::Undo);
+                                    }
+                                    window.request_redraw();
+                                    return;
+                                }
+                                "y" => {
+                                    let _ = buffer_client.send(BufferRequest::Redo);
+                                    window.request_redraw();
+                                    return;
+                                }
+                                "l" => {
+                                    show_line_numbers = !show_line_numbers;
+                                    window.request_redraw();
+                                    return;
+                                }
+                                "b" => {
+                                    selection.mode = if selection.mode == SelectionMode::Block {
+                                        SelectionMode::None
+                                    } else {
+                                        SelectionMode::Block
+                                    };
+                                    window.request_redraw();
+                                    return;
+                                }
+                                "s" => {
+                                    // Save file atomically
+                                    if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                        let save_path = current_file_path.clone().unwrap_or_else(|| PathBuf::from("note.txt"));
+                                        if IoManager::save_atomic(&save_path, &snap.content, false, LineEnding::Lf).is_ok() {
+                                            current_file_path = Some(save_path.clone());
+                                            window.set_title(&format!("{} - Texted", save_path.display()));
+                                        }
+                                    }
+                                    window.request_redraw();
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    // 2. Check Search Bar Input (if search bar is active)
+                    if search_state.mode != SearchBarMode::Closed {
+                        match logical_key {
+                            Key::Named(NamedKey::Escape) => {
+                                search_state.mode = SearchBarMode::Closed;
+                                window.request_redraw();
+                                return;
+                            }
+                            Key::Named(NamedKey::Tab) => {
+                                if search_state.mode == SearchBarMode::Replace {
+                                    search_state.active_field = (search_state.active_field + 1) % 2;
+                                }
+                                window.request_redraw();
+                                return;
+                            }
+                            Key::Named(NamedKey::Enter) => {
+                                if search_state.mode == SearchBarMode::Replace && search_state.active_field == 1 {
+                                    // In Replace field: execute Replace Next
+                                    if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                        let _ = buffer_client.send(BufferRequest::ReplaceNext {
+                                            query: search_state.find_query.clone(),
+                                            replacement: search_state.replace_query.clone(),
+                                            start_offset: snap.cursor_offset,
+                                        });
+                                        update_search_matches(&buffer_client, &mut search_state);
+                                        find_next_match(&buffer_client, &mut search_state, &mut selection);
+                                    }
+                                } else {
+                                    // In Find field: jump to next/prev match
+                                    if current_modifiers.shift_key() {
+                                        find_prev_match(&buffer_client, &mut search_state, &mut selection);
+                                    } else {
+                                        find_next_match(&buffer_client, &mut search_state, &mut selection);
+                                    }
+                                }
+                                window.request_redraw();
+                                return;
+                            }
+                            Key::Named(NamedKey::Backspace) => {
+                                if search_state.active_field == 0 {
+                                    search_state.find_query.pop();
+                                    update_search_matches(&buffer_client, &mut search_state);
+                                    if !search_state.find_query.is_empty() {
+                                        find_next_match(&buffer_client, &mut search_state, &mut selection);
+                                    }
+                                } else {
+                                    search_state.replace_query.pop();
+                                }
+                                window.request_redraw();
+                                return;
+                            }
+                            _ => {
+                                if let Some(t) = text {
+                                    for ch in t.chars() {
+                                        if !ch.is_control() {
+                                            if search_state.active_field == 0 {
+                                                search_state.find_query.push(ch);
+                                                update_search_matches(&buffer_client, &mut search_state);
+                                                find_next_match(&buffer_client, &mut search_state, &mut selection);
+                                            } else {
+                                                search_state.replace_query.push(ch);
+                                            }
+                                        }
+                                    }
+                                    window.request_redraw();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. Normal Document Editing & Navigation
                     match logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            selection.mode = SelectionMode::None;
+                        }
                         Key::Named(NamedKey::ArrowLeft) => {
                             selection.mode = SelectionMode::None;
                             let _ = buffer_client.send(BufferRequest::MoveLeft);
@@ -800,135 +1287,11 @@ fn main() {
                                 });
                             }
                         }
-                        Key::Character(ref s) if is_ctrl_or_cmd => {
-                            match s.to_lowercase().as_str() {
-                                "z" => {
-                                    if current_modifiers.shift_key() {
-                                        let _ = buffer_client.send(BufferRequest::Redo);
-                                    } else {
-                                        let _ = buffer_client.send(BufferRequest::Undo);
-                                    }
-                                }
-                                "y" => {
-                                    let _ = buffer_client.send(BufferRequest::Redo);
-                                }
-                                "l" => {
-                                    show_line_numbers = !show_line_numbers;
-                                }
-                                "b" => {
-                                    // Keyboard shortcut to toggle Block Selection mode
-                                    selection.mode = if selection.mode == SelectionMode::Block {
-                                        SelectionMode::None
-                                    } else {
-                                        SelectionMode::Block
-                                    };
-                                }
-                                "c" => {
-                                    // Copy to system clipboard
-                                    if selection.mode == SelectionMode::Block {
-                                        let min_l = selection.anchor_line.min(selection.active_line);
-                                        let max_l = selection.anchor_line.max(selection.active_line);
-                                        let min_c = selection.anchor_col.min(selection.active_col);
-                                        let max_c = selection.anchor_col.max(selection.active_col);
-                                        if let Ok(BufferResponse::Text(extracted)) = buffer_client.send(BufferRequest::BlockExtract {
-                                            start_line: min_l,
-                                            end_line: max_l,
-                                            start_col: min_c,
-                                            end_col: max_c,
-                                        }) {
-                                            copy_to_system_clipboard(&extracted);
-                                        }
-                                    } else if selection.mode == SelectionMode::Stream {
-                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
-                                            let min_off = off_a.min(off_b);
-                                            let max_off = off_a.max(off_b);
-                                            if min_off < max_off && max_off <= snap.content.len() {
-                                                copy_to_system_clipboard(&snap.content[min_off..max_off]);
-                                            }
-                                        }
-                                    }
-                                }
-                                "x" => {
-                                    // Cut to system clipboard
-                                    if selection.mode == SelectionMode::Block {
-                                        let min_l = selection.anchor_line.min(selection.active_line);
-                                        let max_l = selection.anchor_line.max(selection.active_line);
-                                        let min_c = selection.anchor_col.min(selection.active_col);
-                                        let max_c = selection.anchor_col.max(selection.active_col);
-                                        if let Ok(BufferResponse::Text(extracted)) = buffer_client.send(BufferRequest::BlockExtract {
-                                            start_line: min_l,
-                                            end_line: max_l,
-                                            start_col: min_c,
-                                            end_col: max_c,
-                                        }) {
-                                            copy_to_system_clipboard(&extracted);
-                                            let _ = buffer_client.send(BufferRequest::BlockDelete {
-                                                start_line: min_l,
-                                                end_line: max_l,
-                                                start_col: min_c,
-                                                end_col: max_c,
-                                            });
-                                        }
-                                        selection.mode = SelectionMode::None;
-                                    } else if selection.mode == SelectionMode::Stream {
-                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
-                                            let min_off = off_a.min(off_b);
-                                            let max_off = off_a.max(off_b);
-                                            if min_off < max_off && max_off <= snap.content.len() {
-                                                copy_to_system_clipboard(&snap.content[min_off..max_off]);
-                                                let _ = buffer_client.send(BufferRequest::DeleteRange { start: min_off, end: max_off });
-                                            }
-                                        }
-                                        selection.mode = SelectionMode::None;
-                                    }
-                                }
-                                "v" => {
-                                    // Paste from system clipboard
-                                    if let Some(clip) = get_system_clipboard() {
-                                        if selection.mode == SelectionMode::Block {
-                                            let min_l = selection.anchor_line.min(selection.active_line);
-                                            let min_c = selection.anchor_col.min(selection.active_col);
-                                            let clip_lines: Vec<&str> = clip.split('\n').collect();
-                                            for (idx, line_text) in clip_lines.iter().enumerate() {
-                                                let target_l = min_l + idx;
-                                                let _ = buffer_client.send(BufferRequest::BlockInsert {
-                                                    start_line: target_l,
-                                                    end_line: target_l,
-                                                    col: min_c,
-                                                    text: line_text.to_string(),
-                                                });
-                                            }
-                                        } else {
-                                            let _ = buffer_client.send(BufferRequest::Insert {
-                                                offset: usize::MAX,
-                                                text: clip,
-                                            });
-                                        }
-                                    }
-                                }
-                                "s" => {
-                                    // Save file atomically
-                                    if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                        let save_path = current_file_path.clone().unwrap_or_else(|| PathBuf::from("note.txt"));
-                                        if IoManager::save_atomic(&save_path, &snap.content, false, LineEnding::Lf).is_ok() {
-                                            current_file_path = Some(save_path.clone());
-                                            window.set_title(&format!("{} - Texted", save_path.display()));
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
                         _ => {
                             if let Some(t) = text {
                                 for ch in t.chars() {
                                     if !ch.is_control() {
                                         if selection.mode == SelectionMode::Block {
-                                            // Block typing: type simultaneously into all selected lines at col!
                                             let min_l = selection.anchor_line.min(selection.active_line);
                                             let max_l = selection.anchor_line.max(selection.active_line);
                                             let min_c = selection.anchor_col.min(selection.active_col);
@@ -943,7 +1306,6 @@ fn main() {
                                             selection.active_col = min_c + 1;
                                         } else {
                                             if selection.mode == SelectionMode::Stream {
-                                                // Replace selected text
                                                 if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
                                                     let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
                                                     let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
@@ -954,7 +1316,7 @@ fn main() {
                                                 selection.mode = SelectionMode::None;
                                             }
 
-                                            // High-priority Unicode pulse dispatch (supports Ukrainian Cyrillic)
+                                            // Pulse dispatch for character input
                                             let pulse = Pulse::new(0, PULSE_KEY_INPUT, ch as u32 as u64);
                                             let _ = buffer_client.send_pulse(pulse);
                                         }
@@ -1039,7 +1401,6 @@ fn main() {
                             height.saturating_sub(28),
                             COLOR_GUTTER_BG,
                         );
-                        // Vertical separator line
                         draw_rect(
                             &mut buffer,
                             width,
@@ -1052,11 +1413,51 @@ fn main() {
                         );
                     }
 
-                    // 5. Render Selection Highlights
                     let text_start_x = gutter_w as usize + 6;
 
+                    // 5. Render Search Match Highlights
+                    if !search_state.find_query.is_empty() {
+                        let lines: Vec<&str> = snap.content.split('\n').collect();
+
+                        for (m_idx, &(m_start, m_end)) in search_state.matches.iter().enumerate() {
+                            let (m_s_l, m_s_c) = LayoutEngine::offset_to_line_col(&snap.content, m_start);
+                            let (m_e_l, m_e_c) = LayoutEngine::offset_to_line_col(&snap.content, m_end);
+
+                            let is_active = search_state.current_match_idx == Some(m_idx);
+                            let highlight_color = if is_active {
+                                COLOR_SEARCH_ACTIVE
+                            } else {
+                                COLOR_SEARCH_MATCH
+                            };
+
+                            for l_idx in m_s_l..=m_e_l {
+                                if l_idx >= top_line && l_idx < top_line + visible_rows + 2 {
+                                    let row_y = ((l_idx - top_line) as f32 * font_engine.line_height_px) as usize;
+                                    let line_len = lines.get(l_idx).map(|l| l.chars().count()).unwrap_or(0);
+
+                                    let from_c = if l_idx == m_s_l { m_s_c } else { 0 };
+                                    let to_c = if l_idx == m_e_l { m_e_c } else { line_len };
+
+                                    let h_x = text_start_x + (from_c as f32 * font_engine.char_width_px).round() as usize;
+                                    let h_w = (((to_c.saturating_sub(from_c)) as f32 * font_engine.char_width_px).round() as usize).max(4);
+
+                                    draw_rect(
+                                        &mut buffer,
+                                        width,
+                                        height,
+                                        h_x,
+                                        row_y + 2,
+                                        h_w,
+                                        font_engine.line_height_px as usize,
+                                        highlight_color,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // 6. Render Selection Highlights
                     if selection.mode == SelectionMode::Block {
-                        // Render 2D Rectangular Column Selection
                         let min_l = selection.anchor_line.min(selection.active_line);
                         let max_l = selection.anchor_line.max(selection.active_line);
                         let min_c = selection.anchor_col.min(selection.active_col);
@@ -1081,7 +1482,6 @@ fn main() {
                             }
                         }
                     } else if selection.mode == SelectionMode::Stream {
-                        // Render Stream Selection
                         let (s_line, s_col) = if (selection.anchor_line, selection.anchor_col) <= (selection.active_line, selection.active_col) {
                             (selection.anchor_line, selection.anchor_col)
                         } else {
@@ -1120,7 +1520,7 @@ fn main() {
                         }
                     }
 
-                    // 6. Render Visible Lines (with antialiased Ukrainian font support)
+                    // 7. Render Visible Lines (with antialiased Ukrainian font support)
                     for line in &layout.visible_lines {
                         let y_int = line.y_px as usize;
                         if y_int + (font_engine.line_height_px as usize) > height.saturating_sub(28) {
@@ -1153,7 +1553,7 @@ fn main() {
                         );
                     }
 
-                    // 7. Render Caret
+                    // 8. Render Caret
                     if caret_visible && layout.caret_rect.x >= 0.0 {
                         let cx = text_start_x + (cur_col as f32 * font_engine.char_width_px).round() as usize;
                         let cy = if cur_line >= top_line {
@@ -1167,11 +1567,78 @@ fn main() {
                         }
                     }
 
-                    // 8. Render Windows Notepad Style Status Bar
+                    // 9. Render Floating Find & Replace Bar (when active)
+                    if search_state.mode != SearchBarMode::Closed {
+                        let panel_w = 460usize;
+                        let panel_h = if search_state.mode == SearchBarMode::Replace { 68usize } else { 36usize };
+                        let panel_x = width.saturating_sub(panel_w + 16);
+                        let panel_y = 10usize;
+
+                        draw_box(&mut buffer, width, height, panel_x, panel_y, panel_w, panel_h, COLOR_PANEL_BG, COLOR_PANEL_BORDER);
+
+                        // Find Input Box
+                        let input_x = panel_x + 55;
+                        let input_y = panel_y + 6;
+                        let input_w = 180usize;
+                        let input_h = 24usize;
+                        let border_col = if search_state.active_field == 0 { COLOR_STATUS_ACCENT } else { COLOR_INPUT_BORDER };
+                        draw_box(&mut buffer, width, height, input_x, input_y, input_w, input_h, COLOR_INPUT_BG, border_col);
+
+                        font_engine.draw_string(&mut buffer, width, height, panel_x + 10, input_y + 3, "Find:", COLOR_STATUS_TEXT);
+
+                        let query_display = if search_state.find_query.is_empty() {
+                            ""
+                        } else {
+                            &search_state.find_query
+                        };
+                        font_engine.draw_string(&mut buffer, width, height, input_x + 5, input_y + 3, query_display, COLOR_TEXT);
+
+                        // Cursor in Find box
+                        if search_state.active_field == 0 && caret_visible {
+                            let cur_x = input_x + 5 + (query_display.chars().count() as f32 * font_engine.char_width_px).round() as usize;
+                            if cur_x < input_x + input_w - 4 {
+                                draw_rect(&mut buffer, width, height, cur_x, input_y + 4, 2, input_h - 8, COLOR_CARET);
+                            }
+                        }
+
+                        // Match count info
+                        let match_info = if search_state.find_query.is_empty() {
+                            "".to_string()
+                        } else if search_state.matches.is_empty() {
+                            "0/0".to_string()
+                        } else {
+                            let cur_idx = search_state.current_match_idx.map_or(0, |i| i + 1);
+                            format!("{}/{}", cur_idx, search_state.matches.len())
+                        };
+                        font_engine.draw_string(&mut buffer, width, height, input_x + input_w + 10, input_y + 3, &match_info, COLOR_STATUS_TEXT);
+
+                        // Close button [x]
+                        font_engine.draw_string(&mut buffer, width, height, panel_x + panel_w - 24, input_y + 3, "X", COLOR_GUTTER_TEXT);
+
+                        // Replace Row (if in Replace mode)
+                        if search_state.mode == SearchBarMode::Replace {
+                            let repl_y = panel_y + 36;
+                            let repl_border = if search_state.active_field == 1 { COLOR_STATUS_ACCENT } else { COLOR_INPUT_BORDER };
+                            draw_box(&mut buffer, width, height, input_x, repl_y, input_w, input_h, COLOR_INPUT_BG, repl_border);
+
+                            font_engine.draw_string(&mut buffer, width, height, panel_x + 10, repl_y + 3, "Repl:", COLOR_STATUS_TEXT);
+                            font_engine.draw_string(&mut buffer, width, height, input_x + 5, repl_y + 3, &search_state.replace_query, COLOR_TEXT);
+
+                            if search_state.active_field == 1 && caret_visible {
+                                let cur_x = input_x + 5 + (search_state.replace_query.chars().count() as f32 * font_engine.char_width_px).round() as usize;
+                                if cur_x < input_x + input_w - 4 {
+                                    draw_rect(&mut buffer, width, height, cur_x, repl_y + 4, 2, input_h - 8, COLOR_CARET);
+                                }
+                            }
+
+                            // Replace actions
+                            font_engine.draw_string(&mut buffer, width, height, input_x + input_w + 10, repl_y + 3, "[Next: Enter] [All]", COLOR_STATUS_TEXT);
+                        }
+                    }
+
+                    // 10. Render Windows Notepad Style Status Bar
                     let status_y = height.saturating_sub(28);
-                    // Top separator border
                     draw_rect(&mut buffer, width, height, 0, status_y, width, 1, COLOR_STATUS_BORDER);
-                    // Background
                     draw_rect(&mut buffer, width, height, 0, status_y + 1, width, 27, COLOR_STATUS_BG);
 
                     let status_mode = match selection.mode {
@@ -1183,7 +1650,13 @@ fn main() {
                             format!("[BLOCK SELECT: R{}-R{}, C{}-C{}]", min_l, max_l, min_c, max_c)
                         }
                         SelectionMode::Stream => "[SELECT]".to_string(),
-                        SelectionMode::None => "[NORMAL]".to_string(),
+                        SelectionMode::None => {
+                            if search_state.mode != SearchBarMode::Closed {
+                                "[SEARCH]".to_string()
+                            } else {
+                                "[NORMAL]".to_string()
+                            }
+                        }
                     };
 
                     let status_text = format!(
