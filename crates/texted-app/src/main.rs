@@ -36,7 +36,7 @@ use texted_kernel::{ChannelEvent, ChannelPair, Pulse, CH_BUFFER, PULSE_KEY_INPUT
 use texted_layout::{LayoutEngine, ViewportConfig};
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::WindowBuilder;
 
 /// Messages sent to the Buffer Server
@@ -967,6 +967,7 @@ fn main() {
                     event: KeyEvent {
                         state: ElementState::Pressed,
                         logical_key,
+                        physical_key,
                         text,
                         ..
                     },
@@ -979,222 +980,226 @@ fn main() {
                     let is_ctrl_or_cmd = current_modifiers.control_key() || current_modifiers.super_key();
                     let is_alt = current_modifiers.alt_key();
 
-                    // 1. Check Global Shortcuts
-                    if is_ctrl_or_cmd {
+                    let matches_key = |target_code: KeyCode, target_char: char| -> bool {
+                        if let PhysicalKey::Code(code) = physical_key {
+                            if code == target_code {
+                                return true;
+                            }
+                        }
                         if let Key::Character(ref s) = logical_key {
-                            match s.to_lowercase().as_str() {
-                                "a" => {
-                                    // Cmd+A: Select All
-                                    if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                        let lines: Vec<&str> = snap.content.split('\n').collect();
-                                        let total_lines = lines.len();
-                                        let last_line_len = lines.last().map(|l| l.chars().count()).unwrap_or(0);
-                                        selection = SelectionState {
-                                            mode: SelectionMode::Stream,
-                                            anchor_line: 0,
-                                            anchor_col: 0,
-                                            active_line: total_lines.saturating_sub(1),
-                                            active_col: last_line_len,
-                                        };
-                                        let _ = buffer_client.send(BufferRequest::SetCursorOffset(snap.total_bytes));
-                                    }
-                                    window.request_redraw();
-                                    return;
+                            if let Some(ch) = s.chars().next() {
+                                if ch.eq_ignore_ascii_case(&target_char) {
+                                    return true;
                                 }
-                                "c" => {
-                                    // Cmd+C: Copy
-                                    if selection.mode == SelectionMode::Block {
-                                        let min_l = selection.anchor_line.min(selection.active_line);
-                                        let max_l = selection.anchor_line.max(selection.active_line);
-                                        let min_c = selection.anchor_col.min(selection.active_col);
-                                        let max_c = selection.anchor_col.max(selection.active_col);
-                                        if let Ok(BufferResponse::Text(extracted)) = buffer_client.send(BufferRequest::BlockExtract {
-                                            start_line: min_l,
-                                            end_line: max_l,
-                                            start_col: min_c,
-                                            end_col: max_c,
-                                        }) {
-                                            copy_to_system_clipboard(&extracted);
-                                        }
-                                    } else if selection.mode == SelectionMode::Stream {
-                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
-                                            let min_off = off_a.min(off_b);
-                                            let max_off = off_a.max(off_b);
-                                            if min_off < max_off && max_off <= snap.content.len() {
-                                                copy_to_system_clipboard(&snap.content[min_off..max_off]);
-                                            }
-                                        }
-                                    }
-                                    window.request_redraw();
-                                    return;
+                            }
+                        }
+                        false
+                    };
+
+                    // 1. Check Global Shortcuts (Layout-independent via physical key & logical fallback)
+                    if is_ctrl_or_cmd {
+                        if matches_key(KeyCode::KeyA, 'a') {
+                            // Cmd+A: Select All
+                            if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                let lines: Vec<&str> = snap.content.split('\n').collect();
+                                let total_lines = lines.len();
+                                let last_line_len = lines.last().map(|l| l.chars().count()).unwrap_or(0);
+                                selection = SelectionState {
+                                    mode: SelectionMode::Stream,
+                                    anchor_line: 0,
+                                    anchor_col: 0,
+                                    active_line: total_lines.saturating_sub(1),
+                                    active_col: last_line_len,
+                                };
+                                let _ = buffer_client.send(BufferRequest::SetCursorOffset(snap.total_bytes));
+                            }
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyC, 'c') {
+                            // Cmd+C: Copy
+                            if selection.mode == SelectionMode::Block {
+                                let min_l = selection.anchor_line.min(selection.active_line);
+                                let max_l = selection.anchor_line.max(selection.active_line);
+                                let min_c = selection.anchor_col.min(selection.active_col);
+                                let max_c = selection.anchor_col.max(selection.active_col);
+                                if let Ok(BufferResponse::Text(extracted)) = buffer_client.send(BufferRequest::BlockExtract {
+                                    start_line: min_l,
+                                    end_line: max_l,
+                                    start_col: min_c,
+                                    end_col: max_c,
+                                }) {
+                                    copy_to_system_clipboard(&extracted);
                                 }
-                                "v" => {
-                                    // Cmd+V: Paste
-                                    if let Some(clip) = get_system_clipboard() {
-                                        if selection.mode == SelectionMode::Block {
-                                            let min_l = selection.anchor_line.min(selection.active_line);
-                                            let min_c = selection.anchor_col.min(selection.active_col);
-                                            let clip_lines: Vec<&str> = clip.split('\n').collect();
-                                            for (idx, line_text) in clip_lines.iter().enumerate() {
-                                                let target_l = min_l + idx;
-                                                let _ = buffer_client.send(BufferRequest::BlockInsert {
-                                                    start_line: target_l,
-                                                    end_line: target_l,
-                                                    col: min_c,
-                                                    text: line_text.to_string(),
-                                                });
-                                            }
-                                        } else {
-                                            if selection.mode == SelectionMode::Stream {
-                                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                                    let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                                    let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
-                                                    let _ = buffer_client.send(BufferRequest::DeleteRange { start: off_a.min(off_b), end: off_a.max(off_b) });
-                                                }
-                                                selection.mode = SelectionMode::None;
-                                            }
-                                            let _ = buffer_client.send(BufferRequest::Insert {
-                                                offset: usize::MAX,
-                                                text: clip,
-                                            });
-                                        }
+                            } else if selection.mode == SelectionMode::Stream {
+                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                    let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
+                                    let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                    let min_off = off_a.min(off_b);
+                                    let max_off = off_a.max(off_b);
+                                    if min_off < max_off && max_off <= snap.content.len() {
+                                        copy_to_system_clipboard(&snap.content[min_off..max_off]);
                                     }
-                                    window.request_redraw();
-                                    return;
                                 }
-                                "x" => {
-                                    // Cmd+X: Cut
-                                    if selection.mode == SelectionMode::Block {
-                                        let min_l = selection.anchor_line.min(selection.active_line);
-                                        let max_l = selection.anchor_line.max(selection.active_line);
-                                        let min_c = selection.anchor_col.min(selection.active_col);
-                                        let max_c = selection.anchor_col.max(selection.active_col);
-                                        if let Ok(BufferResponse::Text(extracted)) = buffer_client.send(BufferRequest::BlockExtract {
-                                            start_line: min_l,
-                                            end_line: max_l,
-                                            start_col: min_c,
-                                            end_col: max_c,
-                                        }) {
-                                            copy_to_system_clipboard(&extracted);
-                                            let _ = buffer_client.send(BufferRequest::BlockDelete {
-                                                start_line: min_l,
-                                                end_line: max_l,
-                                                start_col: min_c,
-                                                end_col: max_c,
-                                            });
-                                        }
-                                        selection.mode = SelectionMode::None;
-                                    } else if selection.mode == SelectionMode::Stream {
-                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
-                                            let min_off = off_a.min(off_b);
-                                            let max_off = off_a.max(off_b);
-                                            if min_off < max_off && max_off <= snap.content.len() {
-                                                copy_to_system_clipboard(&snap.content[min_off..max_off]);
-                                                let _ = buffer_client.send(BufferRequest::DeleteRange { start: min_off, end: max_off });
-                                            }
-                                        }
-                                        selection.mode = SelectionMode::None;
+                            }
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyV, 'v') {
+                            // Cmd+V: Paste
+                            if let Some(clip) = get_system_clipboard() {
+                                if search_state.mode != SearchBarMode::Closed {
+                                    if search_state.active_field == 0 {
+                                        search_state.find_query.push_str(&clip);
+                                        update_search_matches(&buffer_client, &mut search_state);
+                                        find_next_match(&buffer_client, &mut search_state, &mut selection);
+                                    } else {
+                                        search_state.replace_query.push_str(&clip);
                                     }
-                                    window.request_redraw();
-                                    return;
-                                }
-                                "f" => {
-                                    // Cmd+F: Find
-                                    search_state.mode = SearchBarMode::Find;
-                                    search_state.active_field = 0;
+                                } else if selection.mode == SelectionMode::Block {
+                                    let min_l = selection.anchor_line.min(selection.active_line);
+                                    let min_c = selection.anchor_col.min(selection.active_col);
+                                    let clip_lines: Vec<&str> = clip.split('\n').collect();
+                                    for (idx, line_text) in clip_lines.iter().enumerate() {
+                                        let target_l = min_l + idx;
+                                        let _ = buffer_client.send(BufferRequest::BlockInsert {
+                                            start_line: target_l,
+                                            end_line: target_l,
+                                            col: min_c,
+                                            text: line_text.to_string(),
+                                        });
+                                    }
+                                } else {
                                     if selection.mode == SelectionMode::Stream {
                                         if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
                                             let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
                                             let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
-                                            let min_off = off_a.min(off_b);
-                                            let max_off = off_a.max(off_b);
-                                            if min_off < max_off && max_off - min_off < 100 {
-                                                search_state.find_query = snap.content[min_off..max_off].to_string();
-                                                update_search_matches(&buffer_client, &mut search_state);
-                                            }
+                                            let _ = buffer_client.send(BufferRequest::DeleteRange { start: off_a.min(off_b), end: off_a.max(off_b) });
                                         }
+                                        selection.mode = SelectionMode::None;
                                     }
-                                    window.request_redraw();
-                                    return;
+                                    let _ = buffer_client.send(BufferRequest::Insert {
+                                        offset: usize::MAX,
+                                        text: clip,
+                                    });
                                 }
-                                "r" => {
-                                    // Cmd+R: Replace
-                                    search_state.mode = if search_state.mode == SearchBarMode::Replace {
-                                        SearchBarMode::Closed
-                                    } else {
-                                        SearchBarMode::Replace
-                                    };
-                                    search_state.active_field = 0;
-                                    window.request_redraw();
-                                    return;
-                                }
-                                "g" => {
-                                    // Cmd+G: Find Next (or Find Prev if shift held)
-                                    if current_modifiers.shift_key() {
-                                        find_prev_match(&buffer_client, &mut search_state, &mut selection);
-                                    } else {
-                                        find_next_match(&buffer_client, &mut search_state, &mut selection);
-                                    }
-                                    window.request_redraw();
-                                    return;
-                                }
-                                "z" => {
-                                    if current_modifiers.shift_key() {
-                                        let _ = buffer_client.send(BufferRequest::Redo);
-                                    } else {
-                                        let _ = buffer_client.send(BufferRequest::Undo);
-                                    }
-                                    window.request_redraw();
-                                    return;
-                                }
-                                "y" => {
-                                    let _ = buffer_client.send(BufferRequest::Redo);
-                                    window.request_redraw();
-                                    return;
-                                }
-                                "l" => {
-                                    show_line_numbers = !show_line_numbers;
-                                    window.request_redraw();
-                                    return;
-                                }
-                                "b" => {
-                                    selection.mode = if selection.mode == SelectionMode::Block {
-                                        SelectionMode::None
-                                    } else {
-                                        SelectionMode::Block
-                                    };
-                                    window.request_redraw();
-                                    return;
-                                }
-                                "s" => {
-                                    if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                        let save_path = current_file_path.clone().unwrap_or_else(|| PathBuf::from("note.txt"));
-                                        if IoManager::save_atomic(&save_path, &snap.content, false, LineEnding::Lf).is_ok() {
-                                            current_file_path = Some(save_path.clone());
-                                            window.set_title(&format!("{} - Texted", save_path.display()));
-                                        }
-                                    }
-                                    window.request_redraw();
-                                    return;
-                                }
-                                _ => {}
                             }
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyX, 'x') {
+                            // Cmd+X: Cut
+                            if selection.mode == SelectionMode::Block {
+                                let min_l = selection.anchor_line.min(selection.active_line);
+                                let max_l = selection.anchor_line.max(selection.active_line);
+                                let min_c = selection.anchor_col.min(selection.active_col);
+                                let max_c = selection.anchor_col.max(selection.active_col);
+                                if let Ok(BufferResponse::Text(extracted)) = buffer_client.send(BufferRequest::BlockExtract {
+                                    start_line: min_l,
+                                    end_line: max_l,
+                                    start_col: min_c,
+                                    end_col: max_c,
+                                }) {
+                                    copy_to_system_clipboard(&extracted);
+                                    let _ = buffer_client.send(BufferRequest::BlockDelete {
+                                        start_line: min_l,
+                                        end_line: max_l,
+                                        start_col: min_c,
+                                        end_col: max_c,
+                                    });
+                                }
+                                selection.mode = SelectionMode::None;
+                            } else if selection.mode == SelectionMode::Stream {
+                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                    let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
+                                    let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                    let min_off = off_a.min(off_b);
+                                    let max_off = off_a.max(off_b);
+                                    if min_off < max_off && max_off <= snap.content.len() {
+                                        copy_to_system_clipboard(&snap.content[min_off..max_off]);
+                                        let _ = buffer_client.send(BufferRequest::DeleteRange { start: min_off, end: max_off });
+                                    }
+                                }
+                                selection.mode = SelectionMode::None;
+                            }
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyF, 'f') {
+                            // Cmd+F: Find
+                            search_state.mode = SearchBarMode::Find;
+                            search_state.active_field = 0;
+                            if selection.mode == SelectionMode::Stream {
+                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                    let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
+                                    let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                    let min_off = off_a.min(off_b);
+                                    let max_off = off_a.max(off_b);
+                                    if min_off < max_off && max_off - min_off < 100 {
+                                        search_state.find_query = snap.content[min_off..max_off].to_string();
+                                        update_search_matches(&buffer_client, &mut search_state);
+                                    }
+                                }
+                            }
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyR, 'r') {
+                            // Cmd+R: Replace
+                            search_state.mode = if search_state.mode == SearchBarMode::Replace {
+                                SearchBarMode::Closed
+                            } else {
+                                SearchBarMode::Replace
+                            };
+                            search_state.active_field = 0;
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyG, 'g') {
+                            // Cmd+G: Find Next (or Find Prev if shift held)
+                            if current_modifiers.shift_key() {
+                                find_prev_match(&buffer_client, &mut search_state, &mut selection);
+                            } else {
+                                find_next_match(&buffer_client, &mut search_state, &mut selection);
+                            }
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyZ, 'z') {
+                            if current_modifiers.shift_key() {
+                                let _ = buffer_client.send(BufferRequest::Redo);
+                            } else {
+                                let _ = buffer_client.send(BufferRequest::Undo);
+                            }
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyY, 'y') {
+                            let _ = buffer_client.send(BufferRequest::Redo);
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyL, 'l') {
+                            show_line_numbers = !show_line_numbers;
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyB, 'b') {
+                            selection.mode = if selection.mode == SelectionMode::Block {
+                                SelectionMode::None
+                            } else {
+                                SelectionMode::Block
+                            };
+                            window.request_redraw();
+                            return;
+                        } else if matches_key(KeyCode::KeyS, 's') {
+                            if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                let save_path = current_file_path.clone().unwrap_or_else(|| PathBuf::from("note.txt"));
+                                if IoManager::save_atomic(&save_path, &snap.content, false, LineEnding::Lf).is_ok() {
+                                    current_file_path = Some(save_path.clone());
+                                    window.set_title(&format!("{} - Texted", save_path.display()));
+                                }
+                            }
+                            window.request_redraw();
+                            return;
                         }
                     }
 
-                    // Alt+Z: Toggle Word Wrap
-                    if is_alt {
-                        if let Key::Character(ref s) = logical_key {
-                            if s.eq_ignore_ascii_case("z") {
-                                word_wrap = !word_wrap;
-                                window.request_redraw();
-                                return;
-                            }
-                        }
+                    // Alt+Z: Toggle Word Wrap (Layout-independent)
+                    if is_alt && matches_key(KeyCode::KeyZ, 'z') {
+                        word_wrap = !word_wrap;
+                        window.request_redraw();
+                        return;
                     }
 
                     // 2. Check Search Bar Input (if search bar is active)
