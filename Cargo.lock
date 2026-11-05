@@ -1208,6 +1208,7 @@ dependencies = [
 name = "texted-app"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "crossbeam-channel",
  "font8x8",
  "parking_lot",

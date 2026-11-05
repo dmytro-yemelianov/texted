@@ -19,3 +19,4 @@ crossbeam-channel.workspace = true
 winit = "0.29"
 softbuffer = "0.4"
 font8x8 = "0.3"
+ab_glyph = "0.2"

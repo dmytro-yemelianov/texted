@@ -494,6 +494,122 @@ impl TextBuffer {
         }
     }
 
+    /// Extracts a rectangular block of characters [start_col..end_col) across lines [start_line..=end_line]
+    pub fn block_extract(&self, start_line: usize, end_line: usize, start_col: usize, end_col: usize) -> String {
+        let full = self.to_string();
+        let lines: Vec<&str> = full.split('\n').collect();
+        let min_l = start_line.min(end_line);
+        let max_l = start_line.max(end_line);
+        let min_c = start_col.min(end_col);
+        let max_c = start_col.max(end_col);
+
+        let mut result = Vec::new();
+        for l_idx in min_l..=max_l {
+            if let Some(line_str) = lines.get(l_idx) {
+                let chars: Vec<char> = line_str.chars().collect();
+                let mut line_res = String::new();
+                for c_idx in min_c..max_c {
+                    if c_idx < chars.len() {
+                        line_res.push(chars[c_idx]);
+                    } else {
+                        line_res.push(' ');
+                    }
+                }
+                result.push(line_res);
+            }
+        }
+        result.join("\n")
+    }
+
+    /// Deletes a rectangular block [start_col..end_col) across lines [start_line..=end_line]
+    pub fn block_delete(&mut self, start_line: usize, end_line: usize, start_col: usize, end_col: usize) {
+        let min_l = start_line.min(end_line);
+        let max_l = start_line.max(end_line);
+        let min_c = start_col.min(end_col);
+        let max_c = start_col.max(end_col);
+        if min_c >= max_c {
+            return;
+        }
+
+        // Iterate backwards from max_l to min_l so line byte positions above don't shift
+        for l_idx in (min_l..=max_l).rev() {
+            let full = self.to_string();
+            let lines: Vec<&str> = full.split('\n').collect();
+            if l_idx >= lines.len() {
+                continue;
+            }
+
+            let mut line_byte_start = 0;
+            for i in 0..l_idx {
+                line_byte_start += lines[i].len() + 1; // +1 for '\n'
+            }
+
+            let line_str = lines[l_idx];
+            let chars: Vec<(usize, char)> = line_str.char_indices().collect();
+            if chars.is_empty() || min_c >= chars.len() {
+                continue;
+            }
+
+            let byte_from = chars[min_c].0;
+            let byte_to = if max_c < chars.len() {
+                chars[max_c].0
+            } else {
+                line_str.len()
+            };
+
+            if byte_from < byte_to {
+                self.delete(line_byte_start + byte_from, line_byte_start + byte_to);
+            }
+        }
+
+        // Update cursor to top-left of the deleted block
+        let full = self.to_string();
+        self.cursor_offset = Self::line_col_to_offset_str(&full, min_l, min_c);
+    }
+
+    /// Inserts text at column `col` across lines [start_line..=end_line]
+    pub fn block_insert(&mut self, start_line: usize, end_line: usize, col: usize, text: &str) {
+        let min_l = start_line.min(end_line);
+        let max_l = start_line.max(end_line);
+
+        // Process from bottom to top to preserve offsets
+        for l_idx in (min_l..=max_l).rev() {
+            let full = self.to_string();
+            let lines: Vec<&str> = full.split('\n').collect();
+            if l_idx >= lines.len() {
+                continue;
+            }
+
+            let mut line_byte_start = 0;
+            for i in 0..l_idx {
+                line_byte_start += lines[i].len() + 1;
+            }
+
+            let line_str = lines[l_idx];
+            let char_count = line_str.chars().count();
+
+            if col > char_count {
+                // Pad with spaces up to col, then insert text
+                let pad_spaces = " ".repeat(col - char_count);
+                let insert_str = format!("{}{}", pad_spaces, text);
+                self.insert(line_byte_start + line_str.len(), &insert_str);
+            } else {
+                let mut byte_offset = 0;
+                for (i, (b_idx, _)) in line_str.char_indices().enumerate() {
+                    if i == col {
+                        byte_offset = b_idx;
+                        break;
+                    }
+                }
+                self.insert(line_byte_start + byte_offset, text);
+            }
+        }
+
+        // Move cursor to after insertion at min_l
+        let full = self.to_string();
+        self.cursor_offset = Self::line_col_to_offset_str(&full, min_l, col + text.chars().count());
+    }
+
     /// Create an immutable snapshot for layout and render servers
     pub fn create_snapshot(&self) -> BufferSnapshot {
         BufferSnapshot {
@@ -553,5 +669,34 @@ mod tests {
         assert_eq!(buf.offset_to_line_col(7), (1, 0));
         // Offset 10 -> (1, 3)
         assert_eq!(buf.offset_to_line_col(10), (1, 3));
+    }
+
+    #[test]
+    fn test_ukrainian_text_support() {
+        let text = "Привіт, світе!\nЦе українська мова: Їжак, Євген, Ґрунт, Ігор.".to_string();
+        let mut buf = TextBuffer::from_string(text.clone());
+        assert_eq!(buf.to_string(), text);
+        assert_eq!(buf.total_lines(), 2);
+
+        // Insert Ukrainian word at offset 14 (start of "світе!")
+        buf.insert(14, "чудовий ");
+        assert_eq!(buf.to_string(), "Привіт, чудовий світе!\nЦе українська мова: Їжак, Євген, Ґрунт, Ігор.");
+    }
+
+    #[test]
+    fn test_block_selection_operations() {
+        let mut buf = TextBuffer::from_string("Apple\nBanana\nCherry".to_string());
+        
+        // Extract block [0..2] on lines 0..2
+        let extracted = buf.block_extract(0, 2, 0, 2);
+        assert_eq!(extracted, "Ap\nBa\nCh");
+
+        // Block insert "[x] " at col 0 on lines 0..2
+        buf.block_insert(0, 2, 0, "[x] ");
+        assert_eq!(buf.to_string(), "[x] Apple\n[x] Banana\n[x] Cherry");
+
+        // Block delete columns 0..4 on lines 0..2 (removes "[x] ")
+        buf.block_delete(0, 2, 0, 4);
+        assert_eq!(buf.to_string(), "Apple\nBanana\nCherry");
     }
 }
