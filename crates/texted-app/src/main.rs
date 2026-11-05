@@ -16,23 +16,21 @@
 //! - Full Ukrainian & Unicode typography via TrueType font rasterizer (ab_glyph)
 //! - Block Select (Column / Rectangular selection): Alt/Option + drag or Cmd+B
 
-use std::collections::HashMap;
-use std::fs;
 use std::io::Write;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+mod graphics;
+mod horizontal_scroll;
+use graphics::{draw_box, draw_rect, FontEngine};
+use horizontal_scroll::{HorizontalScroll, BAR_HEIGHT};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
-use font8x8::UnicodeFonts;
 use texted_buffer::{BufferSnapshot, TextBuffer};
 use texted_io::{IoManager, LineEnding};
-use texted_kernel::{ChannelEvent, ChannelPair, Pulse, CH_BUFFER, PULSE_KEY_INPUT};
+use texted_kernel::{ChannelEvent, ChannelPair, CH_BUFFER};
 use texted_layout::{LayoutEngine, ViewportConfig};
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -42,8 +40,15 @@ use winit::window::WindowBuilder;
 /// Messages sent to the Buffer Server
 #[derive(Debug)]
 pub enum BufferRequest {
-    Insert { offset: usize, text: String },
-    DeleteRange { start: usize, end: usize },
+    Shutdown,
+    Insert {
+        offset: usize,
+        text: String,
+    },
+    DeleteRange {
+        start: usize,
+        end: usize,
+    },
     GetSnapshot,
     Undo,
     Redo,
@@ -62,14 +67,29 @@ pub enum BufferRequest {
     DeleteToLineStart,
     DeleteToLineEnd,
     SetCursorOffset(usize),
-    BlockInsert { start_line: usize, end_line: usize, col: usize, text: String },
-    BlockDelete { start_line: usize, end_line: usize, start_col: usize, end_col: usize },
-    BlockExtract { start_line: usize, end_line: usize, start_col: usize, end_col: usize },
-    FindMatches { query: String },
-    FindNext { query: String, start_offset: usize },
-    FindPrev { query: String, start_offset: usize },
-    ReplaceNext { query: String, replacement: String, start_offset: usize },
-    ReplaceAll { query: String, replacement: String },
+    BlockInsert {
+        start_line: usize,
+        end_line: usize,
+        col: usize,
+        text: String,
+    },
+    BlockDelete {
+        start_line: usize,
+        end_line: usize,
+        start_col: usize,
+        end_col: usize,
+    },
+    BlockExtract {
+        start_line: usize,
+        end_line: usize,
+        start_col: usize,
+        end_col: usize,
+    },
+    CommitReplacement {
+        revision: u64,
+        cursor: usize,
+        edited: BufferSnapshot,
+    },
 }
 
 /// Responses from the Buffer Server
@@ -77,34 +97,32 @@ pub enum BufferRequest {
 pub enum BufferResponse {
     Snapshot(BufferSnapshot),
     Text(String),
-    Matches(Vec<(usize, usize)>),
-    Match(Option<(usize, usize)>),
-    Count(usize),
+    Committed(bool),
     Success,
 }
 
 // Dark Mode Palette (VS Code / Zed Dark Charcoal aesthetic)
-const COLOR_BG: u32 = 0x001E1E1E;              // Editor canvas dark charcoal
-const COLOR_GUTTER_BG: u32 = 0x00181818;       // Slightly darker gutter
-const COLOR_GUTTER_BORDER: u32 = 0x002B2B2B;   // Subtle separator border
-const COLOR_GUTTER_TEXT: u32 = 0x006E6E6E;     // Muted line numbers
-const COLOR_TEXT: u32 = 0x00D4D4D4;            // Crisp off-white text
-const COLOR_CARET: u32 = 0x00FFFFFF;           // Sharp white caret
-const COLOR_SELECTION: u32 = 0x00264F78;       // Stream selection dark blue
+const COLOR_BG: u32 = 0x001E1E1E; // Editor canvas dark charcoal
+const COLOR_GUTTER_BG: u32 = 0x00181818; // Slightly darker gutter
+const COLOR_GUTTER_BORDER: u32 = 0x002B2B2B; // Subtle separator border
+const COLOR_GUTTER_TEXT: u32 = 0x006E6E6E; // Muted line numbers
+const COLOR_TEXT: u32 = 0x00D4D4D4; // Crisp off-white text
+const COLOR_CARET: u32 = 0x00FFFFFF; // Sharp white caret
+const COLOR_SELECTION: u32 = 0x00264F78; // Stream selection dark blue
 const COLOR_BLOCK_SELECTION: u32 = 0x001E4068; // Block selection deep blue
-const COLOR_SEARCH_MATCH: u32 = 0x0052441C;    // Subtle dark amber highlight
-const COLOR_SEARCH_ACTIVE: u32 = 0x008F6400;   // Bright gold active match
-const COLOR_PANEL_BG: u32 = 0x00252526;        // Floating find bar dark panel
-const COLOR_PANEL_BORDER: u32 = 0x003F3F46;    // Floating find bar border
-const COLOR_INPUT_BG: u32 = 0x001E1E1E;        // Search input background
-const COLOR_INPUT_BORDER: u32 = 0x003C3C3C;    // Search input border
-const COLOR_INPUT_ACTIVE: u32 = 0x000E639C;    // Search input active border
-const COLOR_BUTTON_BG: u32 = 0x00333333;       // Button background
-const COLOR_BUTTON_BORDER: u32 = 0x004A4A4A;   // Button border
-const COLOR_STATUS_BG: u32 = 0x00141414;       // Status bar dark
-const COLOR_STATUS_BORDER: u32 = 0x00282828;   // Status bar border
-const COLOR_STATUS_TEXT: u32 = 0x00888888;     // Status bar text
-const COLOR_STATUS_ACCENT: u32 = 0x00569CD6;   // Status bar accent blue
+const COLOR_SEARCH_MATCH: u32 = 0x0052441C; // Subtle dark amber highlight
+const COLOR_SEARCH_ACTIVE: u32 = 0x008F6400; // Bright gold active match
+const COLOR_PANEL_BG: u32 = 0x00252526; // Floating find bar dark panel
+const COLOR_PANEL_BORDER: u32 = 0x003F3F46; // Floating find bar border
+const COLOR_INPUT_BG: u32 = 0x001E1E1E; // Search input background
+const COLOR_INPUT_BORDER: u32 = 0x003C3C3C; // Search input border
+const COLOR_INPUT_ACTIVE: u32 = 0x000E639C; // Search input active border
+const COLOR_BUTTON_BG: u32 = 0x00333333; // Button background
+const COLOR_BUTTON_BORDER: u32 = 0x004A4A4A; // Button border
+const COLOR_STATUS_BG: u32 = 0x00141414; // Status bar dark
+const COLOR_STATUS_BORDER: u32 = 0x00282828; // Status bar border
+const COLOR_STATUS_TEXT: u32 = 0x00888888; // Status bar text
+const COLOR_STATUS_ACCENT: u32 = 0x00569CD6; // Status bar accent blue
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionMode {
@@ -141,6 +159,8 @@ pub enum SearchBarMode {
     Replace,
 }
 
+type MutationPlan = (u64, usize, Option<BufferSnapshot>);
+type SearchResult = (u64, String, Vec<(usize, usize)>);
 pub struct SearchState {
     pub mode: SearchBarMode,
     pub find_query: String,
@@ -148,10 +168,30 @@ pub struct SearchState {
     pub active_field: usize, // 0 = Find, 1 = Replace
     pub matches: Vec<(usize, usize)>,
     pub current_match_idx: Option<usize>,
+    worker: std::sync::mpsc::Sender<(BufferSnapshot, String)>,
+    results: std::sync::mpsc::Receiver<SearchResult>,
+    submitted: Option<(u64, String)>,
+    pending: bool,
+    pending_navigation: Option<bool>,
+    mutation: Option<std::sync::mpsc::Receiver<MutationPlan>>,
 }
 
 impl Default for SearchState {
     fn default() -> Self {
+        let (worker, jobs) = std::sync::mpsc::channel::<(BufferSnapshot, String)>();
+        let (out, results) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(mut job) = jobs.recv() {
+                while let Ok(next) = jobs.try_recv() {
+                    job = next;
+                }
+                let (snap, query) = job;
+                let matches = snap.find_matches(&query);
+                if out.send((snap.revision, query, matches)).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             mode: SearchBarMode::Closed,
             find_query: String::new(),
@@ -159,254 +199,19 @@ impl Default for SearchState {
             active_field: 0,
             matches: Vec::new(),
             current_match_idx: None,
+            worker,
+            results,
+            submitted: None,
+            pending: false,
+            pending_navigation: None,
+            mutation: None,
         }
     }
-}
-
-// Alpha blend pixel over background
-#[inline(always)]
-fn blend_pixel(dst: &mut u32, fg_rgb: u32, alpha: u8) {
-    if alpha == 0 {
-        return;
-    }
-    if alpha == 255 {
-        *dst = fg_rgb;
-        return;
-    }
-    let a = alpha as u32;
-    let inv_a = 255 - a;
-
-    let fr = (fg_rgb >> 16) & 0xFF;
-    let fg = (fg_rgb >> 8) & 0xFF;
-    let fb = fg_rgb & 0xFF;
-
-    let dr = (*dst >> 16) & 0xFF;
-    let dg = (*dst >> 8) & 0xFF;
-    let db = *dst & 0xFF;
-
-    let r = (fr * a + dr * inv_a) / 255;
-    let g = (fg * a + dg * inv_a) / 255;
-    let b = (fb * a + db * inv_a) / 255;
-
-    *dst = (r << 16) | (g << 8) | b;
-}
-
-#[derive(Clone)]
-struct CachedGlyph {
-    width: usize,
-    height: usize,
-    x_offset: i32,
-    y_offset: i32,
-    coverage: Vec<u8>,
-}
-
-pub struct FontEngine {
-    font: Option<FontArc>,
-    scale_px: f32,
-    pub char_width_px: f32,
-    pub line_height_px: f32,
-    pub ascent_px: f32,
-    cache: HashMap<char, CachedGlyph>,
-}
-
-impl FontEngine {
-    pub fn new(scale_px: f32) -> Self {
-        let candidate_paths = [
-            "/System/Library/Fonts/Supplemental/Courier New.ttf",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-            "/System/Library/Fonts/Menlo.ttc",
-        ];
-
-        let mut loaded_font = None;
-        for path in candidate_paths {
-            if let Ok(bytes) = fs::read(path) {
-                if let Ok(font) = FontArc::try_from_vec(bytes) {
-                    loaded_font = Some(font);
-                    break;
-                }
-            }
-        }
-
-        let (char_width_px, line_height_px, ascent_px) = if let Some(ref font) = loaded_font {
-            let scaled = font.as_scaled(PxScale::from(scale_px));
-            let h_advance = scaled.h_advance(scaled.glyph_id('M'));
-            let ascent = scaled.ascent();
-            let descent = scaled.descent();
-            let line_gap = scaled.line_gap();
-            let line_h = (ascent - descent + line_gap).ceil().max(scale_px * 1.25);
-            (h_advance.round().max(8.0), line_h, ascent)
-        } else {
-            (scale_px * 0.6, scale_px * 1.3, scale_px)
-        };
-
-        Self {
-            font: loaded_font,
-            scale_px,
-            char_width_px,
-            line_height_px,
-            ascent_px,
-            cache: HashMap::new(),
-        }
-    }
-
-    pub fn draw_char(
-        &mut self,
-        buffer: &mut [u32],
-        stride: usize,
-        max_height: usize,
-        x: usize,
-        y: usize,
-        ch: char,
-        color: u32,
-    ) {
-        if let Some(ref font) = self.font {
-            let scale_px = self.scale_px;
-            let ascent_px = self.ascent_px;
-
-            let glyph_data = self.cache.entry(ch).or_insert_with(|| {
-                let scaled = font.as_scaled(PxScale::from(scale_px));
-                let glyph = scaled.scaled_glyph(ch);
-                if let Some(outlined) = font.outline_glyph(glyph) {
-                    let bounds = outlined.px_bounds();
-                    let width = bounds.width().ceil() as usize;
-                    let height = bounds.height().ceil() as usize;
-                    let mut cov = vec![0u8; width * height];
-                    outlined.draw(|gx, gy, coverage| {
-                        if (gx as usize) < width && (gy as usize) < height {
-                            cov[gy as usize * width + gx as usize] =
-                                (coverage * 255.0).round().min(255.0) as u8;
-                        }
-                    });
-                    CachedGlyph {
-                        width,
-                        height,
-                        x_offset: bounds.min.x.round() as i32,
-                        y_offset: (bounds.min.y + ascent_px).round() as i32,
-                        coverage: cov,
-                    }
-                } else {
-                    CachedGlyph {
-                        width: 0,
-                        height: 0,
-                        x_offset: 0,
-                        y_offset: 0,
-                        coverage: Vec::new(),
-                    }
-                }
-            });
-
-            if glyph_data.width > 0 && glyph_data.height > 0 {
-                let base_x = x as i32 + glyph_data.x_offset;
-                let base_y = y as i32 + glyph_data.y_offset;
-
-                for row in 0..glyph_data.height {
-                    let py = base_y + row as i32;
-                    if py < 0 || py as usize >= max_height {
-                        continue;
-                    }
-                    let row_offset = (py as usize) * stride;
-
-                    for col in 0..glyph_data.width {
-                        let px = base_x + col as i32;
-                        if px < 0 || px as usize >= stride {
-                            continue;
-                        }
-                        let alpha = glyph_data.coverage[row * glyph_data.width + col];
-                        blend_pixel(&mut buffer[row_offset + px as usize], color, alpha);
-                    }
-                }
-                return;
-            }
-        }
-
-        // Fallback to font8x8 if TrueType glyph is unavailable
-        let glyph = font8x8::BASIC_FONTS
-            .get(ch)
-            .or_else(|| font8x8::LATIN_FONTS.get(ch))
-            .or_else(|| font8x8::BLOCK_FONTS.get(ch))
-            .or_else(|| font8x8::BOX_FONTS.get(ch));
-
-        if let Some(glyph_data) = glyph {
-            let scale = (self.scale_px / 9.0).round().max(1.0) as usize;
-            for (row_idx, &row_byte) in glyph_data.iter().enumerate() {
-                for col_idx in 0..8 {
-                    if (row_byte & (1 << col_idx)) != 0 {
-                        let px = x + col_idx * scale;
-                        let py = y + row_idx * scale;
-                        draw_rect(buffer, stride, max_height, px, py, scale, scale, color);
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn draw_string(
-        &mut self,
-        buffer: &mut [u32],
-        stride: usize,
-        max_height: usize,
-        x: usize,
-        y: usize,
-        text: &str,
-        color: u32,
-    ) {
-        let mut cur_x = x as f32;
-        let char_advance = self.char_width_px;
-
-        for ch in text.chars() {
-            if cur_x + char_advance > stride as f32 {
-                break;
-            }
-            self.draw_char(buffer, stride, max_height, cur_x.round() as usize, y, ch, color);
-            cur_x += char_advance;
-        }
-    }
-}
-
-fn draw_rect(
-    buffer: &mut [u32],
-    stride: usize,
-    max_height: usize,
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    color: u32,
-) {
-    let x_end = (x + width).min(stride);
-    let y_end = (y + height).min(max_height);
-    for row in y..y_end {
-        let row_offset = row * stride;
-        for col in x..x_end {
-            buffer[row_offset + col] = color;
-        }
-    }
-}
-
-fn draw_box(
-    buffer: &mut [u32],
-    stride: usize,
-    max_height: usize,
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    bg_color: u32,
-    border_color: u32,
-) {
-    draw_rect(buffer, stride, max_height, x, y, width, height, bg_color);
-    draw_rect(buffer, stride, max_height, x, y, width, 1, border_color);
-    draw_rect(buffer, stride, max_height, x, y + height.saturating_sub(1), width, 1, border_color);
-    draw_rect(buffer, stride, max_height, x, y, 1, height, border_color);
-    draw_rect(buffer, stride, max_height, x + width.saturating_sub(1), y, 1, height, border_color);
 }
 
 // System clipboard helpers via macOS pbcopy / pbpaste
 fn copy_to_system_clipboard(text: &str) {
-    if let Ok(mut child) = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()
-    {
+    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(text.as_bytes());
         }
@@ -426,24 +231,58 @@ fn update_search_matches(
     client: &texted_kernel::ChannelClient<BufferRequest, BufferResponse>,
     search: &mut SearchState,
 ) {
-    if search.find_query.is_empty() {
-        search.matches.clear();
-        search.current_match_idx = None;
+    if let Ok(BufferResponse::Snapshot(snap)) = client.send(BufferRequest::GetSnapshot) {
+        submit_search(snap, search);
+    }
+}
+fn submit_search(snap: BufferSnapshot, search: &mut SearchState) {
+    let key = (snap.revision, search.find_query.clone());
+    if search.submitted.as_ref() == Some(&key) {
         return;
     }
-
-    if let Ok(BufferResponse::Matches(matches)) = client.send(BufferRequest::FindMatches {
-        query: search.find_query.clone(),
-    }) {
-        search.matches = matches;
-        if search.matches.is_empty() {
-            search.current_match_idx = None;
-        } else if search.current_match_idx.map_or(true, |idx| idx >= search.matches.len()) {
-            search.current_match_idx = Some(0);
-        }
+    if search
+        .submitted
+        .as_ref()
+        .is_none_or(|(_, query)| query != &search.find_query)
+    {
+        search.pending_navigation = Some(true);
+    }
+    search.matches.clear();
+    search.current_match_idx = None;
+    search.submitted = Some(key);
+    search.pending = !search.find_query.is_empty();
+    if search.pending {
+        let _ = search.worker.send((snap, search.find_query.clone()));
     }
 }
 
+fn start_replacement(
+    client: &texted_kernel::ChannelClient<BufferRequest, BufferResponse>,
+    search: &mut SearchState,
+    all: bool,
+) {
+    if search.mutation.is_some() || search.find_query.is_empty() {
+        return;
+    }
+    let Ok(BufferResponse::Snapshot(snap)) = client.send(BufferRequest::GetSnapshot) else {
+        return;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    search.mutation = Some(rx);
+    let query = search.find_query.clone();
+    let replacement = search.replace_query.clone();
+    thread::spawn(move || {
+        let (revision, cursor) = (snap.revision, snap.cursor_offset);
+        let mut edited = TextBuffer::from_rope(snap.content);
+        edited.set_cursor_offset(cursor);
+        let changed = if all {
+            edited.replace_all(&query, &replacement) > 0
+        } else {
+            edited.replace_next(&query, &replacement, cursor).is_some()
+        };
+        let _ = tx.send((revision, cursor, changed.then(|| edited.create_snapshot())));
+    });
+}
 fn jump_to_match(
     client: &texted_kernel::ChannelClient<BufferRequest, BufferResponse>,
     search: &mut SearchState,
@@ -453,8 +292,8 @@ fn jump_to_match(
     if let Some(&(start, end)) = search.matches.get(match_idx) {
         search.current_match_idx = Some(match_idx);
         if let Ok(BufferResponse::Snapshot(snap)) = client.send(BufferRequest::GetSnapshot) {
-            let (s_line, s_col) = LayoutEngine::offset_to_line_col(&snap.content, start);
-            let (e_line, e_col) = LayoutEngine::offset_to_line_col(&snap.content, end);
+            let (s_line, s_col) = snap.offset_to_line_col(start);
+            let (e_line, e_col) = snap.offset_to_line_col(end);
 
             *selection = SelectionState {
                 mode: SelectionMode::Stream,
@@ -473,8 +312,10 @@ fn find_next_match(
     search: &mut SearchState,
     selection: &mut SelectionState,
 ) {
-    if search.matches.is_empty() {
-        update_search_matches(client, search);
+    update_search_matches(client, search);
+    if search.pending {
+        search.pending_navigation = Some(true);
+        return;
     }
     if search.matches.is_empty() {
         return;
@@ -491,8 +332,10 @@ fn find_prev_match(
     search: &mut SearchState,
     selection: &mut SelectionState,
 ) {
-    if search.matches.is_empty() {
-        update_search_matches(client, search);
+    update_search_matches(client, search);
+    if search.pending {
+        search.pending_navigation = Some(false);
+        return;
     }
     if search.matches.is_empty() {
         return;
@@ -551,7 +394,11 @@ fn find_word_boundaries(line_str: &str, click_col: usize) -> (usize, usize) {
     (start, end)
 }
 
-fn compute_gutter_metrics(total_lines: usize, show_line_numbers: bool, char_w: f32) -> (f32, usize, usize) {
+fn compute_gutter_metrics(
+    total_lines: usize,
+    show_line_numbers: bool,
+    char_w: f32,
+) -> (f32, usize, usize) {
     if !show_line_numbers {
         return (0.0, 10, 0);
     }
@@ -563,16 +410,46 @@ fn compute_gutter_metrics(total_lines: usize, show_line_numbers: bool, char_w: f
     (gutter_w, text_start_x, digits)
 }
 
+struct SnapshotLines<'a>(&'a BufferSnapshot);
+impl<'a> SnapshotLines<'a> {
+    fn len(&self) -> usize {
+        self.0.total_lines
+    }
+    fn get(&self, line: usize) -> Option<ropey::RopeSlice<'a>> {
+        (line < self.len()).then(|| self.0.line(line))
+    }
+    fn last(&self) -> Option<ropey::RopeSlice<'a>> {
+        self.get(self.len() - 1)
+    }
+}
+
 fn main() {
+    match std::env::args().nth(1).as_deref() {
+        Some("--version" | "-V") => {
+            println!("Texted {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Some("--help" | "-h") => {
+            println!("Texted {}\nUsage: texted [FILE]\n       texted --version\n\nOpen FILE as plain UTF-8 text. Without FILE, open a demonstration document.",env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        _ => {}
+    }
+
     let event_loop = EventLoop::new().expect("Failed to initialize winit EventLoop");
 
     let initial_path = std::env::args().nth(1).map(PathBuf::from);
     let window_title = match &initial_path {
-        Some(p) => format!("{} - Texted", p.file_name().and_then(|n| n.to_str()).unwrap_or("document.txt")),
+        Some(p) => format!(
+            "{} - Texted",
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("document.txt")
+        ),
         None => "Untitled - Texted".to_string(),
     };
 
-    let window = Rc::new(
+    let window = Arc::new(
         WindowBuilder::new()
             .with_title(&window_title)
             .with_inner_size(winit::dpi::LogicalSize::new(980.0, 700.0))
@@ -581,10 +458,19 @@ fn main() {
     );
 
     // Initial content with full Ukrainian support & demonstration
-    let (initial_content, active_path) = if let Some(ref path) = initial_path {
+    let (initial_content, active_path, file_bom, file_ending) = if let Some(ref path) = initial_path
+    {
         match IoManager::open_file(path) {
-            Ok(doc) => (doc.content, Some(path.clone())),
-            Err(_) => (String::new(), Some(path.clone())),
+            Ok(doc) => (
+                doc.content,
+                Some(path.clone()),
+                doc.has_bom,
+                doc.line_ending,
+            ),
+            Err(error) => {
+                eprintln!("Cannot open {}: {error}", path.display());
+                return;
+            }
         }
     } else {
         let sample = "Вітаємо у Texted! (Welcome to Texted!)\n\n\
@@ -606,169 +492,168 @@ fn main() {
   - Cmd+Z / Cmd+Shift+Z: Undo / Redo\n\
   - Cmd+S: Зберегти файл атомарно\n\n\
 Спробуйте затиснути Alt/Option та виділити стовпчик мишею, або натисніть Cmd+F для пошуку!\n";
-        (sample.to_string(), None)
+        (sample.into(), None, false, LineEnding::Lf)
     };
-
-    let running = Arc::new(AtomicBool::new(true));
 
     // 1. Initialize Microkernel Channels (QNX ChannelCreate)
     let buffer_channel: ChannelPair<BufferRequest, BufferResponse> = ChannelPair::new(CH_BUFFER);
     let buffer_client = buffer_channel.connect();
 
     // 2. Spawn Isolated Buffer Server Thread (handles Piece Table)
-    let b_running = running.clone();
-    let init_text = initial_content.clone();
+    let init_text = initial_content;
     let buffer_thread = thread::Builder::new()
         .name("server-buffer".to_string())
         .spawn(move || {
-            let mut buffer = TextBuffer::from_string(init_text);
+            let mut buffer = TextBuffer::from_rope(init_text);
             let server = buffer_channel.server;
 
-            while b_running.load(Ordering::Relaxed) {
-                if let Some(event) = server.try_receive() {
-                    match event {
-                        ChannelEvent::Pulse(pulse) => {
-                            if pulse.code == PULSE_KEY_INPUT {
-                                if let Some(ch) = char::from_u32(pulse.value as u32) {
-                                    let offset = buffer.cursor_offset();
-                                    buffer.insert(offset, &ch.to_string());
-                                }
-                            }
+            while let Ok(event) = server.receive() {
+                match event {
+                    ChannelEvent::Pulse(_) => {}
+                    ChannelEvent::Message(req) => match req.payload {
+                        BufferRequest::Shutdown => {
+                            req.reply(BufferResponse::Success);
+                            break;
                         }
-                        ChannelEvent::Message(req) => match req.payload {
-                            BufferRequest::Insert { offset, ref text } => {
-                                let insert_pos = if offset == usize::MAX {
-                                    buffer.cursor_offset()
-                                } else {
-                                    offset
-                                };
-                                buffer.insert(insert_pos, text);
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::DeleteRange { start, end } => {
-                                buffer.delete(start, end);
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::GetSnapshot => {
-                                let snap = buffer.create_snapshot();
-                                req.reply(BufferResponse::Snapshot(snap));
-                            }
-                            BufferRequest::Undo => {
-                                buffer.undo();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::Redo => {
-                                buffer.redo();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::MoveLeft => {
-                                buffer.move_cursor_left();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::MoveRight => {
-                                buffer.move_cursor_right();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::MoveWordLeft => {
-                                buffer.move_word_left();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::MoveWordRight => {
-                                buffer.move_word_right();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::MoveUp => {
-                                buffer.move_cursor_up();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::MoveDown => {
-                                buffer.move_cursor_down();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::MoveHome => {
-                                buffer.move_cursor_home();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::MoveEnd => {
-                                buffer.move_cursor_end();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::Backspace => {
-                                buffer.backspace();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::DeleteForward => {
-                                buffer.delete_forward();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::DeleteWordLeft => {
-                                buffer.delete_word_left();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::DeleteWordRight => {
-                                buffer.delete_word_right();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::DeleteToLineStart => {
-                                buffer.delete_to_line_start();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::DeleteToLineEnd => {
-                                buffer.delete_to_line_end();
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::SetCursorOffset(offset) => {
-                                buffer.set_cursor_offset(offset);
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::BlockInsert { start_line, end_line, col, ref text } => {
-                                buffer.block_insert(start_line, end_line, col, text);
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::BlockDelete { start_line, end_line, start_col, end_col } => {
-                                buffer.block_delete(start_line, end_line, start_col, end_col);
-                                req.reply(BufferResponse::Success);
-                            }
-                            BufferRequest::BlockExtract { start_line, end_line, start_col, end_col } => {
-                                let extracted = buffer.block_extract(start_line, end_line, start_col, end_col);
-                                req.reply(BufferResponse::Text(extracted));
-                            }
-                            BufferRequest::FindMatches { ref query } => {
-                                let matches = buffer.find_matches(query);
-                                req.reply(BufferResponse::Matches(matches));
-                            }
-                            BufferRequest::FindNext { ref query, start_offset } => {
-                                let m = buffer.find_next(query, start_offset);
-                                req.reply(BufferResponse::Match(m));
-                            }
-                            BufferRequest::FindPrev { ref query, start_offset } => {
-                                let m = buffer.find_prev(query, start_offset);
-                                req.reply(BufferResponse::Match(m));
-                            }
-                            BufferRequest::ReplaceNext { ref query, ref replacement, start_offset } => {
-                                let m = buffer.replace_next(query, replacement, start_offset);
-                                req.reply(BufferResponse::Match(m));
-                            }
-                            BufferRequest::ReplaceAll { ref query, ref replacement } => {
-                                let count = buffer.replace_all(query, replacement);
-                                req.reply(BufferResponse::Count(count));
-                            }
-                        },
-                    }
-                } else {
-                    thread::sleep(Duration::from_micros(500));
+                        BufferRequest::Insert { offset, ref text } => {
+                            let insert_pos = if offset == usize::MAX {
+                                buffer.cursor_offset()
+                            } else {
+                                offset
+                            };
+                            buffer.insert(insert_pos, text);
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::DeleteRange { start, end } => {
+                            buffer.delete(start, end);
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::GetSnapshot => {
+                            let snap = buffer.create_snapshot();
+                            req.reply(BufferResponse::Snapshot(snap));
+                        }
+                        BufferRequest::Undo => {
+                            buffer.undo();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::Redo => {
+                            buffer.redo();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::MoveLeft => {
+                            buffer.move_cursor_left();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::MoveRight => {
+                            buffer.move_cursor_right();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::MoveWordLeft => {
+                            buffer.move_word_left();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::MoveWordRight => {
+                            buffer.move_word_right();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::MoveUp => {
+                            buffer.move_cursor_up();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::MoveDown => {
+                            buffer.move_cursor_down();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::MoveHome => {
+                            buffer.move_cursor_home();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::MoveEnd => {
+                            buffer.move_cursor_end();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::Backspace => {
+                            buffer.backspace();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::DeleteForward => {
+                            buffer.delete_forward();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::DeleteWordLeft => {
+                            buffer.delete_word_left();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::DeleteWordRight => {
+                            buffer.delete_word_right();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::DeleteToLineStart => {
+                            buffer.delete_to_line_start();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::DeleteToLineEnd => {
+                            buffer.delete_to_line_end();
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::SetCursorOffset(offset) => {
+                            buffer.set_cursor_offset(offset);
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::BlockInsert {
+                            start_line,
+                            end_line,
+                            col,
+                            ref text,
+                        } => {
+                            buffer.block_insert(start_line, end_line, col, text);
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::BlockDelete {
+                            start_line,
+                            end_line,
+                            start_col,
+                            end_col,
+                        } => {
+                            buffer.block_delete(start_line, end_line, start_col, end_col);
+                            req.reply(BufferResponse::Success);
+                        }
+                        BufferRequest::BlockExtract {
+                            start_line,
+                            end_line,
+                            start_col,
+                            end_col,
+                        } => {
+                            let extracted =
+                                buffer.block_extract(start_line, end_line, start_col, end_col);
+                            req.reply(BufferResponse::Text(extracted));
+                        }
+                        BufferRequest::CommitReplacement {
+                            revision,
+                            cursor,
+                            ref edited,
+                        } => {
+                            let committed =
+                                buffer.commit_snapshot(revision, cursor, edited.clone());
+                            req.reply(BufferResponse::Committed(committed));
+                        }
+                    },
                 }
             }
         })
         .expect("Failed to spawn buffer server");
 
     // 3. Initialize Display & Typography
-    let context = softbuffer::Context::new(window.clone()).expect("Failed to create softbuffer context");
-    let mut surface = softbuffer::Surface::new(&context, window.clone()).expect("Failed to create surface");
+    let context =
+        softbuffer::Context::new(window.clone()).expect("Failed to create softbuffer context");
+    let mut surface =
+        softbuffer::Surface::new(&context, window.clone()).expect("Failed to create surface");
 
     // Typography Engine (18px crisp scalable font)
     let mut font_engine = FontEngine::new(18.0);
     let mut top_line = 0usize;
+    let mut top_wrap_row = 0usize;
+    let mut current_view: Option<(texted_layout::ViewportLayout, ViewportConfig)> = None;
     let mut show_line_numbers = true;
     let mut word_wrap = true; // Word wrap enabled by default
     let mut current_modifiers = ModifiersState::empty();
@@ -778,6 +663,10 @@ fn main() {
 
     // Viewport auto-scroll pacing: decoupled from passive mouse scrolling
     let mut snap_to_cursor_needed = false;
+    let scroll_window = window.clone();
+    let mut horizontal = HorizontalScroll::new(move || scroll_window.request_redraw());
+    let mut current_scrollbar: Option<horizontal_scroll::Scrollbar> = None;
+    let mut vertical_remainder = 0.0_f64;
 
     // Mouse & Selection Tracking
     let mut selection = SelectionState::default();
@@ -793,31 +682,76 @@ fn main() {
 
     println!("[Texted] GUI editor running: Dark Mode, Word Wrap, macOS Cmd/Opt navigation.");
 
+    let shutdown_client = buffer_client.clone();
+    let mut last_present: Option<Instant> = None;
+    let mut save_result: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>> = None;
     let _ = event_loop.run(move |event, elwt| {
-        elwt.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
+        elwt.set_control_flow(ControlFlow::WaitUntil(
+            if search_state.pending || search_state.mutation.is_some() {
+                Instant::now() + Duration::from_millis(16)
+            } else {
+                last_caret_blink + Duration::from_millis(500)
+            },
+        ));
 
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::CloseRequested => {
-                    running.store(false, Ordering::Relaxed);
+                    if let Some(rx) = search_state.mutation.take() {
+                        let _ = rx.recv();
+                    }
+                    if let Some(rx) = save_result.take() {
+                        if let Ok(Err(error)) = rx.recv() {
+                            eprintln!("Save failed: {error}");
+                            window.set_title(&format!("Save failed: {error} - Texted"));
+                            return;
+                        }
+                    }
+                    let _ = buffer_client.send(BufferRequest::Shutdown);
                     elwt.exit();
                 }
                 WindowEvent::ModifiersChanged(mods) => {
                     current_modifiers = mods.state();
                 }
                 WindowEvent::Resized(_) => {
+                    snap_to_cursor_needed = true;
                     window.request_redraw();
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
-                    // Decoupled mouse scrolling: does not stop by cursor
-                    let lines_delta = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => (y * 2.5).round() as i32,
-                        MouseScrollDelta::PixelDelta(pos) => (pos.y / (font_engine.line_height_px as f64)).round() as i32,
-                    };
-                    if lines_delta > 0 {
-                        top_line = top_line.saturating_sub(lines_delta.unsigned_abs() as usize);
-                    } else if lines_delta < 0 {
-                        top_line = top_line.saturating_add(lines_delta.unsigned_abs() as usize);
+                    if let Some((_, config)) = current_view.as_ref() {
+                        let (dx, mut dy) = match delta {
+                            MouseScrollDelta::LineDelta(x, y) => (
+                                f64::from(x) * f64::from(font_engine.char_width_px) * 3.0,
+                                f64::from(y) * f64::from(font_engine.line_height_px) * 2.5,
+                            ),
+                            MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
+                        };
+                        if !word_wrap {
+                            let (horizontal_delta, vertical_delta) = horizontal_scroll::wheel_axes(
+                                dx,
+                                dy,
+                                current_modifiers.shift_key(),
+                            );
+                            dy = vertical_delta;
+                            horizontal.wheel(
+                                -horizontal_delta,
+                                font_engine.char_width_px,
+                                config.columns(),
+                            );
+                        }
+                        vertical_remainder -= dy / f64::from(font_engine.line_height_px);
+                        let rows = vertical_remainder.trunc() as i32;
+                        vertical_remainder -= f64::from(rows);
+                        if rows != 0 {
+                            if let Ok(BufferResponse::Snapshot(snap)) =
+                                buffer_client.send(BufferRequest::GetSnapshot)
+                            {
+                                let mut config = *config;
+                                config.scroll_rows(&snap, rows);
+                                top_line = config.top_line;
+                                top_wrap_row = config.top_wrap_row;
+                            }
+                        }
                     }
                     snap_to_cursor_needed = false;
                     window.request_redraw();
@@ -825,26 +759,50 @@ fn main() {
                 WindowEvent::CursorMoved { position, .. } => {
                     last_mouse_pos = (position.x as f32, position.y as f32);
 
+                    if let Some(bar) = current_scrollbar {
+                        if horizontal.drag(bar, last_mouse_pos.0) {
+                            snap_to_cursor_needed = false;
+                            window.request_redraw();
+                            return;
+                        }
+                    }
                     if is_mouse_dragging {
-                        let rel_y = (last_mouse_pos.1 - 4.0).max(0.0);
+                        let rel_y = (last_mouse_pos.1 - 2.0).max(0.0);
                         let rel_x = (last_mouse_pos.0 - current_text_start_x).max(0.0);
 
-                        let hover_line = (rel_y / font_engine.line_height_px).floor() as usize + top_line;
-                        let hover_col = (rel_x / font_engine.char_width_px).round() as usize;
+                        let (hover_line, hover_col) = current_view
+                            .as_ref()
+                            .map(|(layout, config)| {
+                                layout.screen_to_line_col(config, last_mouse_pos.0, rel_y)
+                            })
+                            .unwrap_or((
+                                top_line,
+                                (rel_x / font_engine.char_width_px).round() as usize,
+                            ));
 
                         if let Some((init_line, init_w_start, init_w_end)) = word_drag_anchor {
-                            if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                let lines: Vec<&str> = snap.content.split('\n').collect();
-                                let curr_line_str = lines.get(hover_line).copied().unwrap_or("");
-                                let (curr_w_start, curr_w_end) = find_word_boundaries(curr_line_str, hover_col);
+                            if let Ok(BufferResponse::Snapshot(snap)) =
+                                buffer_client.send(BufferRequest::GetSnapshot)
+                            {
+                                let lines = SnapshotLines(&snap);
+                                let curr_line_str = lines
+                                    .get(hover_line)
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_default();
+                                let (curr_w_start, curr_w_end) =
+                                    find_word_boundaries(&curr_line_str, hover_col);
 
                                 selection.mode = SelectionMode::Stream;
-                                if hover_line > init_line || (hover_line == init_line && hover_col > init_w_end) {
+                                if hover_line > init_line
+                                    || (hover_line == init_line && hover_col > init_w_end)
+                                {
                                     selection.anchor_line = init_line;
                                     selection.anchor_col = init_w_start;
                                     selection.active_line = hover_line;
                                     selection.active_col = curr_w_end;
-                                } else if hover_line < init_line || (hover_line == init_line && hover_col < init_w_start) {
+                                } else if hover_line < init_line
+                                    || (hover_line == init_line && hover_col < init_w_start)
+                                {
                                     selection.anchor_line = init_line;
                                     selection.anchor_col = init_w_end;
                                     selection.active_line = hover_line;
@@ -856,12 +814,17 @@ fn main() {
                                     selection.active_col = init_w_end;
                                 }
 
-                                let offset = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                let offset = snap.line_col_to_offset(
+                                    selection.active_line,
+                                    selection.active_col,
+                                );
                                 let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
                             }
                         } else if let Some(init_line) = line_drag_anchor {
-                            if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                let lines: Vec<&str> = snap.content.split('\n').collect();
+                            if let Ok(BufferResponse::Snapshot(snap)) =
+                                buffer_client.send(BufferRequest::GetSnapshot)
+                            {
+                                let lines = SnapshotLines(&snap);
                                 let total_lines = lines.len();
 
                                 selection.mode = SelectionMode::Stream;
@@ -869,7 +832,10 @@ fn main() {
                                     let (e_line, e_col) = if hover_line + 1 < total_lines {
                                         (hover_line + 1, 0)
                                     } else {
-                                        let last_line_len = lines.get(hover_line).map(|l| l.chars().count()).unwrap_or(0);
+                                        let last_line_len = lines
+                                            .get(hover_line)
+                                            .map(|l| l.len_chars())
+                                            .unwrap_or(0);
                                         (hover_line, last_line_len)
                                     };
                                     selection.anchor_line = init_line;
@@ -880,7 +846,10 @@ fn main() {
                                     let (a_line, a_col) = if init_line + 1 < total_lines {
                                         (init_line + 1, 0)
                                     } else {
-                                        let init_len = lines.get(init_line).map(|l| l.chars().count()).unwrap_or(0);
+                                        let init_len = lines
+                                            .get(init_line)
+                                            .map(|l| l.len_chars())
+                                            .unwrap_or(0);
                                         (init_line, init_len)
                                     };
                                     selection.anchor_line = a_line;
@@ -889,7 +858,10 @@ fn main() {
                                     selection.active_col = 0;
                                 }
 
-                                let offset = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                let offset = snap.line_col_to_offset(
+                                    selection.active_line,
+                                    selection.active_col,
+                                );
                                 let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
                             }
                         } else {
@@ -904,8 +876,10 @@ fn main() {
                             }
 
                             // Position cursor at active position
-                            if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                let offset = TextBuffer::line_col_to_offset_str(&snap.content, hover_line, hover_col);
+                            if let Ok(BufferResponse::Snapshot(snap)) =
+                                buffer_client.send(BufferRequest::GetSnapshot)
+                            {
+                                let offset = snap.line_col_to_offset(hover_line, hover_col);
                                 let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
                             }
                         }
@@ -915,8 +889,30 @@ fn main() {
                         window.request_redraw();
                     }
                 }
-                WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                    let rel_y = (last_mouse_pos.1 - 4.0).max(0.0);
+                WindowEvent::MouseInput {
+                    state,
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    if state == ElementState::Released && horizontal.end_drag() {
+                        window.request_redraw();
+                        return;
+                    }
+                    if let Some(bar) = current_scrollbar {
+                        if bar.contains(last_mouse_pos.0, last_mouse_pos.1) {
+                            if state == ElementState::Pressed {
+                                let columns = current_view
+                                    .as_ref()
+                                    .map_or(1, |(_, config)| config.columns());
+                                horizontal.press(bar, last_mouse_pos.0, columns);
+                                is_mouse_dragging = false;
+                                snap_to_cursor_needed = false;
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                    let rel_y = (last_mouse_pos.1 - 2.0).max(0.0);
                     let rel_x = (last_mouse_pos.0 - current_text_start_x).max(0.0);
 
                     // Check interaction with Search Bar buttons
@@ -924,14 +920,22 @@ fn main() {
                         let size = window.inner_size();
                         let panel_w = 480.0f32;
                         let panel_x = (size.width as f32 - panel_w - 12.0).max(0.0);
-                        let panel_h = if search_state.mode == SearchBarMode::Replace { 68.0 } else { 36.0 };
+                        let panel_h = if search_state.mode == SearchBarMode::Replace {
+                            68.0
+                        } else {
+                            36.0
+                        };
 
-                        if last_mouse_pos.0 >= panel_x && last_mouse_pos.0 <= panel_x + panel_w
-                            && last_mouse_pos.1 >= 8.0 && last_mouse_pos.1 <= 8.0 + panel_h
+                        if last_mouse_pos.0 >= panel_x
+                            && last_mouse_pos.0 <= panel_x + panel_w
+                            && last_mouse_pos.1 >= 8.0
+                            && last_mouse_pos.1 <= 8.0 + panel_h
                         {
                             if state == ElementState::Pressed {
                                 // 1. Close [X] button
-                                if last_mouse_pos.0 >= panel_x + panel_w - 28.0 && last_mouse_pos.1 <= 36.0 {
+                                if last_mouse_pos.0 >= panel_x + panel_w - 28.0
+                                    && last_mouse_pos.1 <= 36.0
+                                {
                                     search_state.mode = SearchBarMode::Closed;
                                     window.request_redraw();
                                     return;
@@ -939,8 +943,15 @@ fn main() {
 
                                 // 2. [< Prev] button
                                 let prev_btn_x = panel_x + 285.0;
-                                if last_mouse_pos.0 >= prev_btn_x && last_mouse_pos.0 <= prev_btn_x + 55.0 && last_mouse_pos.1 <= 36.0 {
-                                    find_prev_match(&buffer_client, &mut search_state, &mut selection);
+                                if last_mouse_pos.0 >= prev_btn_x
+                                    && last_mouse_pos.0 <= prev_btn_x + 55.0
+                                    && last_mouse_pos.1 <= 36.0
+                                {
+                                    find_prev_match(
+                                        &buffer_client,
+                                        &mut search_state,
+                                        &mut selection,
+                                    );
                                     snap_to_cursor_needed = true;
                                     window.request_redraw();
                                     return;
@@ -948,38 +959,39 @@ fn main() {
 
                                 // 3. [Next >] button
                                 let next_btn_x = panel_x + 345.0;
-                                if last_mouse_pos.0 >= next_btn_x && last_mouse_pos.0 <= next_btn_x + 55.0 && last_mouse_pos.1 <= 36.0 {
-                                    find_next_match(&buffer_client, &mut search_state, &mut selection);
+                                if last_mouse_pos.0 >= next_btn_x
+                                    && last_mouse_pos.0 <= next_btn_x + 55.0
+                                    && last_mouse_pos.1 <= 36.0
+                                {
+                                    find_next_match(
+                                        &buffer_client,
+                                        &mut search_state,
+                                        &mut selection,
+                                    );
                                     snap_to_cursor_needed = true;
                                     window.request_redraw();
                                     return;
                                 }
 
                                 // 4. Switch between Find and Replace fields
-                                if search_state.mode == SearchBarMode::Replace && last_mouse_pos.1 > 38.0 {
+                                if search_state.mode == SearchBarMode::Replace
+                                    && last_mouse_pos.1 > 38.0
+                                {
                                     // Replace or All buttons
                                     let repl_btn_x = panel_x + 245.0;
-                                    if last_mouse_pos.0 >= repl_btn_x && last_mouse_pos.0 <= repl_btn_x + 70.0 {
-                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                            let _ = buffer_client.send(BufferRequest::ReplaceNext {
-                                                query: search_state.find_query.clone(),
-                                                replacement: search_state.replace_query.clone(),
-                                                start_offset: snap.cursor_offset,
-                                            });
-                                            update_search_matches(&buffer_client, &mut search_state);
-                                            find_next_match(&buffer_client, &mut search_state, &mut selection);
-                                            snap_to_cursor_needed = true;
-                                            window.request_redraw();
-                                            return;
-                                        }
+                                    if last_mouse_pos.0 >= repl_btn_x
+                                        && last_mouse_pos.0 <= repl_btn_x + 70.0
+                                    {
+                                        start_replacement(&buffer_client, &mut search_state, false);
+                                        window.request_redraw();
+                                        return;
                                     }
 
                                     let all_btn_x = panel_x + 325.0;
-                                    if last_mouse_pos.0 >= all_btn_x && last_mouse_pos.0 <= all_btn_x + 45.0 {
-                                        let _ = buffer_client.send(BufferRequest::ReplaceAll {
-                                            query: search_state.find_query.clone(),
-                                            replacement: search_state.replace_query.clone(),
-                                        });
+                                    if last_mouse_pos.0 >= all_btn_x
+                                        && last_mouse_pos.0 <= all_btn_x + 45.0
+                                    {
+                                        start_replacement(&buffer_client, &mut search_state, true);
                                         update_search_matches(&buffer_client, &mut search_state);
                                         window.request_redraw();
                                         return;
@@ -995,8 +1007,15 @@ fn main() {
                         }
                     }
 
-                    let click_line = (rel_y / font_engine.line_height_px).floor() as usize + top_line;
-                    let click_col = (rel_x / font_engine.char_width_px).round() as usize;
+                    let (click_line, click_col) = current_view
+                        .as_ref()
+                        .map(|(layout, config)| {
+                            layout.screen_to_line_col(config, last_mouse_pos.0, rel_y)
+                        })
+                        .unwrap_or((
+                            top_line,
+                            (rel_x / font_engine.char_width_px).round() as usize,
+                        ));
 
                     match state {
                         ElementState::Pressed => {
@@ -1010,17 +1029,28 @@ fn main() {
                             }
                             last_click_time = now;
 
-                            if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                let (_, t_start, _) = compute_gutter_metrics(snap.total_lines, show_line_numbers, font_engine.char_width_px);
+                            if let Ok(BufferResponse::Snapshot(snap)) =
+                                buffer_client.send(BufferRequest::GetSnapshot)
+                            {
+                                let (_, t_start, _) = compute_gutter_metrics(
+                                    snap.total_lines,
+                                    show_line_numbers,
+                                    font_engine.char_width_px,
+                                );
                                 current_text_start_x = t_start as f32;
 
-                                let lines: Vec<&str> = snap.content.split('\n').collect();
-                                let line_len = lines.get(click_line).map(|l| l.chars().count()).unwrap_or(0);
+                                let lines = SnapshotLines(&snap);
+                                let line_len =
+                                    lines.get(click_line).map(|l| l.len_chars()).unwrap_or(0);
 
                                 if click_count == 2 {
                                     // Double click: Select Word
-                                    let line_str = lines.get(click_line).copied().unwrap_or("");
-                                    let (w_start, w_end) = find_word_boundaries(line_str, click_col);
+                                    let line_str = lines
+                                        .get(click_line)
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_default();
+                                    let (w_start, w_end) =
+                                        find_word_boundaries(&line_str, click_col);
                                     selection = SelectionState {
                                         mode: SelectionMode::Stream,
                                         anchor_line: click_line,
@@ -1030,8 +1060,9 @@ fn main() {
                                     };
                                     word_drag_anchor = Some((click_line, w_start, w_end));
                                     line_drag_anchor = None;
-                                    let offset = TextBuffer::line_col_to_offset_str(&snap.content, click_line, w_end);
-                                    let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
+                                    let offset = snap.line_col_to_offset(click_line, w_end);
+                                    let _ =
+                                        buffer_client.send(BufferRequest::SetCursorOffset(offset));
                                 } else if click_count >= 3 {
                                     // Triple click: Select Entire Line
                                     let total_lines = lines.len();
@@ -1049,22 +1080,28 @@ fn main() {
                                     };
                                     line_drag_anchor = Some(click_line);
                                     word_drag_anchor = None;
-                                    let offset = TextBuffer::line_col_to_offset_str(&snap.content, e_line, e_col);
-                                    let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
+                                    let offset = snap.line_col_to_offset(e_line, e_col);
+                                    let _ =
+                                        buffer_client.send(BufferRequest::SetCursorOffset(offset));
                                 } else {
                                     // Single click
                                     word_drag_anchor = None;
                                     line_drag_anchor = None;
                                     let is_block = current_modifiers.alt_key();
                                     selection = SelectionState {
-                                        mode: if is_block { SelectionMode::Block } else { SelectionMode::None },
+                                        mode: if is_block {
+                                            SelectionMode::Block
+                                        } else {
+                                            SelectionMode::None
+                                        },
                                         anchor_line: click_line,
                                         anchor_col: click_col,
                                         active_line: click_line,
                                         active_col: click_col,
                                     };
-                                    let offset = TextBuffer::line_col_to_offset_str(&snap.content, click_line, click_col);
-                                    let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
+                                    let offset = snap.line_col_to_offset(click_line, click_col);
+                                    let _ =
+                                        buffer_client.send(BufferRequest::SetCursorOffset(offset));
                                 }
                             }
 
@@ -1087,20 +1124,22 @@ fn main() {
                     }
                 }
                 WindowEvent::KeyboardInput {
-                    event: KeyEvent {
-                        state: ElementState::Pressed,
-                        logical_key,
-                        physical_key,
-                        text,
-                        ..
-                    },
+                    event:
+                        KeyEvent {
+                            state: ElementState::Pressed,
+                            logical_key,
+                            physical_key,
+                            text,
+                            ..
+                        },
                     ..
                 } => {
                     caret_visible = true;
                     last_caret_blink = Instant::now();
                     snap_to_cursor_needed = true; // Key input centers/snaps viewport to caret
 
-                    let is_ctrl_or_cmd = current_modifiers.control_key() || current_modifiers.super_key();
+                    let is_ctrl_or_cmd =
+                        current_modifiers.control_key() || current_modifiers.super_key();
                     let is_alt = current_modifiers.alt_key();
                     let is_shift = current_modifiers.shift_key();
 
@@ -1124,10 +1163,13 @@ fn main() {
                     if is_ctrl_or_cmd {
                         if matches_key(KeyCode::KeyA, 'a') {
                             // Cmd+A: Select All
-                            if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                let lines: Vec<&str> = snap.content.split('\n').collect();
+                            if let Ok(BufferResponse::Snapshot(snap)) =
+                                buffer_client.send(BufferRequest::GetSnapshot)
+                            {
+                                let lines = SnapshotLines(&snap);
                                 let total_lines = lines.len();
-                                let last_line_len = lines.last().map(|l| l.chars().count()).unwrap_or(0);
+                                let last_line_len =
+                                    lines.last().map(|l| l.len_chars()).unwrap_or(0);
                                 selection = SelectionState {
                                     mode: SelectionMode::Stream,
                                     anchor_line: 0,
@@ -1135,7 +1177,8 @@ fn main() {
                                     active_line: total_lines.saturating_sub(1),
                                     active_col: last_line_len,
                                 };
-                                let _ = buffer_client.send(BufferRequest::SetCursorOffset(snap.total_bytes));
+                                let _ = buffer_client
+                                    .send(BufferRequest::SetCursorOffset(snap.total_bytes));
                             }
                             window.request_redraw();
                             return;
@@ -1146,22 +1189,34 @@ fn main() {
                                 let max_l = selection.anchor_line.max(selection.active_line);
                                 let min_c = selection.anchor_col.min(selection.active_col);
                                 let max_c = selection.anchor_col.max(selection.active_col);
-                                if let Ok(BufferResponse::Text(extracted)) = buffer_client.send(BufferRequest::BlockExtract {
-                                    start_line: min_l,
-                                    end_line: max_l,
-                                    start_col: min_c,
-                                    end_col: max_c,
-                                }) {
+                                if let Ok(BufferResponse::Text(extracted)) =
+                                    buffer_client.send(BufferRequest::BlockExtract {
+                                        start_line: min_l,
+                                        end_line: max_l,
+                                        start_col: min_c,
+                                        end_col: max_c,
+                                    })
+                                {
                                     copy_to_system_clipboard(&extracted);
                                 }
                             } else if selection.mode == SelectionMode::Stream {
-                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                    let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                    let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                if let Ok(BufferResponse::Snapshot(snap)) =
+                                    buffer_client.send(BufferRequest::GetSnapshot)
+                                {
+                                    let off_a = snap.line_col_to_offset(
+                                        selection.anchor_line,
+                                        selection.anchor_col,
+                                    );
+                                    let off_b = snap.line_col_to_offset(
+                                        selection.active_line,
+                                        selection.active_col,
+                                    );
                                     let min_off = off_a.min(off_b);
                                     let max_off = off_a.max(off_b);
-                                    if min_off < max_off && max_off <= snap.content.len() {
-                                        copy_to_system_clipboard(&snap.content[min_off..max_off]);
+                                    if min_off < max_off && max_off <= snap.total_bytes {
+                                        copy_to_system_clipboard(
+                                            &snap.content.byte_slice(min_off..max_off).to_string(),
+                                        );
                                     }
                                 }
                             }
@@ -1174,7 +1229,11 @@ fn main() {
                                     if search_state.active_field == 0 {
                                         search_state.find_query.push_str(&clip);
                                         update_search_matches(&buffer_client, &mut search_state);
-                                        find_next_match(&buffer_client, &mut search_state, &mut selection);
+                                        find_next_match(
+                                            &buffer_client,
+                                            &mut search_state,
+                                            &mut selection,
+                                        );
                                     } else {
                                         search_state.replace_query.push_str(&clip);
                                     }
@@ -1203,17 +1262,34 @@ fn main() {
                                             text: line_text.to_string(),
                                         });
                                     }
-                                    let max_clip_line_len = clip_lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+                                    let max_clip_line_len = clip_lines
+                                        .iter()
+                                        .map(|l| l.chars().count())
+                                        .max()
+                                        .unwrap_or(0);
                                     selection.anchor_line = min_l;
-                                    selection.active_line = (min_l + clip_lines.len().saturating_sub(1)).max(max_l);
+                                    selection.active_line =
+                                        (min_l + clip_lines.len().saturating_sub(1)).max(max_l);
                                     selection.anchor_col = min_c + max_clip_line_len;
                                     selection.active_col = min_c + max_clip_line_len;
                                 } else {
                                     if selection.mode == SelectionMode::Stream {
-                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
-                                            let _ = buffer_client.send(BufferRequest::DeleteRange { start: off_a.min(off_b), end: off_a.max(off_b) });
+                                        if let Ok(BufferResponse::Snapshot(snap)) =
+                                            buffer_client.send(BufferRequest::GetSnapshot)
+                                        {
+                                            let off_a = snap.line_col_to_offset(
+                                                selection.anchor_line,
+                                                selection.anchor_col,
+                                            );
+                                            let off_b = snap.line_col_to_offset(
+                                                selection.active_line,
+                                                selection.active_col,
+                                            );
+                                            let _ =
+                                                buffer_client.send(BufferRequest::DeleteRange {
+                                                    start: off_a.min(off_b),
+                                                    end: off_a.max(off_b),
+                                                });
                                         }
                                         selection.mode = SelectionMode::None;
                                     }
@@ -1232,12 +1308,14 @@ fn main() {
                                 let max_l = selection.anchor_line.max(selection.active_line);
                                 let min_c = selection.anchor_col.min(selection.active_col);
                                 let max_c = selection.anchor_col.max(selection.active_col);
-                                if let Ok(BufferResponse::Text(extracted)) = buffer_client.send(BufferRequest::BlockExtract {
-                                    start_line: min_l,
-                                    end_line: max_l,
-                                    start_col: min_c,
-                                    end_col: max_c,
-                                }) {
+                                if let Ok(BufferResponse::Text(extracted)) =
+                                    buffer_client.send(BufferRequest::BlockExtract {
+                                        start_line: min_l,
+                                        end_line: max_l,
+                                        start_col: min_c,
+                                        end_col: max_c,
+                                    })
+                                {
                                     copy_to_system_clipboard(&extracted);
                                     let _ = buffer_client.send(BufferRequest::BlockDelete {
                                         start_line: min_l,
@@ -1248,14 +1326,27 @@ fn main() {
                                 }
                                 selection.mode = SelectionMode::None;
                             } else if selection.mode == SelectionMode::Stream {
-                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                    let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                    let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                if let Ok(BufferResponse::Snapshot(snap)) =
+                                    buffer_client.send(BufferRequest::GetSnapshot)
+                                {
+                                    let off_a = snap.line_col_to_offset(
+                                        selection.anchor_line,
+                                        selection.anchor_col,
+                                    );
+                                    let off_b = snap.line_col_to_offset(
+                                        selection.active_line,
+                                        selection.active_col,
+                                    );
                                     let min_off = off_a.min(off_b);
                                     let max_off = off_a.max(off_b);
-                                    if min_off < max_off && max_off <= snap.content.len() {
-                                        copy_to_system_clipboard(&snap.content[min_off..max_off]);
-                                        let _ = buffer_client.send(BufferRequest::DeleteRange { start: min_off, end: max_off });
+                                    if min_off < max_off && max_off <= snap.total_bytes {
+                                        copy_to_system_clipboard(
+                                            &snap.content.byte_slice(min_off..max_off).to_string(),
+                                        );
+                                        let _ = buffer_client.send(BufferRequest::DeleteRange {
+                                            start: min_off,
+                                            end: max_off,
+                                        });
                                     }
                                 }
                                 selection.mode = SelectionMode::None;
@@ -1267,13 +1358,22 @@ fn main() {
                             search_state.mode = SearchBarMode::Find;
                             search_state.active_field = 0;
                             if selection.mode == SelectionMode::Stream {
-                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                    let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                    let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                if let Ok(BufferResponse::Snapshot(snap)) =
+                                    buffer_client.send(BufferRequest::GetSnapshot)
+                                {
+                                    let off_a = snap.line_col_to_offset(
+                                        selection.anchor_line,
+                                        selection.anchor_col,
+                                    );
+                                    let off_b = snap.line_col_to_offset(
+                                        selection.active_line,
+                                        selection.active_col,
+                                    );
                                     let min_off = off_a.min(off_b);
                                     let max_off = off_a.max(off_b);
                                     if min_off < max_off && max_off - min_off < 100 {
-                                        search_state.find_query = snap.content[min_off..max_off].to_string();
+                                        search_state.find_query =
+                                            snap.content.byte_slice(min_off..max_off).to_string();
                                         update_search_matches(&buffer_client, &mut search_state);
                                     }
                                 }
@@ -1324,11 +1424,28 @@ fn main() {
                             window.request_redraw();
                             return;
                         } else if matches_key(KeyCode::KeyS, 's') {
-                            if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                let save_path = current_file_path.clone().unwrap_or_else(|| PathBuf::from("note.txt"));
-                                if IoManager::save_atomic(&save_path, &snap.content, false, LineEnding::Lf).is_ok() {
-                                    current_file_path = Some(save_path.clone());
-                                    window.set_title(&format!("{} - Texted", save_path.display()));
+                            if let Ok(BufferResponse::Snapshot(snap)) =
+                                buffer_client.send(BufferRequest::GetSnapshot)
+                            {
+                                let save_path = current_file_path
+                                    .clone()
+                                    .unwrap_or_else(|| PathBuf::from("note.txt"));
+                                if save_result.is_none() {
+                                    let (tx, rx) = std::sync::mpsc::channel();
+                                    save_result = Some(rx);
+                                    let save_window = window.clone();
+                                    thread::spawn(move || {
+                                        let result = IoManager::save_rope(
+                                            &save_path,
+                                            &snap.content,
+                                            file_bom,
+                                            file_ending,
+                                        )
+                                        .map(|()| save_path)
+                                        .map_err(|e| e.to_string());
+                                        let _ = tx.send(result);
+                                        save_window.request_redraw();
+                                    });
                                 }
                             }
                             window.request_redraw();
@@ -1359,22 +1476,22 @@ fn main() {
                                 return;
                             }
                             Key::Named(NamedKey::Enter) => {
-                                if search_state.mode == SearchBarMode::Replace && search_state.active_field == 1 {
-                                    if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                        let _ = buffer_client.send(BufferRequest::ReplaceNext {
-                                            query: search_state.find_query.clone(),
-                                            replacement: search_state.replace_query.clone(),
-                                            start_offset: snap.cursor_offset,
-                                        });
-                                        update_search_matches(&buffer_client, &mut search_state);
-                                        find_next_match(&buffer_client, &mut search_state, &mut selection);
-                                    }
+                                if search_state.mode == SearchBarMode::Replace
+                                    && search_state.active_field == 1
+                                {
+                                    start_replacement(&buffer_client, &mut search_state, false);
+                                } else if current_modifiers.shift_key() {
+                                    find_prev_match(
+                                        &buffer_client,
+                                        &mut search_state,
+                                        &mut selection,
+                                    );
                                 } else {
-                                    if current_modifiers.shift_key() {
-                                        find_prev_match(&buffer_client, &mut search_state, &mut selection);
-                                    } else {
-                                        find_next_match(&buffer_client, &mut search_state, &mut selection);
-                                    }
+                                    find_next_match(
+                                        &buffer_client,
+                                        &mut search_state,
+                                        &mut selection,
+                                    );
                                 }
                                 window.request_redraw();
                                 return;
@@ -1384,7 +1501,11 @@ fn main() {
                                     search_state.find_query.pop();
                                     update_search_matches(&buffer_client, &mut search_state);
                                     if !search_state.find_query.is_empty() {
-                                        find_next_match(&buffer_client, &mut search_state, &mut selection);
+                                        find_next_match(
+                                            &buffer_client,
+                                            &mut search_state,
+                                            &mut selection,
+                                        );
                                     }
                                 } else {
                                     search_state.replace_query.pop();
@@ -1398,8 +1519,15 @@ fn main() {
                                         if !ch.is_control() {
                                             if search_state.active_field == 0 {
                                                 search_state.find_query.push(ch);
-                                                update_search_matches(&buffer_client, &mut search_state);
-                                                find_next_match(&buffer_client, &mut search_state, &mut selection);
+                                                update_search_matches(
+                                                    &buffer_client,
+                                                    &mut search_state,
+                                                );
+                                                find_next_match(
+                                                    &buffer_client,
+                                                    &mut search_state,
+                                                    &mut selection,
+                                                );
                                             } else {
                                                 search_state.replace_query.push(ch);
                                             }
@@ -1416,6 +1544,7 @@ fn main() {
                     match logical_key {
                         Key::Named(NamedKey::F3) => {
                             show_perf_hud = !show_perf_hud;
+                            snap_to_cursor_needed = false;
                             window.request_redraw();
                             return;
                         }
@@ -1433,10 +1562,17 @@ fn main() {
                         | Key::Named(NamedKey::PageUp)
                         | Key::Named(NamedKey::PageDown) => {
                             // 1. Shift+Option+Up/Down: Block/Column Selection Mode
-                            if is_shift && is_alt && (matches!(logical_key, Key::Named(NamedKey::ArrowUp)) || matches!(logical_key, Key::Named(NamedKey::ArrowDown))) {
+                            if is_shift
+                                && is_alt
+                                && (matches!(logical_key, Key::Named(NamedKey::ArrowUp))
+                                    || matches!(logical_key, Key::Named(NamedKey::ArrowDown)))
+                            {
                                 if selection.mode != SelectionMode::Block {
-                                    if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                        let (cur_l, cur_c) = TextBuffer::offset_to_line_col_str(&snap.content, snap.cursor_offset);
+                                    if let Ok(BufferResponse::Snapshot(snap)) =
+                                        buffer_client.send(BufferRequest::GetSnapshot)
+                                    {
+                                        let (cur_l, cur_c) =
+                                            snap.offset_to_line_col(snap.cursor_offset);
                                         selection.mode = SelectionMode::Block;
                                         selection.anchor_line = cur_l;
                                         selection.anchor_col = cur_c;
@@ -1458,8 +1594,11 @@ fn main() {
                             // 2. Stream Range Selection via Shift
                             if is_shift {
                                 if selection.mode != SelectionMode::Stream {
-                                    if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                        let (cur_l, cur_c) = TextBuffer::offset_to_line_col_str(&snap.content, snap.cursor_offset);
+                                    if let Ok(BufferResponse::Snapshot(snap)) =
+                                        buffer_client.send(BufferRequest::GetSnapshot)
+                                    {
+                                        let (cur_l, cur_c) =
+                                            snap.offset_to_line_col(snap.cursor_offset);
                                         selection.mode = SelectionMode::Stream;
                                         selection.anchor_line = cur_l;
                                         selection.anchor_col = cur_c;
@@ -1470,20 +1609,48 @@ fn main() {
                             } else {
                                 // If Shift is NOT held, collapse any existing Stream selection
                                 if selection.mode == SelectionMode::Stream {
-                                    if matches!(logical_key, Key::Named(NamedKey::ArrowLeft)) && !is_ctrl_or_cmd && !is_alt {
-                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
-                                            let _ = buffer_client.send(BufferRequest::SetCursorOffset(off_a.min(off_b)));
+                                    if matches!(logical_key, Key::Named(NamedKey::ArrowLeft))
+                                        && !is_ctrl_or_cmd
+                                        && !is_alt
+                                    {
+                                        if let Ok(BufferResponse::Snapshot(snap)) =
+                                            buffer_client.send(BufferRequest::GetSnapshot)
+                                        {
+                                            let off_a = snap.line_col_to_offset(
+                                                selection.anchor_line,
+                                                selection.anchor_col,
+                                            );
+                                            let off_b = snap.line_col_to_offset(
+                                                selection.active_line,
+                                                selection.active_col,
+                                            );
+                                            let _ = buffer_client.send(
+                                                BufferRequest::SetCursorOffset(off_a.min(off_b)),
+                                            );
                                         }
                                         selection.mode = SelectionMode::None;
                                         window.request_redraw();
                                         return;
-                                    } else if matches!(logical_key, Key::Named(NamedKey::ArrowRight)) && !is_ctrl_or_cmd && !is_alt {
-                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                            let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                            let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
-                                            let _ = buffer_client.send(BufferRequest::SetCursorOffset(off_a.max(off_b)));
+                                    } else if matches!(
+                                        logical_key,
+                                        Key::Named(NamedKey::ArrowRight)
+                                    ) && !is_ctrl_or_cmd
+                                        && !is_alt
+                                    {
+                                        if let Ok(BufferResponse::Snapshot(snap)) =
+                                            buffer_client.send(BufferRequest::GetSnapshot)
+                                        {
+                                            let off_a = snap.line_col_to_offset(
+                                                selection.anchor_line,
+                                                selection.anchor_col,
+                                            );
+                                            let off_b = snap.line_col_to_offset(
+                                                selection.active_line,
+                                                selection.active_col,
+                                            );
+                                            let _ = buffer_client.send(
+                                                BufferRequest::SetCursorOffset(off_a.max(off_b)),
+                                            );
                                         }
                                         selection.mode = SelectionMode::None;
                                         window.request_redraw();
@@ -1497,25 +1664,31 @@ fn main() {
                             match logical_key {
                                 Key::Named(NamedKey::ArrowLeft) => {
                                     if is_ctrl_or_cmd {
-                                        let _ = buffer_client.send(BufferRequest::MoveHome); // Cmd+Left: Line start
+                                        let _ = buffer_client.send(BufferRequest::MoveHome);
+                                    // Cmd+Left: Line start
                                     } else if is_alt {
-                                        let _ = buffer_client.send(BufferRequest::MoveWordLeft); // Opt+Left: Word left
+                                        let _ = buffer_client.send(BufferRequest::MoveWordLeft);
+                                    // Opt+Left: Word left
                                     } else {
                                         let _ = buffer_client.send(BufferRequest::MoveLeft);
                                     }
                                 }
                                 Key::Named(NamedKey::ArrowRight) => {
                                     if is_ctrl_or_cmd {
-                                        let _ = buffer_client.send(BufferRequest::MoveEnd); // Cmd+Right: Line end
+                                        let _ = buffer_client.send(BufferRequest::MoveEnd);
+                                    // Cmd+Right: Line end
                                     } else if is_alt {
-                                        let _ = buffer_client.send(BufferRequest::MoveWordRight); // Opt+Right: Word right
+                                        let _ = buffer_client.send(BufferRequest::MoveWordRight);
+                                    // Opt+Right: Word right
                                     } else {
                                         let _ = buffer_client.send(BufferRequest::MoveRight);
                                     }
                                 }
                                 Key::Named(NamedKey::ArrowUp) => {
                                     if is_ctrl_or_cmd {
-                                        let _ = buffer_client.send(BufferRequest::SetCursorOffset(0)); // Cmd+Up: Doc start
+                                        let _ =
+                                            buffer_client.send(BufferRequest::SetCursorOffset(0));
+                                    // Cmd+Up: Doc start
                                     } else if is_alt {
                                         for _ in 0..5 {
                                             let _ = buffer_client.send(BufferRequest::MoveUp);
@@ -1526,8 +1699,12 @@ fn main() {
                                 }
                                 Key::Named(NamedKey::ArrowDown) => {
                                     if is_ctrl_or_cmd {
-                                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                            let _ = buffer_client.send(BufferRequest::SetCursorOffset(snap.total_bytes)); // Cmd+Down: Doc end
+                                        if let Ok(BufferResponse::Snapshot(snap)) =
+                                            buffer_client.send(BufferRequest::GetSnapshot)
+                                        {
+                                            let _ = buffer_client.send(
+                                                BufferRequest::SetCursorOffset(snap.total_bytes),
+                                            ); // Cmd+Down: Doc end
                                         }
                                     } else if is_alt {
                                         for _ in 0..5 {
@@ -1558,8 +1735,11 @@ fn main() {
 
                             // 4. Update active head of selection if Shift is held
                             if is_shift {
-                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                    let (cur_l, cur_c) = TextBuffer::offset_to_line_col_str(&snap.content, snap.cursor_offset);
+                                if let Ok(BufferResponse::Snapshot(snap)) =
+                                    buffer_client.send(BufferRequest::GetSnapshot)
+                                {
+                                    let (cur_l, cur_c) =
+                                        snap.offset_to_line_col(snap.cursor_offset);
                                     selection.active_line = cur_l;
                                     selection.active_col = cur_c;
                                 }
@@ -1594,22 +1774,33 @@ fn main() {
                                     selection.active_col = min_c - 1;
                                 }
                             } else if selection.mode == SelectionMode::Stream {
-                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                    let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                    let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                if let Ok(BufferResponse::Snapshot(snap)) =
+                                    buffer_client.send(BufferRequest::GetSnapshot)
+                                {
+                                    let off_a = snap.line_col_to_offset(
+                                        selection.anchor_line,
+                                        selection.anchor_col,
+                                    );
+                                    let off_b = snap.line_col_to_offset(
+                                        selection.active_line,
+                                        selection.active_col,
+                                    );
                                     let min_off = off_a.min(off_b);
                                     let max_off = off_a.max(off_b);
-                                    let _ = buffer_client.send(BufferRequest::DeleteRange { start: min_off, end: max_off });
+                                    let _ = buffer_client.send(BufferRequest::DeleteRange {
+                                        start: min_off,
+                                        end: max_off,
+                                    });
                                 }
                                 selection.mode = SelectionMode::None;
+                            } else if is_ctrl_or_cmd {
+                                let _ = buffer_client.send(BufferRequest::DeleteToLineStart);
+                            // Cmd+Backspace
+                            } else if is_alt {
+                                let _ = buffer_client.send(BufferRequest::DeleteWordLeft);
+                            // Opt+Backspace
                             } else {
-                                if is_ctrl_or_cmd {
-                                    let _ = buffer_client.send(BufferRequest::DeleteToLineStart); // Cmd+Backspace
-                                } else if is_alt {
-                                    let _ = buffer_client.send(BufferRequest::DeleteWordLeft); // Opt+Backspace
-                                } else {
-                                    let _ = buffer_client.send(BufferRequest::Backspace);
-                                }
+                                let _ = buffer_client.send(BufferRequest::Backspace);
                             }
                         }
                         Key::Named(NamedKey::Delete) => {
@@ -1637,20 +1828,31 @@ fn main() {
                                     });
                                 }
                             } else if selection.mode == SelectionMode::Stream {
-                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                    let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                    let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
-                                    let _ = buffer_client.send(BufferRequest::DeleteRange { start: off_a.min(off_b), end: off_a.max(off_b) });
+                                if let Ok(BufferResponse::Snapshot(snap)) =
+                                    buffer_client.send(BufferRequest::GetSnapshot)
+                                {
+                                    let off_a = snap.line_col_to_offset(
+                                        selection.anchor_line,
+                                        selection.anchor_col,
+                                    );
+                                    let off_b = snap.line_col_to_offset(
+                                        selection.active_line,
+                                        selection.active_col,
+                                    );
+                                    let _ = buffer_client.send(BufferRequest::DeleteRange {
+                                        start: off_a.min(off_b),
+                                        end: off_a.max(off_b),
+                                    });
                                 }
                                 selection.mode = SelectionMode::None;
+                            } else if is_ctrl_or_cmd {
+                                let _ = buffer_client.send(BufferRequest::DeleteToLineEnd);
+                            // Cmd+Delete
+                            } else if is_alt {
+                                let _ = buffer_client.send(BufferRequest::DeleteWordRight);
+                            // Opt+Delete
                             } else {
-                                if is_ctrl_or_cmd {
-                                    let _ = buffer_client.send(BufferRequest::DeleteToLineEnd); // Cmd+Delete
-                                } else if is_alt {
-                                    let _ = buffer_client.send(BufferRequest::DeleteWordRight); // Opt+Delete
-                                } else {
-                                    let _ = buffer_client.send(BufferRequest::DeleteForward);
-                                }
+                                let _ = buffer_client.send(BufferRequest::DeleteForward);
                             }
                         }
                         Key::Named(NamedKey::Enter) => {
@@ -1712,46 +1914,68 @@ fn main() {
                                 for ch in t.chars() {
                                     if !ch.is_control() {
                                         if selection.mode == SelectionMode::Block {
-                                            let min_l = selection.anchor_line.min(selection.active_line);
-                                            let max_l = selection.anchor_line.max(selection.active_line);
-                                            let min_c = selection.anchor_col.min(selection.active_col);
-                                            let max_c = selection.anchor_col.max(selection.active_col);
+                                            let min_l =
+                                                selection.anchor_line.min(selection.active_line);
+                                            let max_l =
+                                                selection.anchor_line.max(selection.active_line);
+                                            let min_c =
+                                                selection.anchor_col.min(selection.active_col);
+                                            let max_c =
+                                                selection.anchor_col.max(selection.active_col);
 
                                             if min_c < max_c {
-                                                let _ = buffer_client.send(BufferRequest::BlockDelete {
-                                                    start_line: min_l,
-                                                    end_line: max_l,
-                                                    start_col: min_c,
-                                                    end_col: max_c,
-                                                });
+                                                let _ = buffer_client.send(
+                                                    BufferRequest::BlockDelete {
+                                                        start_line: min_l,
+                                                        end_line: max_l,
+                                                        start_col: min_c,
+                                                        end_col: max_c,
+                                                    },
+                                                );
                                                 selection.anchor_col = min_c;
                                                 selection.active_col = min_c;
                                             }
 
-                                            let _ = buffer_client.send(BufferRequest::BlockInsert {
-                                                start_line: min_l,
-                                                end_line: max_l,
-                                                col: min_c,
-                                                text: ch.to_string(),
-                                            });
+                                            let _ =
+                                                buffer_client.send(BufferRequest::BlockInsert {
+                                                    start_line: min_l,
+                                                    end_line: max_l,
+                                                    col: min_c,
+                                                    text: ch.to_string(),
+                                                });
                                             selection.anchor_line = min_l;
                                             selection.active_line = max_l;
                                             selection.anchor_col = min_c + 1;
                                             selection.active_col = min_c + 1;
                                         } else {
                                             if selection.mode == SelectionMode::Stream {
-                                                if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                                                    let off_a = TextBuffer::line_col_to_offset_str(&snap.content, selection.anchor_line, selection.anchor_col);
-                                                    let off_b = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                                if let Ok(BufferResponse::Snapshot(snap)) =
+                                                    buffer_client.send(BufferRequest::GetSnapshot)
+                                                {
+                                                    let off_a = snap.line_col_to_offset(
+                                                        selection.anchor_line,
+                                                        selection.anchor_col,
+                                                    );
+                                                    let off_b = snap.line_col_to_offset(
+                                                        selection.active_line,
+                                                        selection.active_col,
+                                                    );
                                                     let min_off = off_a.min(off_b);
                                                     let max_off = off_a.max(off_b);
-                                                    let _ = buffer_client.send(BufferRequest::DeleteRange { start: min_off, end: max_off });
+                                                    let _ = buffer_client.send(
+                                                        BufferRequest::DeleteRange {
+                                                            start: min_off,
+                                                            end: max_off,
+                                                        },
+                                                    );
                                                 }
                                                 selection.mode = SelectionMode::None;
                                             }
 
-                                            let pulse = Pulse::new(0, PULSE_KEY_INPUT, ch as u32 as u64);
-                                            let _ = buffer_client.send_pulse(pulse);
+                                            let _ = buffer_client.send(BufferRequest::Insert {
+                                                offset: usize::MAX,
+                                                text: ch.to_string(),
+                                            });
                                         }
                                     }
                                 }
@@ -1763,6 +1987,44 @@ fn main() {
                 }
                 WindowEvent::RedrawRequested => {
                     let frame_start = Instant::now();
+                    if let Some(plan) = search_state
+                        .mutation
+                        .as_ref()
+                        .and_then(|rx| rx.try_recv().ok())
+                    {
+                        // Commit on the UI event boundary so an input handler cannot race a background mutation.
+                        let (revision, cursor, edited) = plan;
+                        let committed = edited.is_none_or(|edited| {
+                            matches!(
+                                buffer_client.send(BufferRequest::CommitReplacement {
+                                    revision,
+                                    cursor,
+                                    edited
+                                }),
+                                Ok(BufferResponse::Committed(true))
+                            )
+                        });
+                        if committed {
+                            selection.mode = SelectionMode::None;
+                            snap_to_cursor_needed = true;
+                        } else {
+                            window.set_title("Replacement skipped: document changed - Texted");
+                        }
+                        search_state.mutation = None;
+                    }
+                    if let Some(result) = save_result.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                        match result {
+                            Ok(path) => {
+                                window.set_title(&format!("{} - Texted", path.display()));
+                                current_file_path = Some(path);
+                            }
+                            Err(error) => {
+                                eprintln!("Save failed: {error}");
+                                window.set_title(&format!("Save failed: {error} - Texted"));
+                            }
+                        }
+                        save_result = None;
+                    }
                     let size = window.inner_size();
                     if size.width == 0 || size.height == 0 {
                         return;
@@ -1770,6 +2032,8 @@ fn main() {
 
                     let width = size.width as usize;
                     let height = size.height as usize;
+                    let text_height =
+                        height.saturating_sub(28 + if word_wrap { 0 } else { BAR_HEIGHT });
 
                     let _ = surface.resize(
                         NonZeroU32::new(size.width).unwrap(),
@@ -1788,15 +2052,42 @@ fn main() {
                     }
 
                     // 1. Fetch Snapshot from Buffer Server via Microkernel
-                    let snap = match buffer_client.send(BufferRequest::GetSnapshot) {
+                    let mut snap = match buffer_client.send(BufferRequest::GetSnapshot) {
                         Ok(BufferResponse::Snapshot(s)) => s,
                         _ => return,
                     };
 
-                    let (cur_line, cur_col) = LayoutEngine::offset_to_line_col(&snap.content, snap.cursor_offset);
+                    if search_state.mode != SearchBarMode::Closed {
+                        submit_search(snap.clone(), &mut search_state);
+                    }
+                    while let Ok((revision, query, matches)) = search_state.results.try_recv() {
+                        if search_state.submitted.as_ref() == Some(&(revision, query)) {
+                            search_state.matches = matches;
+                            search_state.current_match_idx = None;
+                            search_state.pending = false;
+                        }
+                    }
+                    if !search_state.pending && search_state.mode != SearchBarMode::Closed {
+                        if let Some(forward) = search_state.pending_navigation.take() {
+                            if forward {
+                                find_next_match(&buffer_client, &mut search_state, &mut selection);
+                            } else {
+                                find_prev_match(&buffer_client, &mut search_state, &mut selection);
+                            }
+                            if let Ok(BufferResponse::Snapshot(updated)) =
+                                buffer_client.send(BufferRequest::GetSnapshot)
+                            {
+                                snap = updated;
+                            }
+                            snap_to_cursor_needed = true;
+                        }
+                    }
+                    let (cur_line, cur_col) = snap.offset_to_line_col(snap.cursor_offset);
 
                     // 2. Viewport auto-scrolling: only triggered on keyboard interaction, decoupled from mouse scrolling
-                    let visible_rows = (height.saturating_sub(28) as f32 / font_engine.line_height_px).floor() as usize;
+                    let visible_rows =
+                        (text_height as f32 / font_engine.line_height_px).floor() as usize;
+                    let snap_horiz = snap_to_cursor_needed;
                     if snap_to_cursor_needed {
                         if cur_line < top_line {
                             top_line = cur_line;
@@ -1813,17 +2104,59 @@ fn main() {
                     );
                     current_text_start_x = text_start_x as f32;
 
-                    let config = ViewportConfig {
+                    let mut config = ViewportConfig {
                         width_px: width as f32,
-                        height_px: (height.saturating_sub(28)) as f32,
+                        height_px: text_height as f32,
                         line_height_px: font_engine.line_height_px,
                         char_width_px: font_engine.char_width_px,
                         top_line,
+                        top_wrap_row,
+                        left_col: 0,
                         word_wrap,
                         show_line_numbers,
                         line_number_gutter_width_px: gutter_w,
                     };
 
+                    config.top_line = config.top_line.min(snap.total_lines - 1);
+                    if !word_wrap {
+                        config.top_wrap_row = 0;
+                    }
+                    if snap_horiz && word_wrap {
+                        let caret_row = (cur_col / config.columns())
+                            .min(config.rows_for_line(&snap, cur_line) - 1);
+                        if cur_line == config.top_line && caret_row < config.top_wrap_row {
+                            config.top_wrap_row = caret_row;
+                        }
+                        let probe = LayoutEngine::compute_layout(&snap, &config, None);
+                        if probe.caret_rect.y < 0.0 {
+                            config.top_line = cur_line;
+                            config.top_wrap_row =
+                                caret_row.saturating_sub(visible_rows.saturating_sub(2));
+                        }
+                    }
+                    if word_wrap {
+                        horizontal.reset();
+                        current_scrollbar = None;
+                    } else {
+                        horizontal.refresh(
+                            &snap,
+                            config.top_line,
+                            visible_rows + 1,
+                            config.columns(),
+                        );
+                        if snap_horiz {
+                            horizontal.ensure_caret(cur_col, config.columns());
+                        }
+                        config.left_col = horizontal.first_col;
+                        current_scrollbar = horizontal.scrollbar(
+                            config.text_x(),
+                            text_height as f32,
+                            (width as f32 - config.text_x()).max(0.0),
+                            config.columns(),
+                        );
+                    }
+                    top_line = config.top_line;
+                    top_wrap_row = config.top_wrap_row;
                     let t_layout = Instant::now();
                     let layout = LayoutEngine::compute_layout(&snap, &config, None);
                     let layout_time = t_layout.elapsed();
@@ -1858,11 +2191,24 @@ fn main() {
 
                     // 5. Render Search Match Highlights
                     if !search_state.find_query.is_empty() {
-                        let lines: Vec<&str> = snap.content.split('\n').collect();
+                        let lines = SnapshotLines(&snap);
 
-                        for (m_idx, &(m_start, m_end)) in search_state.matches.iter().enumerate() {
-                            let (m_s_l, m_s_c) = LayoutEngine::offset_to_line_col(&snap.content, m_start);
-                            let (m_e_l, m_e_c) = LayoutEngine::offset_to_line_col(&snap.content, m_end);
+                        let first = snap.line_col_to_offset(config.top_line, 0);
+                        let last = layout.visible_lines.last().map_or(first, |row| {
+                            snap.line_col_to_offset(row.line_index, row.end_col)
+                        });
+                        let start = search_state
+                            .matches
+                            .partition_point(|&(_, end)| end < first);
+                        for (m_idx, &(m_start, m_end)) in search_state
+                            .matches
+                            .iter()
+                            .enumerate()
+                            .skip(start)
+                            .take_while(|(_, &(begin, _))| begin <= last)
+                        {
+                            let (m_s_l, m_s_c) = snap.offset_to_line_col(m_start);
+                            let (m_e_l, m_e_c) = snap.offset_to_line_col(m_end);
 
                             let is_active = search_state.current_match_idx == Some(m_idx);
                             let highlight_color = if is_active {
@@ -1875,13 +2221,19 @@ fn main() {
                                 for v_line in &layout.visible_lines {
                                     if v_line.line_index == l_idx {
                                         let row_y = v_line.y_px as usize;
-                                        let line_len = lines.get(l_idx).map(|l| l.chars().count()).unwrap_or(0);
+                                        let line_len =
+                                            lines.get(l_idx).map(|l| l.len_chars()).unwrap_or(0);
 
                                         let from_c = if l_idx == m_s_l { m_s_c } else { 0 };
                                         let to_c = if l_idx == m_e_l { m_e_c } else { line_len };
 
-                                        let h_x = text_start_x + (from_c as f32 * font_engine.char_width_px).round() as usize;
-                                        let h_w = (((to_c.saturating_sub(from_c)) as f32 * font_engine.char_width_px).round() as usize).max(4);
+                                        let Some(rect) =
+                                            layout.highlight(&config, v_line, from_c, to_c)
+                                        else {
+                                            continue;
+                                        };
+                                        let h_x = rect.x.round() as usize;
+                                        let h_w = rect.width.round() as usize;
 
                                         draw_rect(
                                             &mut buffer,
@@ -1906,12 +2258,18 @@ fn main() {
                         let min_c = selection.anchor_col.min(selection.active_col);
                         let max_c = selection.anchor_col.max(selection.active_col);
 
-                        for l_idx in min_l..=max_l {
-                            for v_line in &layout.visible_lines {
-                                if v_line.line_index == l_idx {
+                        for v_line in &layout.visible_lines {
+                            let l_idx = v_line.line_index;
+                            {
+                                if l_idx >= min_l && l_idx <= max_l {
                                     let row_y = v_line.y_px as usize;
-                                    let sel_x = text_start_x + (min_c as f32 * font_engine.char_width_px).round() as usize;
-                                    let sel_w = (((max_c - min_c) as f32 * font_engine.char_width_px).round() as usize).max(3);
+                                    let Some(rect) =
+                                        layout.highlight(&config, v_line, min_c, max_c)
+                                    else {
+                                        continue;
+                                    };
+                                    let sel_x = rect.x.round() as usize;
+                                    let sel_w = rect.width.round() as usize;
 
                                     draw_rect(
                                         &mut buffer,
@@ -1927,25 +2285,31 @@ fn main() {
                             }
                         }
                     } else if selection.mode == SelectionMode::Stream {
-                        let (s_line, s_col) = if (selection.anchor_line, selection.anchor_col) <= (selection.active_line, selection.active_col) {
+                        let (s_line, s_col) = if (selection.anchor_line, selection.anchor_col)
+                            <= (selection.active_line, selection.active_col)
+                        {
                             (selection.anchor_line, selection.anchor_col)
                         } else {
                             (selection.active_line, selection.active_col)
                         };
-                        let (e_line, e_col) = if (selection.anchor_line, selection.anchor_col) <= (selection.active_line, selection.active_col) {
+                        let (e_line, e_col) = if (selection.anchor_line, selection.anchor_col)
+                            <= (selection.active_line, selection.active_col)
+                        {
                             (selection.active_line, selection.active_col)
                         } else {
                             (selection.anchor_line, selection.anchor_col)
                         };
 
-                        let lines: Vec<&str> = snap.content.split('\n').collect();
+                        let lines = SnapshotLines(&snap);
 
                         if (s_line, s_col) != (e_line, e_col) {
-                            for l_idx in s_line..=e_line {
-                                for v_line in &layout.visible_lines {
-                                    if v_line.line_index == l_idx {
+                            for v_line in &layout.visible_lines {
+                                let l_idx = v_line.line_index;
+                                {
+                                    if l_idx >= s_line && l_idx <= e_line {
                                         let row_y = v_line.y_px as usize;
-                                        let line_len = lines.get(l_idx).map(|l| l.chars().count()).unwrap_or(0);
+                                        let line_len =
+                                            lines.get(l_idx).map(|l| l.len_chars()).unwrap_or(0);
 
                                         let from_c = if l_idx == s_line { s_col } else { 0 };
                                         let to_c = if l_idx == e_line { e_col } else { line_len };
@@ -1954,16 +2318,13 @@ fn main() {
                                             continue;
                                         }
 
-                                        let sel_x = text_start_x + (from_c as f32 * font_engine.char_width_px).round() as usize;
-                                        let base_w = (to_c.saturating_sub(from_c)) as f32 * font_engine.char_width_px;
-                                        let sel_w = if l_idx < e_line {
-                                            (base_w + font_engine.char_width_px * 0.6).round() as usize
-                                        } else {
-                                            base_w.round() as usize
-                                        };
-                                        if sel_w == 0 {
+                                        let Some(rect) =
+                                            layout.highlight(&config, v_line, from_c, to_c)
+                                        else {
                                             continue;
-                                        }
+                                        };
+                                        let sel_x = rect.x.round() as usize;
+                                        let sel_w = rect.width.round() as usize;
 
                                         draw_rect(
                                             &mut buffer,
@@ -1984,13 +2345,14 @@ fn main() {
                     // 7. Render Visible Lines (with antialiased Ukrainian font support)
                     for line in &layout.visible_lines {
                         let y_int = line.y_px as usize;
-                        if y_int + (font_engine.line_height_px as usize) > height.saturating_sub(28) {
+                        if y_int + (font_engine.line_height_px as usize) > text_height {
                             break;
                         }
 
                         // Gutter line number (only on non-continuation rows)
                         if show_line_numbers && !line.is_continuation {
-                            let num_str = format!("{:>width$}", line.line_index + 1, width = line_digits);
+                            let num_str =
+                                format!("{:>width$}", line.line_index + 1, width = line_digits);
                             font_engine.draw_string(
                                 &mut buffer,
                                 width,
@@ -2016,41 +2378,128 @@ fn main() {
 
                     // 8. Render Caret (character-based positioning)
                     if caret_visible && layout.caret_rect.x >= 0.0 {
-                        let cx = text_start_x + (cur_col as f32 * font_engine.char_width_px).round() as usize;
+                        let cx = layout.caret_rect.x.round() as usize;
                         let cy = layout.caret_rect.y as usize + 2;
 
-                        if cy + (font_engine.line_height_px as usize) <= height.saturating_sub(28) {
-                            draw_rect(&mut buffer, width, height, cx, cy, 2, font_engine.line_height_px as usize, COLOR_CARET);
+                        if cy + (font_engine.line_height_px as usize) <= text_height {
+                            draw_rect(
+                                &mut buffer,
+                                width,
+                                height,
+                                cx,
+                                cy,
+                                2,
+                                font_engine.line_height_px as usize,
+                                COLOR_CARET,
+                            );
                         }
                     }
 
+                    if let Some(bar) = current_scrollbar {
+                        draw_rect(
+                            &mut buffer,
+                            width,
+                            height,
+                            bar.track.x as usize,
+                            bar.track.y as usize,
+                            bar.track.width as usize,
+                            BAR_HEIGHT,
+                            COLOR_GUTTER_BG,
+                        );
+                        draw_rect(
+                            &mut buffer,
+                            width,
+                            height,
+                            bar.thumb.x.round() as usize,
+                            bar.thumb.y as usize,
+                            bar.thumb.width.round() as usize,
+                            bar.thumb.height as usize,
+                            COLOR_GUTTER_TEXT,
+                        );
+                    }
                     // 9. Render Floating Find & Replace Bar with Interactive [< Prev] and [Next >] Buttons
                     if search_state.mode != SearchBarMode::Closed {
                         let panel_w = 480usize;
-                        let panel_h = if search_state.mode == SearchBarMode::Replace { 68usize } else { 36usize };
+                        let panel_h = if search_state.mode == SearchBarMode::Replace {
+                            68usize
+                        } else {
+                            36usize
+                        };
                         let panel_x = width.saturating_sub(panel_w + 16);
                         let panel_y = 10usize;
 
-                        draw_box(&mut buffer, width, height, panel_x, panel_y, panel_w, panel_h, COLOR_PANEL_BG, COLOR_PANEL_BORDER);
+                        draw_box(
+                            &mut buffer,
+                            width,
+                            height,
+                            panel_x,
+                            panel_y,
+                            panel_w,
+                            panel_h,
+                            COLOR_PANEL_BG,
+                            COLOR_PANEL_BORDER,
+                        );
 
                         // Find Input Box
                         let input_x = panel_x + 50;
                         let input_y = panel_y + 6;
                         let input_w = 160usize;
                         let input_h = 24usize;
-                        let border_col = if search_state.active_field == 0 { COLOR_INPUT_ACTIVE } else { COLOR_INPUT_BORDER };
-                        draw_box(&mut buffer, width, height, input_x, input_y, input_w, input_h, COLOR_INPUT_BG, border_col);
+                        let border_col = if search_state.active_field == 0 {
+                            COLOR_INPUT_ACTIVE
+                        } else {
+                            COLOR_INPUT_BORDER
+                        };
+                        draw_box(
+                            &mut buffer,
+                            width,
+                            height,
+                            input_x,
+                            input_y,
+                            input_w,
+                            input_h,
+                            COLOR_INPUT_BG,
+                            border_col,
+                        );
 
-                        font_engine.draw_string(&mut buffer, width, height, panel_x + 8, input_y + 3, "Find:", COLOR_STATUS_TEXT);
+                        font_engine.draw_string(
+                            &mut buffer,
+                            width,
+                            height,
+                            panel_x + 8,
+                            input_y + 3,
+                            "Find:",
+                            COLOR_STATUS_TEXT,
+                        );
 
                         let query_display = &search_state.find_query;
-                        font_engine.draw_string(&mut buffer, width, height, input_x + 5, input_y + 3, query_display, COLOR_TEXT);
+                        font_engine.draw_string(
+                            &mut buffer,
+                            width,
+                            height,
+                            input_x + 5,
+                            input_y + 3,
+                            query_display,
+                            COLOR_TEXT,
+                        );
 
                         // Cursor in Find box
                         if search_state.active_field == 0 && caret_visible {
-                            let cur_x = input_x + 5 + (query_display.chars().count() as f32 * font_engine.char_width_px).round() as usize;
+                            let cur_x = input_x
+                                + 5
+                                + (query_display.chars().count() as f32 * font_engine.char_width_px)
+                                    .round() as usize;
                             if cur_x < input_x + input_w - 4 {
-                                draw_rect(&mut buffer, width, height, cur_x, input_y + 4, 2, input_h - 8, COLOR_CARET);
+                                draw_rect(
+                                    &mut buffer,
+                                    width,
+                                    height,
+                                    cur_x,
+                                    input_y + 4,
+                                    2,
+                                    input_h - 8,
+                                    COLOR_CARET,
+                                );
                             }
                         }
 
@@ -2063,53 +2512,202 @@ fn main() {
                             let cur_idx = search_state.current_match_idx.map_or(0, |i| i + 1);
                             format!("{}/{}", cur_idx, search_state.matches.len())
                         };
-                        font_engine.draw_string(&mut buffer, width, height, input_x + input_w + 8, input_y + 3, &match_info, COLOR_STATUS_TEXT);
+                        font_engine.draw_string(
+                            &mut buffer,
+                            width,
+                            height,
+                            input_x + input_w + 8,
+                            input_y + 3,
+                            &match_info,
+                            COLOR_STATUS_TEXT,
+                        );
 
                         // Interactive [< Prev] button
                         let prev_btn_x = panel_x + 285;
-                        draw_box(&mut buffer, width, height, prev_btn_x, input_y, 52, input_h, COLOR_BUTTON_BG, COLOR_BUTTON_BORDER);
-                        font_engine.draw_string(&mut buffer, width, height, prev_btn_x + 6, input_y + 3, "< Prev", COLOR_TEXT);
+                        draw_box(
+                            &mut buffer,
+                            width,
+                            height,
+                            prev_btn_x,
+                            input_y,
+                            52,
+                            input_h,
+                            COLOR_BUTTON_BG,
+                            COLOR_BUTTON_BORDER,
+                        );
+                        font_engine.draw_string(
+                            &mut buffer,
+                            width,
+                            height,
+                            prev_btn_x + 6,
+                            input_y + 3,
+                            "< Prev",
+                            COLOR_TEXT,
+                        );
 
                         // Interactive [Next >] button
                         let next_btn_x = panel_x + 343;
-                        draw_box(&mut buffer, width, height, next_btn_x, input_y, 52, input_h, COLOR_BUTTON_BG, COLOR_BUTTON_BORDER);
-                        font_engine.draw_string(&mut buffer, width, height, next_btn_x + 6, input_y + 3, "Next >", COLOR_TEXT);
+                        draw_box(
+                            &mut buffer,
+                            width,
+                            height,
+                            next_btn_x,
+                            input_y,
+                            52,
+                            input_h,
+                            COLOR_BUTTON_BG,
+                            COLOR_BUTTON_BORDER,
+                        );
+                        font_engine.draw_string(
+                            &mut buffer,
+                            width,
+                            height,
+                            next_btn_x + 6,
+                            input_y + 3,
+                            "Next >",
+                            COLOR_TEXT,
+                        );
 
                         // Close button [x]
-                        font_engine.draw_string(&mut buffer, width, height, panel_x + panel_w - 22, input_y + 3, "X", COLOR_GUTTER_TEXT);
+                        font_engine.draw_string(
+                            &mut buffer,
+                            width,
+                            height,
+                            panel_x + panel_w - 22,
+                            input_y + 3,
+                            "X",
+                            COLOR_GUTTER_TEXT,
+                        );
 
                         // Replace Row (if in Replace mode)
                         if search_state.mode == SearchBarMode::Replace {
                             let repl_y = panel_y + 36;
-                            let repl_border = if search_state.active_field == 1 { COLOR_INPUT_ACTIVE } else { COLOR_INPUT_BORDER };
-                            draw_box(&mut buffer, width, height, input_x, repl_y, input_w, input_h, COLOR_INPUT_BG, repl_border);
+                            let repl_border = if search_state.active_field == 1 {
+                                COLOR_INPUT_ACTIVE
+                            } else {
+                                COLOR_INPUT_BORDER
+                            };
+                            draw_box(
+                                &mut buffer,
+                                width,
+                                height,
+                                input_x,
+                                repl_y,
+                                input_w,
+                                input_h,
+                                COLOR_INPUT_BG,
+                                repl_border,
+                            );
 
-                            font_engine.draw_string(&mut buffer, width, height, panel_x + 8, repl_y + 3, "Repl:", COLOR_STATUS_TEXT);
-                            font_engine.draw_string(&mut buffer, width, height, input_x + 5, repl_y + 3, &search_state.replace_query, COLOR_TEXT);
+                            font_engine.draw_string(
+                                &mut buffer,
+                                width,
+                                height,
+                                panel_x + 8,
+                                repl_y + 3,
+                                "Repl:",
+                                COLOR_STATUS_TEXT,
+                            );
+                            font_engine.draw_string(
+                                &mut buffer,
+                                width,
+                                height,
+                                input_x + 5,
+                                repl_y + 3,
+                                &search_state.replace_query,
+                                COLOR_TEXT,
+                            );
 
                             if search_state.active_field == 1 && caret_visible {
-                                let cur_x = input_x + 5 + (search_state.replace_query.chars().count() as f32 * font_engine.char_width_px).round() as usize;
+                                let cur_x = input_x
+                                    + 5
+                                    + (search_state.replace_query.chars().count() as f32
+                                        * font_engine.char_width_px)
+                                        .round() as usize;
                                 if cur_x < input_x + input_w - 4 {
-                                    draw_rect(&mut buffer, width, height, cur_x, repl_y + 4, 2, input_h - 8, COLOR_CARET);
+                                    draw_rect(
+                                        &mut buffer,
+                                        width,
+                                        height,
+                                        cur_x,
+                                        repl_y + 4,
+                                        2,
+                                        input_h - 8,
+                                        COLOR_CARET,
+                                    );
                                 }
                             }
 
                             // Interactive [Replace] button
                             let repl_btn_x = panel_x + 245;
-                            draw_box(&mut buffer, width, height, repl_btn_x, repl_y, 65, input_h, COLOR_BUTTON_BG, COLOR_BUTTON_BORDER);
-                            font_engine.draw_string(&mut buffer, width, height, repl_btn_x + 6, repl_y + 3, "Replace", COLOR_TEXT);
+                            draw_box(
+                                &mut buffer,
+                                width,
+                                height,
+                                repl_btn_x,
+                                repl_y,
+                                65,
+                                input_h,
+                                COLOR_BUTTON_BG,
+                                COLOR_BUTTON_BORDER,
+                            );
+                            font_engine.draw_string(
+                                &mut buffer,
+                                width,
+                                height,
+                                repl_btn_x + 6,
+                                repl_y + 3,
+                                "Replace",
+                                COLOR_TEXT,
+                            );
 
                             // Interactive [All] button
                             let all_btn_x = panel_x + 320;
-                            draw_box(&mut buffer, width, height, all_btn_x, repl_y, 42, input_h, COLOR_BUTTON_BG, COLOR_BUTTON_BORDER);
-                            font_engine.draw_string(&mut buffer, width, height, all_btn_x + 8, repl_y + 3, "All", COLOR_TEXT);
+                            draw_box(
+                                &mut buffer,
+                                width,
+                                height,
+                                all_btn_x,
+                                repl_y,
+                                42,
+                                input_h,
+                                COLOR_BUTTON_BG,
+                                COLOR_BUTTON_BORDER,
+                            );
+                            font_engine.draw_string(
+                                &mut buffer,
+                                width,
+                                height,
+                                all_btn_x + 8,
+                                repl_y + 3,
+                                "All",
+                                COLOR_TEXT,
+                            );
                         }
                     }
 
                     // 10. Render Status Bar
                     let status_y = height.saturating_sub(28);
-                    draw_rect(&mut buffer, width, height, 0, status_y, width, 1, COLOR_STATUS_BORDER);
-                    draw_rect(&mut buffer, width, height, 0, status_y + 1, width, 27, COLOR_STATUS_BG);
+                    draw_rect(
+                        &mut buffer,
+                        width,
+                        height,
+                        0,
+                        status_y,
+                        width,
+                        1,
+                        COLOR_STATUS_BORDER,
+                    );
+                    draw_rect(
+                        &mut buffer,
+                        width,
+                        height,
+                        0,
+                        status_y + 1,
+                        width,
+                        27,
+                        COLOR_STATUS_BG,
+                    );
 
                     let status_mode = match selection.mode {
                         SelectionMode::Block => {
@@ -2117,7 +2715,7 @@ fn main() {
                             let max_l = selection.anchor_line.max(selection.active_line) + 1;
                             let min_c = selection.anchor_col.min(selection.active_col) + 1;
                             let max_c = selection.anchor_col.max(selection.active_col) + 1;
-                            format!("[BLOCK SELECT: R{}-R{}, C{}-C{}]", min_l, max_l, min_c, max_c)
+                            format!("[BLOCK SELECT: R{min_l}-R{max_l}, C{min_c}-C{max_c}]")
                         }
                         SelectionMode::Stream => "[SELECT]".to_string(),
                         SelectionMode::None => {
@@ -2132,12 +2730,18 @@ fn main() {
                     let wrap_text = if word_wrap { "Wrap: ON" } else { "Wrap: OFF" };
 
                     let status_text = format!(
-                        "  Ln {}, Col {}    {}    {}    {} chars    100%    UTF-8    LF",
+                        "  Ln {}, Col {}    {}    {}    {} chars    100%    {}    {}",
                         cur_line + 1,
                         cur_col + 1,
                         status_mode,
                         wrap_text,
-                        snap.total_bytes
+                        snap.total_bytes,
+                        if file_bom { "UTF-8 BOM" } else { "UTF-8" },
+                        if file_ending == LineEnding::Crlf {
+                            "CRLF"
+                        } else {
+                            "LF"
+                        }
                     );
 
                     let status_color = if selection.mode == SelectionMode::Block {
@@ -2162,33 +2766,130 @@ fn main() {
                         let hud_x = width.saturating_sub(hud_w + 16);
                         let hud_y = 12usize;
 
-                        draw_rect(&mut buffer, width, height, hud_x, hud_y, hud_w, hud_h, 0xEE1A1A1A);
-                        draw_rect(&mut buffer, width, height, hud_x, hud_y, hud_w, 1, 0xFF3E3E3E);
-                        draw_rect(&mut buffer, width, height, hud_x, hud_y + hud_h - 1, hud_w, 1, 0xFF3E3E3E);
-                        draw_rect(&mut buffer, width, height, hud_x, hud_y, 1, hud_h, 0xFF3E3E3E);
-                        draw_rect(&mut buffer, width, height, hud_x + hud_w - 1, hud_y, 1, hud_h, 0xFF3E3E3E);
+                        draw_rect(
+                            &mut buffer,
+                            width,
+                            height,
+                            hud_x,
+                            hud_y,
+                            hud_w,
+                            hud_h,
+                            0xEE1A1A1A,
+                        );
+                        draw_rect(
+                            &mut buffer,
+                            width,
+                            height,
+                            hud_x,
+                            hud_y,
+                            hud_w,
+                            1,
+                            0xFF3E3E3E,
+                        );
+                        draw_rect(
+                            &mut buffer,
+                            width,
+                            height,
+                            hud_x,
+                            hud_y + hud_h - 1,
+                            hud_w,
+                            1,
+                            0xFF3E3E3E,
+                        );
+                        draw_rect(
+                            &mut buffer,
+                            width,
+                            height,
+                            hud_x,
+                            hud_y,
+                            1,
+                            hud_h,
+                            0xFF3E3E3E,
+                        );
+                        draw_rect(
+                            &mut buffer,
+                            width,
+                            height,
+                            hud_x + hud_w - 1,
+                            hud_y,
+                            1,
+                            hud_h,
+                            0xFF3E3E3E,
+                        );
 
                         let cur_frame_time = frame_start.elapsed();
-                        let fps = 1000.0 / (cur_frame_time.as_secs_f64() * 1000.0).max(0.01);
-                        let l1 = format!("PERF HUD [F3]   ~{:.0} FPS", fps);
-                        let l2 = format!("Frame time  : {:.2} ms", cur_frame_time.as_secs_f64() * 1000.0);
-                        let l3 = format!("Layout time : {:.1} µs", layout_time.as_secs_f64() * 1_000_000.0);
+                        let fps = last_present
+                            .map_or(0.0, |at| 1.0 / at.elapsed().as_secs_f64().max(0.000001));
+                        let l1 = format!("PERF HUD [F3]   ~{fps:.0} FPS");
+                        let l2 = format!(
+                            "Frame time  : {:.2} ms",
+                            cur_frame_time.as_secs_f64() * 1000.0
+                        );
+                        let l3 = format!(
+                            "Layout time : {:.1} µs",
+                            layout_time.as_secs_f64() * 1_000_000.0
+                        );
                         let l4 = format!("Doc bytes   : {} B", snap.total_bytes);
-                        let l5 = "RAM footprint: ~28.9 MB".to_string();
+                        let l5 = "Snapshot: shared rope".to_string();
 
-                        font_engine.draw_string(&mut buffer, width, height, hud_x + 10, hud_y + 6, &l1, 0xFF569CD6);
-                        font_engine.draw_string(&mut buffer, width, height, hud_x + 10, hud_y + 24, &l2, 0xFF4EC9B0);
-                        font_engine.draw_string(&mut buffer, width, height, hud_x + 10, hud_y + 42, &l3, 0xFFDCDCAA);
-                        font_engine.draw_string(&mut buffer, width, height, hud_x + 10, hud_y + 60, &l4, 0xFFCCCCCC);
-                        font_engine.draw_string(&mut buffer, width, height, hud_x + 10, hud_y + 78, &l5, 0xFF9CDCFE);
+                        font_engine.draw_string(
+                            &mut buffer,
+                            width,
+                            height,
+                            hud_x + 10,
+                            hud_y + 6,
+                            &l1,
+                            0xFF569CD6,
+                        );
+                        font_engine.draw_string(
+                            &mut buffer,
+                            width,
+                            height,
+                            hud_x + 10,
+                            hud_y + 24,
+                            &l2,
+                            0xFF4EC9B0,
+                        );
+                        font_engine.draw_string(
+                            &mut buffer,
+                            width,
+                            height,
+                            hud_x + 10,
+                            hud_y + 42,
+                            &l3,
+                            0xFFDCDCAA,
+                        );
+                        font_engine.draw_string(
+                            &mut buffer,
+                            width,
+                            height,
+                            hud_x + 10,
+                            hud_y + 60,
+                            &l4,
+                            0xFFCCCCCC,
+                        );
+                        font_engine.draw_string(
+                            &mut buffer,
+                            width,
+                            height,
+                            hud_x + 10,
+                            hud_y + 78,
+                            &l5,
+                            0xFF9CDCFE,
+                        );
                     }
 
+                    last_present = Some(Instant::now());
+                    current_view = Some((layout, config));
                     let _ = buffer.present();
                 }
                 _ => {}
             },
             Event::AboutToWait => {
-                if last_caret_blink.elapsed() >= Duration::from_millis(500) {
+                if search_state.pending
+                    || search_state.mutation.is_some()
+                    || last_caret_blink.elapsed() >= Duration::from_millis(500)
+                {
                     window.request_redraw();
                 }
             }
@@ -2196,6 +2897,7 @@ fn main() {
         }
     });
 
+    let _ = shutdown_client.send(BufferRequest::Shutdown);
     buffer_thread.join().unwrap();
 }
 
@@ -2203,6 +2905,26 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn background_search_is_keyed_by_revision_and_query() {
+        let mut b = TextBuffer::from_string("їжак їжак".into());
+        let mut search = SearchState {
+            find_query: "їжак".into(),
+            ..Default::default()
+        };
+        submit_search(b.create_snapshot(), &mut search);
+        let (revision, query, matches) =
+            search.results.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(search.submitted, Some((revision, query)));
+        assert_eq!(matches, vec![(0, 8), (9, 17)]);
+        b.insert(0, "!");
+        submit_search(b.create_snapshot(), &mut search);
+        assert!(search.matches.is_empty());
+        let (new_revision, _, matches) =
+            search.results.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_ne!(new_revision, revision);
+        assert_eq!(matches, vec![(1, 9), (10, 18)]);
+    }
     #[test]
     fn test_find_word_boundaries_alphanumeric_and_underscores() {
         let line = "let my_variable_name = 12345;";
@@ -2256,13 +2978,13 @@ mod tests {
         let (g_w_small, t_x_small, digits_small) = compute_gutter_metrics(10, true, 8.0);
         assert_eq!(digits_small, 3);
         assert_eq!(g_w_small, 44.0); // 10 + 3*8 + 10
-        assert_eq!(t_x_small, 52);   // 44 + 8
+        assert_eq!(t_x_small, 52); // 44 + 8
 
         // Huge file (3.12M lines): 7 digits, expands dynamically without text overlap
         let (g_w_3m, t_x_3m, digits_3m) = compute_gutter_metrics(3_125_761, true, 8.0);
         assert_eq!(digits_3m, 7);
         assert_eq!(g_w_3m, 76.0); // 10 + 7*8 + 10
-        assert_eq!(t_x_3m, 84);   // 76 + 8
+        assert_eq!(t_x_3m, 84); // 76 + 8
 
         // 100M lines: 9 digits
         let (g_w_100m, t_x_100m, digits_100m) = compute_gutter_metrics(100_000_000, true, 8.0);

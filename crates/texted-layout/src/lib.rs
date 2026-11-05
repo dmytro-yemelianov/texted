@@ -1,8 +1,4 @@
-//! Viewport Layout & Typography Engine
-//!
-//! Computes visible viewport lines, caret bounding boxes,
-//! selection rectangles, and screen-to-buffer coordinate mappings.
-
+//! Viewport-bounded layout and a single coordinate mapping for drawing and input.
 use texted_buffer::BufferSnapshot;
 
 #[derive(Clone, Copy, Debug)]
@@ -11,12 +7,16 @@ pub struct ViewportConfig {
     pub height_px: f32,
     pub line_height_px: f32,
     pub char_width_px: f32,
+    /// Physical document line at the top of the viewport.
     pub top_line: usize,
+    /// Wrapped row within top_line.
+    pub top_wrap_row: usize,
+    /// First visible character column in no-wrap mode. Ignored when wrapping.
+    pub left_col: usize,
     pub word_wrap: bool,
     pub show_line_numbers: bool,
     pub line_number_gutter_width_px: f32,
 }
-
 impl Default for ViewportConfig {
     fn default() -> Self {
         Self {
@@ -25,21 +25,69 @@ impl Default for ViewportConfig {
             line_height_px: 20.0,
             char_width_px: 9.0,
             top_line: 0,
+            top_wrap_row: 0,
+            left_col: 0,
             word_wrap: false,
             show_line_numbers: true,
             line_number_gutter_width_px: 50.0,
         }
     }
 }
-
+impl ViewportConfig {
+    pub fn text_x(&self) -> f32 {
+        if self.show_line_numbers {
+            self.line_number_gutter_width_px + 8.0
+        } else {
+            10.0
+        }
+    }
+    pub fn columns(&self) -> usize {
+        ((self.width_px - self.text_x() - 8.0).max(self.char_width_px) / self.char_width_px)
+            .floor()
+            .max(1.0) as usize
+    }
+    pub fn rows_for_line(&self, snapshot: &BufferSnapshot, line: usize) -> usize {
+        if self.word_wrap {
+            snapshot
+                .line(line)
+                .len_chars()
+                .div_ceil(self.columns())
+                .max(1)
+        } else {
+            1
+        }
+    }
+    pub fn scroll_rows(&mut self, snapshot: &BufferSnapshot, delta: i32) {
+        self.top_line = self.top_line.min(snapshot.total_lines - 1);
+        self.top_wrap_row = self
+            .top_wrap_row
+            .min(self.rows_for_line(snapshot, self.top_line) - 1);
+        for _ in 0..delta.unsigned_abs() {
+            if delta > 0 {
+                if self.top_wrap_row + 1 < self.rows_for_line(snapshot, self.top_line) {
+                    self.top_wrap_row += 1;
+                } else if self.top_line + 1 < snapshot.total_lines {
+                    self.top_line += 1;
+                    self.top_wrap_row = 0;
+                }
+            } else if self.top_wrap_row > 0 {
+                self.top_wrap_row -= 1;
+            } else if self.top_line > 0 {
+                self.top_line -= 1;
+                self.top_wrap_row = self.rows_for_line(snapshot, self.top_line) - 1;
+            }
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct VisibleLine {
     pub line_index: usize,
     pub is_continuation: bool,
+    pub start_col: usize,
+    pub end_col: usize,
     pub text: String,
     pub y_px: f32,
 }
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
     pub x: f32,
@@ -47,7 +95,6 @@ pub struct Rect {
     pub width: f32,
     pub height: f32,
 }
-
 #[derive(Clone, Debug)]
 pub struct ViewportLayout {
     pub visible_lines: Vec<VisibleLine>,
@@ -56,236 +103,232 @@ pub struct ViewportLayout {
     pub cursor_col: usize,
     pub selection_rects: Vec<Rect>,
 }
-
+impl ViewportLayout {
+    pub fn screen_to_line_col(&self, config: &ViewportConfig, x: f32, y: f32) -> (usize, usize) {
+        let row = (y.max(0.0) / config.line_height_px).floor() as usize;
+        if let Some(line) = self
+            .visible_lines
+            .get(row)
+            .or_else(|| self.visible_lines.last())
+        {
+            let col = ((x - config.text_x()).max(0.0) / config.char_width_px).round() as usize;
+            (line.line_index, line.start_col + col)
+        } else {
+            (config.top_line, 0)
+        }
+    }
+    pub fn highlight(
+        &self,
+        config: &ViewportConfig,
+        row: &VisibleLine,
+        from: usize,
+        to: usize,
+    ) -> Option<Rect> {
+        let a = from.max(row.start_col);
+        let b = to.min(row.start_col + config.columns());
+        if b <= a {
+            return None;
+        }
+        Some(Rect {
+            x: config.text_x() + (a - row.start_col) as f32 * config.char_width_px,
+            y: row.y_px,
+            width: (b - a) as f32 * config.char_width_px,
+            height: config.line_height_px,
+        })
+    }
+}
 pub struct LayoutEngine;
-
 impl LayoutEngine {
-    /// Computes layout geometry strictly for visible viewport rows
     pub fn compute_layout(
         snapshot: &BufferSnapshot,
         config: &ViewportConfig,
-        selection: Option<(usize, usize)>, // (start_offset, end_offset)
+        selection: Option<(usize, usize)>,
     ) -> ViewportLayout {
-        let lines: Vec<&str> = snapshot.content.split('\n').collect();
-        let total_lines = lines.len();
-
-        let gutter_offset = if config.show_line_numbers {
-            config.line_number_gutter_width_px
+        let capacity = (config.height_px / config.line_height_px).floor().max(0.0) as usize;
+        let columns = config.columns();
+        let mut visible_lines = Vec::with_capacity(capacity);
+        let mut line = config.top_line.min(snapshot.total_lines - 1);
+        let mut wrap = if config.word_wrap {
+            config
+                .top_wrap_row
+                .min(config.rows_for_line(snapshot, line) - 1)
         } else {
-            10.0
+            0
         };
-
-        let mut visible_lines = Vec::new();
-        let mut cur_y = 0.0f32;
-
-        if config.word_wrap {
-            let max_chars = ((config.width_px - gutter_offset - 20.0).max(100.0) / config.char_width_px).floor().max(10.0) as usize;
-            let mut skipped_visual_rows = 0usize;
-
-            for (idx, line_str) in lines.iter().enumerate() {
-                let char_vec: Vec<char> = line_str.chars().collect();
-                if char_vec.is_empty() {
-                    if skipped_visual_rows >= config.top_line {
-                        if cur_y + config.line_height_px <= config.height_px + config.line_height_px {
-                            visible_lines.push(VisibleLine {
-                                line_index: idx,
-                                is_continuation: false,
-                                text: String::new(),
-                                y_px: cur_y,
-                            });
-                            cur_y += config.line_height_px;
-                        }
-                    } else {
-                        skipped_visual_rows += 1;
-                    }
-                } else {
-                    let mut chunk_start = 0;
-                    let mut is_first = true;
-
-                    while chunk_start < char_vec.len() {
-                        let chunk_end = (chunk_start + max_chars).min(char_vec.len());
-                        let chunk_text: String = char_vec[chunk_start..chunk_end].iter().collect();
-
-                        if skipped_visual_rows >= config.top_line {
-                            if cur_y + config.line_height_px <= config.height_px + config.line_height_px {
-                                visible_lines.push(VisibleLine {
-                                    line_index: idx,
-                                    is_continuation: !is_first,
-                                    text: chunk_text,
-                                    y_px: cur_y,
-                                });
-                                cur_y += config.line_height_px;
-                            }
-                        } else {
-                            skipped_visual_rows += 1;
-                        }
-
-                        chunk_start = chunk_end;
-                        is_first = false;
-                    }
-                }
-
-                if cur_y > config.height_px {
-                    break;
-                }
-            }
-        } else {
-            let visible_row_capacity = (config.height_px / config.line_height_px).ceil() as usize;
-            let start_line = config.top_line.min(total_lines.saturating_sub(1));
-            let end_line = (start_line + visible_row_capacity + 2).min(total_lines);
-
-            for (idx, line_str) in lines.iter().enumerate().take(end_line).skip(start_line) {
-                let row_y = (idx - start_line) as f32 * config.line_height_px;
-                visible_lines.push(VisibleLine {
-                    line_index: idx,
-                    is_continuation: false,
-                    text: line_str.to_string(),
-                    y_px: row_y,
-                });
+        while line < snapshot.total_lines && visible_lines.len() < capacity {
+            let text = snapshot.line(line);
+            let len = text.len_chars();
+            let start = if config.word_wrap {
+                wrap * columns
+            } else {
+                config.left_col
+            };
+            let end = start.saturating_add(columns).min(len);
+            visible_lines.push(VisibleLine {
+                line_index: line,
+                is_continuation: wrap > 0,
+                start_col: start,
+                end_col: end,
+                text: text.slice(start.min(len)..end).to_string(),
+                y_px: visible_lines.len() as f32 * config.line_height_px,
+            });
+            if config.word_wrap && wrap + 1 < config.rows_for_line(snapshot, line) {
+                wrap += 1;
+            } else {
+                line += 1;
+                wrap = 0;
             }
         }
-
-        // Calculate cursor position (line, col)
-        let (cursor_line, cursor_col) = Self::offset_to_line_col(&snapshot.content, snapshot.cursor_offset);
-
-        // Find visual position of cursor
-        let mut caret_x = -100.0f32;
-        let mut caret_y = -100.0f32;
-
-        for v_line in &visible_lines {
-            if v_line.line_index == cursor_line {
-                // If not word wrap or first line with col
-                caret_y = v_line.y_px;
-                caret_x = gutter_offset + (cursor_col as f32 * config.char_width_px);
-                break;
-            }
-        }
-
-        let caret_rect = Rect {
-            x: caret_x,
-            y: caret_y,
-            width: 2.0,
-            height: config.line_height_px,
-        };
-
-        let mut selection_rects = Vec::new();
-        if let Some((sel_start, sel_end)) = selection {
-            let (s_line, s_col) = Self::offset_to_line_col(&snapshot.content, sel_start.min(sel_end));
-            let (e_line, e_col) = Self::offset_to_line_col(&snapshot.content, sel_start.max(sel_end));
-
-            for line_idx in s_line..=e_line {
-                for v_line in &visible_lines {
-                    if v_line.line_index == line_idx && !v_line.is_continuation {
-                        let y = v_line.y_px;
-                        let line_len = lines.get(line_idx).map(|s| s.chars().count()).unwrap_or(0);
-
-                        let col_from = if line_idx == s_line { s_col } else { 0 };
-                        let col_to = if line_idx == e_line { e_col } else { line_len };
-
-                        let x = gutter_offset + (col_from as f32 * config.char_width_px);
-                        let w = ((col_to - col_from) as f32 * config.char_width_px).max(config.char_width_px / 2.0);
-
-                        selection_rects.push(Rect {
-                            x,
-                            y,
-                            width: w,
-                            height: config.line_height_px,
-                        });
-                    }
-                }
-            }
-        }
-
-        ViewportLayout {
+        let (cursor_line, cursor_col) = snapshot.offset_to_line_col(snapshot.cursor_offset);
+        let mut result = ViewportLayout {
             visible_lines,
-            caret_rect,
+            caret_rect: Rect {
+                x: -100.0,
+                y: -100.0,
+                width: 2.0,
+                height: config.line_height_px,
+            },
             cursor_line,
             cursor_col,
-            selection_rects,
-        }
-    }
-
-    pub fn offset_to_line_col(text: &str, target_offset: usize) -> (usize, usize) {
-        let mut cur_line = 0;
-        let mut line_start_offset = 0;
-
-        for (offset, ch) in text.char_indices() {
-            if offset >= target_offset {
-                let col = text[line_start_offset..offset].chars().count();
-                return (cur_line, col);
-            }
-            if ch == '\n' {
-                cur_line += 1;
-                line_start_offset = offset + 1;
-            }
-        }
-
-        let clamped = target_offset.min(text.len());
-        let col = text[line_start_offset..clamped].chars().count();
-        (cur_line, col)
-    }
-
-    /// Maps a screen click coordinate (x, y) to a text buffer byte offset
-    pub fn screen_to_offset(
-        snapshot: &BufferSnapshot,
-        config: &ViewportConfig,
-        click_x: f32,
-        click_y: f32,
-    ) -> usize {
-        let gutter_offset = if config.show_line_numbers {
-            config.line_number_gutter_width_px
-        } else {
-            10.0
+            selection_rects: Vec::new(),
         };
-
-        let row_idx = (click_y / config.line_height_px).floor() as usize + config.top_line;
-        let col_idx = ((click_x - gutter_offset).max(0.0) / config.char_width_px).round() as usize;
-
-        let lines: Vec<&str> = snapshot.content.split('\n').collect();
-        if row_idx >= lines.len() {
-            return snapshot.total_bytes;
-        }
-
-        let mut offset = 0;
-        for line in lines.iter().take(row_idx) {
-            offset += line.len() + 1; // +1 for '\n'
-        }
-
-        let target_line = lines[row_idx];
-        let char_count = target_line.chars().count();
-        let target_col = col_idx.min(char_count);
-
-        let mut col_bytes = 0;
-        for (i, ch) in target_line.chars().enumerate() {
-            if i >= target_col {
+        for row in &result.visible_lines {
+            if row.line_index == cursor_line
+                && cursor_col >= row.start_col
+                && cursor_col <= row.end_col
+                && (!config.word_wrap
+                    || cursor_col < row.start_col + columns
+                    || cursor_col == snapshot.line(cursor_line).len_chars())
+            {
+                result.caret_rect.x =
+                    config.text_x() + (cursor_col - row.start_col) as f32 * config.char_width_px;
+                result.caret_rect.y = row.y_px;
                 break;
             }
-            col_bytes += ch.len_utf8();
         }
-
-        offset + col_bytes
+        if let Some((a, b)) = selection {
+            let (sl, sc) = snapshot.offset_to_line_col(a.min(b));
+            let (el, ec) = snapshot.offset_to_line_col(a.max(b));
+            for row in &result.visible_lines {
+                if row.line_index >= sl && row.line_index <= el {
+                    let from = if row.line_index == sl { sc } else { 0 };
+                    let to = if row.line_index == el {
+                        ec
+                    } else {
+                        snapshot.line(row.line_index).len_chars()
+                    };
+                    if let Some(rect) = result.highlight(config, row, from, to) {
+                        result.selection_rects.push(rect);
+                    }
+                }
+            }
+        }
+        result
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use texted_buffer::TextBuffer;
     #[test]
-    fn test_viewport_layout_calculation() {
-        let snapshot = BufferSnapshot {
-            content: "First Line\nSecond Line\nThird Line".to_string(),
-            total_bytes: 33,
-            total_lines: 3,
-            cursor_offset: 14, // 'e' in "Second Line"
+    fn horizontal_offset_aligns_unicode_text_caret_mouse_and_highlights() {
+        let mut b = TextBuffer::from_string("абвгґдеєжзиіїйклмн".into());
+        b.set_cursor_offset(24);
+        let config = ViewportConfig {
+            left_col: 9,
+            width_px: 108.0,
+            char_width_px: 10.0,
+            show_line_numbers: false,
+            ..Default::default()
         };
-
-        let config = ViewportConfig::default();
-        let layout = LayoutEngine::compute_layout(&snapshot, &config, None);
-
-        assert_eq!(layout.visible_lines.len(), 3);
-        assert_eq!(layout.cursor_line, 1);
-        assert_eq!(layout.cursor_col, 3);
-        assert!(layout.caret_rect.x > 0.0);
+        let snap = b.create_snapshot();
+        let layout = LayoutEngine::compute_layout(&snap, &config, Some((16, 26)));
+        assert_eq!(
+            layout.visible_lines[0].text,
+            snap.line(0).slice(9..18).to_string()
+        );
+        assert_eq!(layout.caret_rect.x, 40.0);
+        assert_eq!(layout.screen_to_line_col(&config, 40.0, 0.0), (0, 12));
+        assert_eq!(layout.selection_rects[0].x, 10.0);
+        assert_eq!(layout.selection_rects[0].width, 40.0);
+        let wrapped = ViewportConfig {
+            word_wrap: true,
+            ..config
+        };
+        let layout = LayoutEngine::compute_layout(&snap, &wrapped, None);
+        assert_eq!(layout.visible_lines[0].start_col, 0);
+    }
+    #[test]
+    fn horizontally_scrolled_short_lines_are_empty_and_caret_is_hidden() {
+        let b = TextBuffer::from_string("hi\n".into());
+        let config = ViewportConfig {
+            left_col: 200,
+            ..Default::default()
+        };
+        let layout = LayoutEngine::compute_layout(&b.create_snapshot(), &config, None);
+        assert!(layout.visible_lines.iter().all(|row| row.text.is_empty()));
+        assert!(layout.caret_rect.x < 0.0);
+    }
+    #[test]
+    fn exact_width_line_does_not_add_a_blank_row_and_caret_remains_visible() {
+        let mut b = TextBuffer::from_string("123456789\nx".into());
+        b.set_cursor_offset(9);
+        let config = ViewportConfig {
+            width_px: 108.0,
+            char_width_px: 10.0,
+            show_line_numbers: false,
+            word_wrap: true,
+            ..Default::default()
+        };
+        let layout = LayoutEngine::compute_layout(&b.create_snapshot(), &config, None);
+        assert_eq!(layout.visible_lines.len(), 2);
+        assert_eq!(layout.caret_rect.y, 0.0);
+        assert_eq!(layout.caret_rect.x, 100.0);
+    }
+    #[test]
+    fn wrapped_caret_and_click_share_coordinates() {
+        let mut b = TextBuffer::from_string("ї".repeat(30));
+        b.set_cursor_offset(24);
+        let snap = b.create_snapshot();
+        let config = ViewportConfig {
+            width_px: 108.0,
+            char_width_px: 10.0,
+            show_line_numbers: false,
+            word_wrap: true,
+            ..Default::default()
+        };
+        let layout = LayoutEngine::compute_layout(&snap, &config, Some((4, 24)));
+        assert_eq!(layout.visible_lines[1].start_col, 9);
+        assert_eq!(layout.caret_rect.y, 20.0);
+        assert_eq!(
+            layout.screen_to_line_col(&config, layout.caret_rect.x, layout.caret_rect.y),
+            (0, 12)
+        );
+        assert_eq!(layout.selection_rects.len(), 2);
+    }
+    #[test]
+    fn deep_viewport_and_long_line_are_bounded() {
+        let b =
+            TextBuffer::from_string(format!("{}{}", "x\n".repeat(100_000), "a".repeat(100_000)));
+        let config = ViewportConfig {
+            top_line: 100_000,
+            ..Default::default()
+        };
+        let layout = LayoutEngine::compute_layout(&b.create_snapshot(), &config, None);
+        assert_eq!(layout.visible_lines.len(), 1);
+        assert!(layout.visible_lines[0].text.len() <= config.columns());
+    }
+    #[test]
+    fn scroll_inside_one_wrapped_line() {
+        let snap = TextBuffer::from_string("x".repeat(1000)).create_snapshot();
+        let mut config = ViewportConfig {
+            word_wrap: true,
+            ..Default::default()
+        };
+        config.scroll_rows(&snap, 3);
+        assert_eq!(config.top_line, 0);
+        assert_eq!(config.top_wrap_row, 3);
+        config.scroll_rows(&snap, -2);
+        assert_eq!(config.top_wrap_row, 1);
     }
 }

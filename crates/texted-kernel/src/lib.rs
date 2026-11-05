@@ -4,11 +4,9 @@
 //! 1. **Synchronous Request-Reply Rendezvous (`MsgSend` / `MsgReceive` / `MsgReply`)**:
 //!    The sender blocks until the receiving server processes the request and sends back a reply.
 //! 2. **Asynchronous Pulses (`MsgSendPulse`)**:
-//!    Non-blocking, fixed-size signals (priority, 8-bit code, 64-bit value) for high-priority notifications.
+//!    Non-blocking, fixed-size signals (8-bit code, 64-bit value) for high-priority notifications.
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -16,35 +14,24 @@ pub type ChannelId = u16;
 pub type ConnectionId = u16;
 
 pub const CH_BUFFER: ChannelId = 1;
-pub const CH_LAYOUT: ChannelId = 2;
-pub const CH_RENDER: ChannelId = 3;
 pub const CH_INPUT: ChannelId = 4;
-pub const CH_IO: ChannelId = 5;
 
 /// Non-blocking, fixed-size Pulse (analogous to QNX `pulse_t`)
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Pulse {
-    pub priority: u8,
     pub code: i8,
     pub value: u64,
 }
 
 impl Pulse {
-    pub fn new(priority: u8, code: i8, value: u64) -> Self {
-        Self {
-            priority,
-            code,
-            value,
-        }
+    pub fn new(code: i8, value: u64) -> Self {
+        Self { code, value }
     }
 }
 
 // Well-known pulse codes
-pub const PULSE_SYS_FRAME_TICK: i8 = -1;
-pub const PULSE_SYS_DIRTY_RECT: i8 = -2;
 pub const PULSE_KEY_INPUT: i8 = 10;
-pub const PULSE_BUFFER_DIRTY: i8 = 20;
 
 /// Synchronous Rendezvous Request-Reply envelope
 pub struct Request<Req, Resp> {
@@ -87,7 +74,7 @@ impl<Req, Resp> ChannelServer<Req, Resp> {
         }
 
         // Select between pulse and message
-        crossbeam_channel::select! {
+        crossbeam_channel::select_biased! {
             recv(self.pulse_rx) -> pulse => {
                 pulse.map(ChannelEvent::Pulse)
             }
@@ -110,13 +97,24 @@ impl<Req, Resp> ChannelServer<Req, Resp> {
 }
 
 /// Channel handle used by clients to send pulses and messages
-#[derive(Clone)]
 pub struct ChannelClient<Req, Resp> {
     client_coid: ConnectionId,
     target_chid: ChannelId,
     pulse_tx: Sender<Pulse>,
     msg_tx: Sender<Request<Req, Resp>>,
     next_tx: Arc<AtomicU64>,
+}
+
+impl<Req, Resp> Clone for ChannelClient<Req, Resp> {
+    fn clone(&self) -> Self {
+        Self {
+            client_coid: self.client_coid,
+            target_chid: self.target_chid,
+            pulse_tx: self.pulse_tx.clone(),
+            msg_tx: self.msg_tx.clone(),
+            next_tx: self.next_tx.clone(),
+        }
+    }
 }
 
 impl<Req, Resp> ChannelClient<Req, Resp> {
@@ -190,26 +188,6 @@ impl<Req, Resp> ChannelPair<Req, Resp> {
     }
 }
 
-/// The Microkernel Registry managing active channels and supervisor tracking
-#[derive(Default)]
-pub struct MicrokernelRegistry {
-    channels: RwLock<HashMap<ChannelId, &'static str>>,
-}
-
-impl MicrokernelRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn register_channel(&self, id: ChannelId, name: &'static str) {
-        self.channels.write().insert(id, name);
-    }
-
-    pub fn channel_name(&self, id: ChannelId) -> Option<&'static str> {
-        self.channels.read().get(&id).copied()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,15 +199,13 @@ mod tests {
         let client = pair.connect();
         let server = pair.server;
 
-        let handle = thread::spawn(move || {
-            match server.receive().expect("Failed to receive") {
-                ChannelEvent::Message(req) => {
-                    assert_eq!(req.payload, "hello microkernel");
-                    let len = req.payload.len();
-                    req.reply(len);
-                }
-                ChannelEvent::Pulse(_) => panic!("Expected message"),
+        let handle = thread::spawn(move || match server.receive().expect("Failed to receive") {
+            ChannelEvent::Message(req) => {
+                assert_eq!(req.payload, "hello microkernel");
+                let len = req.payload.len();
+                req.reply(len);
             }
+            ChannelEvent::Pulse(_) => panic!("Expected message"),
         });
 
         let response = client.send("hello microkernel".to_string()).unwrap();
@@ -251,7 +227,7 @@ mod tests {
         });
 
         // Send a pulse immediately after
-        let pulse = Pulse::new(0, PULSE_KEY_INPUT, 999);
+        let pulse = Pulse::new(PULSE_KEY_INPUT, 999);
         client.send_pulse(pulse).unwrap();
 
         // Server should receive the pulse first because pulses take precedence

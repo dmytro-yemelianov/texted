@@ -1,139 +1,249 @@
-//! Fast I/O Subsystem for Texted
-//!
-//! Provides memory-mapped file loading for multi-megabyte files,
-//! crash-resilient atomic file persistence, and encoding line-ending detection.
-
-use memmap2::Mmap;
-use std::fs::{self, File};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-
+//! Streaming UTF-8 loading and atomic, metadata-preserving persistence.
+use ropey::Rope;
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineEnding {
     Lf,
     Crlf,
 }
-
 #[derive(Debug, Clone)]
 pub struct LoadedDocument {
-    pub content: String,
+    pub content: Rope,
     pub path: Option<PathBuf>,
     pub line_ending: LineEnding,
     pub has_bom: bool,
     pub byte_size: usize,
 }
-
 pub struct IoManager;
-
+// Normalize CRLF incrementally, including pairs split across read boundaries.
+struct NormalizedReader<R> {
+    inner: R,
+    pending_cr: bool,
+    crlf: bool,
+}
+impl<R: BufRead> Read for NormalizedReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut n = 0;
+        while n < out.len() {
+            let input = self.inner.fill_buf()?;
+            if input.is_empty() {
+                if self.pending_cr {
+                    out[n] = b'\r';
+                    n += 1;
+                    self.pending_cr = false;
+                }
+                break;
+            }
+            let mut consumed = 0;
+            for &b in input {
+                if n == out.len() {
+                    break;
+                }
+                if self.pending_cr {
+                    self.pending_cr = false;
+                    if b == b'\n' {
+                        self.crlf = true;
+                        out[n] = b'\n';
+                        n += 1;
+                        consumed += 1;
+                        continue;
+                    }
+                    out[n] = b'\r';
+                    n += 1;
+                    if n == out.len() {
+                        break;
+                    }
+                }
+                consumed += 1;
+                if b == b'\r' {
+                    self.pending_cr = true;
+                } else {
+                    out[n] = b;
+                    n += 1;
+                }
+            }
+            self.inner.consume(consumed);
+        }
+        Ok(n)
+    }
+}
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 impl IoManager {
-    /// Read a file, using memory mapping for large files to eliminate memory copying overhead
     pub fn open_file<P: AsRef<Path>>(path: P) -> io::Result<LoadedDocument> {
-        let path_ref = path.as_ref();
-        let file = File::open(path_ref)?;
-        let metadata = file.metadata()?;
-        let byte_size = metadata.len() as usize;
-
-        let content_bytes: Vec<u8> = if byte_size > 1024 * 1024 {
-            // > 1 MB: use memory-map
-            let mmap = unsafe { Mmap::map(&file)? };
-            mmap.to_vec()
-        } else {
-            // Small file: standard fast read
-            fs::read(path_ref)?
+        let path = path.as_ref();
+        let file = File::open(path)?;
+        let byte_size = file.metadata()?.len() as usize;
+        let mut input = BufReader::new(file);
+        let has_bom = input.fill_buf()?.starts_with(&[0xef, 0xbb, 0xbf]);
+        if has_bom {
+            input.consume(3);
+        }
+        let mut reader = NormalizedReader {
+            inner: input,
+            pending_cr: false,
+            crlf: false,
         };
-
-        // Detect BOM (0xEF, 0xBB, 0xBF)
-        let (has_bom, slice) = if content_bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            (true, &content_bytes[3..])
-        } else {
-            (false, &content_bytes[..])
-        };
-
-        let content = String::from_utf8(slice.to_vec())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        // Detect dominant line ending
-        let line_ending = if content.contains("\r\n") {
-            LineEnding::Crlf
-        } else {
-            LineEnding::Lf
-        };
-
+        let content = Rope::from_reader(&mut reader)?;
         Ok(LoadedDocument {
             content,
-            path: Some(path_ref.to_path_buf()),
-            line_ending,
+            path: Some(path.into()),
+            line_ending: if reader.crlf {
+                LineEnding::Crlf
+            } else {
+                LineEnding::Lf
+            },
             has_bom,
             byte_size,
         })
     }
-
-    /// Safely writes content to target path atomically via a sibling temp file
     pub fn save_atomic<P: AsRef<Path>>(
         path: P,
         content: &str,
         has_bom: bool,
-        line_ending: LineEnding,
+        ending: LineEnding,
     ) -> io::Result<()> {
-        let path_ref = path.as_ref();
-        let parent = path_ref.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = path_ref
+        Self::save_chunks(path, std::iter::once(content), has_bom, ending)
+    }
+    pub fn save_rope<P: AsRef<Path>>(
+        path: P,
+        content: &Rope,
+        has_bom: bool,
+        ending: LineEnding,
+    ) -> io::Result<()> {
+        Self::save_chunks(path, content.chunks(), has_bom, ending)
+    }
+    fn save_chunks<'a, P: AsRef<Path>>(
+        path: P,
+        chunks: impl Iterator<Item = &'a str>,
+        has_bom: bool,
+        ending: LineEnding,
+    ) -> io::Result<()> {
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = path
             .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("document.txt");
-
-        let tmp_file_name = format!(".{}_{}.texted_tmp", file_name, std::process::id());
-        let tmp_path = parent.join(tmp_file_name);
-
-        {
-            let mut file = File::create(&tmp_path)?;
-
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing filename"))?;
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let tmp = parent.join(tmp_name);
+        let mut created = false;
+        let result = (|| {
+            let file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            created = true;
+            if let Ok(meta) = fs::metadata(path) {
+                file.set_permissions(meta.permissions())?;
+            }
+            let mut writer = BufWriter::new(file);
             if has_bom {
-                file.write_all(&[0xEF, 0xBB, 0xBF])?;
+                writer.write_all(&[0xef, 0xbb, 0xbf])?;
             }
-
-            match line_ending {
-                LineEnding::Lf => {
-                    file.write_all(content.as_bytes())?;
+            let mut previous_cr = false;
+            for chunk in chunks {
+                if ending == LineEnding::Lf {
+                    writer.write_all(chunk.as_bytes())?;
+                    continue;
                 }
-                LineEnding::Crlf => {
-                    // Normalize to CRLF if requested
-                    for line in content.split('\n') {
-                        let clean_line = line.strip_suffix('\r').unwrap_or(line);
-                        file.write_all(clean_line.as_bytes())?;
-                        file.write_all(b"\r\n")?;
+                for &b in chunk.as_bytes() {
+                    if b == b'\n' && !previous_cr {
+                        writer.write_all(b"\r")?;
                     }
+                    writer.write_all(&[b])?;
+                    previous_cr = b == b'\r';
                 }
             }
-
-            file.sync_all()?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            drop(writer);
+            fs::rename(&tmp, path)?;
+            #[cfg(unix)]
+            File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() && created {
+            let _ = fs::remove_file(&tmp);
         }
-
-        // Atomic rename over target path
-        fs::rename(&tmp_path, path_ref)?;
-
-        Ok(())
+        result
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_atomic_save_and_read() {
-        let dir = std::env::temp_dir().join("texted_test");
-        let _ = fs::create_dir_all(&dir);
-        let test_file = dir.join("test_note.txt");
-
-        let content = "Hello from Texted!\nLine 2 with LF";
-        IoManager::save_atomic(&test_file, content, false, LineEnding::Lf).unwrap();
-
-        let doc = IoManager::open_file(&test_file).unwrap();
-        assert_eq!(doc.content, content);
-        assert_eq!(doc.line_ending, LineEnding::Lf);
-        assert!(!doc.has_bom);
-
-        let _ = fs::remove_file(test_file);
+    fn failed_atomic_rename_cleans_only_its_own_temp_file() {
+        let parent = std::env::temp_dir().join(format!("texted-io-failure-{}", std::process::id()));
+        let target = parent.join("directory");
+        fs::create_dir_all(&target).unwrap();
+        assert!(IoManager::save_atomic(&target, "data", false, LineEnding::Lf).is_err());
+        assert!(target.is_dir());
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+        fs::remove_dir_all(parent).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn existing_file_permissions_survive_atomic_save() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("texted-io-mode-{}", std::process::id()));
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        IoManager::save_atomic(&path, "new", false, LineEnding::Lf).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn round_trip_endings_bom_and_trailing_newlines() {
+        let dir = std::env::temp_dir().join(format!("texted-io-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.txt");
+        for ending in [LineEnding::Lf, LineEnding::Crlf] {
+            for bom in [false, true] {
+                for text in ["", "abc", "abc\n", "abc\n\n", "їжак\nґрунт"] {
+                    IoManager::save_atomic(&path, text, bom, ending).unwrap();
+                    let doc = IoManager::open_file(&path).unwrap();
+                    assert_eq!(doc.content.to_string(), text);
+                    assert_eq!(doc.has_bom, bom);
+                    let raw = fs::read(&path).unwrap();
+                    let expected = if ending == LineEnding::Crlf {
+                        text.replace('\n', "\r\n")
+                    } else {
+                        text.to_owned()
+                    };
+                    assert_eq!(&raw[if bom { 3 } else { 0 }..], expected.as_bytes());
+                }
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn normalization_handles_read_boundaries_and_lone_cr() {
+        for capacity in 1..6 {
+            let input = BufReader::with_capacity(capacity, &b"a\r\nb\rc\r\n\r"[..]);
+            let mut reader = NormalizedReader {
+                inner: input,
+                pending_cr: false,
+                crlf: false,
+            };
+            let mut text = String::new();
+            reader.read_to_string(&mut text).unwrap();
+            assert_eq!(text, "a\nb\rc\n\r");
+        }
     }
 }

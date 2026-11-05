@@ -1,3 +1,5 @@
+> Historical design proposal. For the current implementation and measured limits, read [README](../README.md) and [performance notes](performance.md). GPU rendering, mmap and supervision below are proposed work, not implemented guarantees.
+
 # Technical Design Specification: Texted
 
 > **Document Version:** 1.0.0  

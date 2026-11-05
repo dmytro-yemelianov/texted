@@ -1,3 +1,5 @@
+> Updated 2026-11-05: the implementation changed substantially after this handover. Start with [README](README.md) and [audit follow-up](docs/performance.md). The Piece Table, renderer crate and diagnostics descriptions below are historical.
+
 # Texted — Agent Handover Document
 
 > [!NOTE]

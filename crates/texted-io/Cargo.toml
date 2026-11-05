@@ -5,5 +5,4 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-texted-kernel = { path = "../texted-kernel" }
-memmap2.workspace = true
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
