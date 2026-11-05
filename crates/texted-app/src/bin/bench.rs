@@ -7,6 +7,7 @@ use std::{
 use texted_buffer::TextBuffer;
 use texted_kernel::{ChannelEvent, ChannelPair};
 use texted_layout::{LayoutEngine, ViewportConfig};
+mod hardening;
 fn measure(label: &str, iterations: usize, mut operation: impl FnMut()) {
     for _ in 0..3 {
         operation();
@@ -21,12 +22,17 @@ fn measure(label: &str, iterations: usize, mut operation: impl FnMut()) {
     samples.sort_unstable();
     let mean = samples.iter().sum::<Duration>() / iterations as u32;
     println!(
-        "{label:<44} mean={mean:?} p50={:?} p99={:?}",
+        "{label:<44} mean={mean:?} p50={:?} p95={:?} p99={:?}",
         samples[iterations / 2],
+        samples[(iterations * 95 / 100).min(iterations - 1)],
         samples[(iterations * 99 / 100).min(iterations - 1)]
     );
 }
 fn main() {
+    if std::env::args().any(|arg| arg == "--hardening") {
+        hardening::run(std::env::args().any(|arg| arg == "--legacy"));
+        return;
+    }
     println!("Texted CPU benchmarks (release build recommended; no display-latency claims)");
     let pair: ChannelPair<u64, u64> = ChannelPair::new(1);
     let client = pair.connect();

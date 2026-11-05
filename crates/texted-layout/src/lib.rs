@@ -103,7 +103,93 @@ pub struct ViewportLayout {
     pub cursor_col: usize,
     pub selection_rects: Vec<Rect>,
 }
+#[derive(Debug)]
+pub struct MatchHighlight {
+    pub rect: Rect,
+    pub active: bool,
+}
+#[derive(Debug, Default)]
+pub struct HighlightPlan {
+    pub highlights: Vec<MatchHighlight>,
+    pub candidates: usize,
+    pub row_visits: usize,
+}
 impl ViewportLayout {
+    /// Clips sorted, non-overlapping matches against visible byte windows.
+    /// The slice may be a bounded viewport page; a full-document index is not required.
+    pub fn search_highlights(
+        &self,
+        snapshot: &BufferSnapshot,
+        config: &ViewportConfig,
+        revision: u64,
+        matches: &[(usize, usize)],
+        active: Option<(usize, usize)>,
+    ) -> HighlightPlan {
+        let mut plan = HighlightPlan::default();
+        if revision != snapshot.revision {
+            return plan;
+        }
+        let rows: Vec<_> = self
+            .visible_lines
+            .iter()
+            .filter_map(|row| {
+                let start = snapshot.line_col_to_offset(row.line_index, row.start_col);
+                let end = snapshot.line_col_to_offset(row.line_index, row.end_col);
+                (start < end).then_some((row, start, end))
+            })
+            .collect();
+        let mut windows: Vec<(usize, usize)> = Vec::new();
+        for &(_, start, end) in &rows {
+            if let Some(window) = windows.last_mut().filter(|w| start <= w.1) {
+                window.1 = window.1.max(end);
+            } else {
+                windows.push((start, end));
+            }
+        }
+        let mut previous = None;
+        for (start, end) in windows {
+            let first = matches.partition_point(|&(_, b)| b <= start);
+            for (index, &(a, b)) in matches
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take_while(|(_, &(a, _))| a < end)
+            {
+                if previous == Some(index) {
+                    continue;
+                }
+                previous = Some(index);
+                plan.candidates += 1;
+                let first_row = rows.partition_point(|&(_, _, end)| end <= a);
+                let (sl, sc) = snapshot.offset_to_line_col(a);
+                let (el, ec) = snapshot.offset_to_line_col(b);
+                for &(row, _, _) in rows
+                    .iter()
+                    .skip(first_row)
+                    .take_while(|&&(_, start, _)| start < b)
+                {
+                    plan.row_visits += 1;
+                    let from = if row.line_index == sl {
+                        sc
+                    } else {
+                        row.start_col
+                    };
+                    let to = if row.line_index == el {
+                        ec
+                    } else {
+                        row.end_col
+                    };
+                    if let Some(rect) = self.highlight(config, row, from, to) {
+                        plan.highlights.push(MatchHighlight {
+                            rect,
+                            active: active == Some((a, b)),
+                        });
+                    }
+                }
+            }
+        }
+        plan
+    }
     pub fn screen_to_line_col(&self, config: &ViewportConfig, x: f32, y: f32) -> (usize, usize) {
         let row = (y.max(0.0) / config.line_height_px).floor() as usize;
         if let Some(line) = self
@@ -230,6 +316,105 @@ impl LayoutEngine {
 mod tests {
     use super::*;
     use texted_buffer::TextBuffer;
+    #[test]
+    fn search_work_is_bounded_at_a_million_column_offset_and_deep_wrap() {
+        let snap = TextBuffer::from_string("a".repeat(2_000_000)).create_snapshot();
+        let matches = snap.find_matches("a");
+        for wrap in [false, true] {
+            let mut config = ViewportConfig {
+                left_col: 1_000_000,
+                word_wrap: wrap,
+                ..Default::default()
+            };
+            config.top_wrap_row = 1_000_000 / config.columns();
+            let layout = LayoutEngine::compute_layout(&snap, &config, None);
+            let plan = layout.search_highlights(
+                &snap,
+                &config,
+                snap.revision,
+                &matches,
+                Some((1_000_000, 1_000_001)),
+            );
+            let visible = layout.visible_lines.len() * config.columns();
+            assert_eq!(plan.highlights.len(), visible);
+            assert!(plan.candidates <= visible + 2);
+            assert_eq!(plan.row_visits, visible);
+            assert_eq!(plan.highlights.iter().filter(|h| h.active).count(), 1);
+        }
+    }
+    #[test]
+    fn multiline_match_visits_visible_rows_instead_of_its_document_span() {
+        let snap = TextBuffer::from_string("ї\n".repeat(100_000)).create_snapshot();
+        let config = ViewportConfig {
+            top_line: 50_000,
+            height_px: 60.0,
+            ..Default::default()
+        };
+        let layout = LayoutEngine::compute_layout(&snap, &config, None);
+        let plan = layout.search_highlights(
+            &snap,
+            &config,
+            snap.revision,
+            &[(0, snap.total_bytes)],
+            None,
+        );
+        assert_eq!(plan.candidates, 1);
+        assert_eq!(plan.row_visits, 3);
+        assert_eq!(plan.highlights.len(), 3);
+        assert!(plan
+            .highlights
+            .iter()
+            .all(|h| h.rect.width == config.char_width_px));
+    }
+    #[test]
+    fn highlight_boundaries_empty_view_and_stale_revision() {
+        let mut buffer = TextBuffer::from_string("їїї\nabc".into());
+        let snap = buffer.create_snapshot();
+        let config = ViewportConfig {
+            left_col: 1,
+            width_px: 78.0,
+            show_line_numbers: false,
+            char_width_px: 10.0,
+            ..Default::default()
+        };
+        let layout = LayoutEngine::compute_layout(&snap, &config, None);
+        let plan = layout.search_highlights(
+            &snap,
+            &config,
+            snap.revision,
+            &[(0, 2), (2, 4), (4, 6)],
+            Some((2, 4)),
+        );
+        assert_eq!(plan.candidates, 2);
+        assert_eq!(plan.highlights.len(), 2);
+        assert!(plan.highlights[0].active);
+        assert_eq!(plan.highlights[0].rect.x, config.text_x());
+        buffer.insert(0, "x");
+        assert!(layout
+            .search_highlights(
+                &buffer.create_snapshot(),
+                &config,
+                snap.revision,
+                &[(2, 4)],
+                None
+            )
+            .highlights
+            .is_empty());
+        let empty = LayoutEngine::compute_layout(
+            &snap,
+            &ViewportConfig {
+                height_px: 0.0,
+                ..config
+            },
+            None,
+        );
+        assert_eq!(
+            empty
+                .search_highlights(&snap, &config, snap.revision, &[(0, 6)], None)
+                .candidates,
+            0
+        );
+    }
     #[test]
     fn horizontal_offset_aligns_unicode_text_caret_mouse_and_highlights() {
         let mut b = TextBuffer::from_string("абвгґдеєжзиіїйклмн".into());
