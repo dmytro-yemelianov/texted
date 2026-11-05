@@ -2159,66 +2159,18 @@ fn main() {
                         );
                     }
 
-                    // 5. Render Search Match Highlights
-                    if !search_state.find_query.is_empty() {
-                        let lines = SnapshotLines(&snap);
-
-                        let first = snap.line_col_to_offset(config.top_line, 0);
-                        let last = layout.visible_lines.last().map_or(first, |row| {
-                            snap.line_col_to_offset(row.line_index, row.end_col)
-                        });
-                        let start = search_state
-                            .matches
-                            .partition_point(|&(_, end)| end < first);
-                        for (m_idx, &(m_start, m_end)) in search_state
-                            .matches
-                            .iter()
-                            .enumerate()
-                            .skip(start)
-                            .take_while(|(_, &(begin, _))| begin <= last)
-                        {
-                            let (m_s_l, m_s_c) = snap.offset_to_line_col(m_start);
-                            let (m_e_l, m_e_c) = snap.offset_to_line_col(m_end);
-
-                            let is_active = search_state.current_match_idx == Some(m_idx);
-                            let highlight_color = if is_active {
-                                COLOR_SEARCH_ACTIVE
-                            } else {
-                                COLOR_SEARCH_MATCH
-                            };
-
-                            for l_idx in m_s_l..=m_e_l {
-                                for v_line in &layout.visible_lines {
-                                    if v_line.line_index == l_idx {
-                                        let row_y = v_line.y_px as usize;
-                                        let line_len =
-                                            lines.get(l_idx).map(|l| l.len_chars()).unwrap_or(0);
-
-                                        let from_c = if l_idx == m_s_l { m_s_c } else { 0 };
-                                        let to_c = if l_idx == m_e_l { m_e_c } else { line_len };
-
-                                        let Some(rect) =
-                                            layout.highlight(&config, v_line, from_c, to_c)
-                                        else {
-                                            continue;
-                                        };
-                                        let h_x = rect.x.round() as usize;
-                                        let h_w = rect.width.round() as usize;
-
-                                        draw_rect(
-                                            buffer,
-                                            width,
-                                            height,
-                                            h_x,
-                                            row_y + 2,
-                                            h_w,
-                                            font_engine.line_height_px as usize,
-                                            highlight_color,
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                    // 5. Render only revision-valid matches intersecting visible rows.
+                    let match_revision = search_state.submitted.as_ref()
+                        .filter(|(_, query)| query == &search_state.find_query)
+                        .map(|(revision, _)| *revision)
+                        .unwrap_or(u64::MAX);
+                    let active = search_state.current_match_idx.and_then(|i| search_state.matches.get(i).copied());
+                    for highlight in layout.search_highlights(&snap, &config, match_revision, &search_state.matches, active).highlights {
+                        let rect = highlight.rect;
+                        draw_rect(buffer, width, height, rect.x.round() as usize,
+                            rect.y.round() as usize + 2, rect.width.round() as usize,
+                            rect.height as usize,
+                            if highlight.active { COLOR_SEARCH_ACTIVE } else { COLOR_SEARCH_MATCH });
                     }
 
                     // 6. Render Selection Highlights

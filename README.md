@@ -61,3 +61,5 @@ cargo run --release --bin bench
 The benchmark reports CPU operation times and percentiles, never keyboard-to-pixel latency. F3 reports UI command preparation time, layout time, document bytes, snapshot storage type and the active GPU/backend. These CPU times exclude GPU execution, submission and display scanout; the HUD does not report display FPS or RAM usage.
 
 See [performance notes](docs/performance.md) for the audit, measurements and remaining limits. [The original design](docs/design-spec.md) is historical planning material.
+
+The next hardening work is defined in the [performance and architecture specification](docs/performance-hardening-spec.md) and its [staged implementation plan](docs/performance-hardening-plan.md).
