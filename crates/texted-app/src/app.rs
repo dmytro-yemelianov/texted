@@ -18,7 +18,7 @@ use std::{
 use texted_app::{
     buffer_service::{BufferService, Command},
     commands::EditorCommand,
-    input::{self, FileIntent, Intent, KeyInput, SearchContext},
+    input::{self, Intent, KeyInput, SearchContext},
     search::SearchBarMode,
 };
 use winit::{
@@ -196,6 +196,11 @@ impl App {
         self.window.request_redraw();
     }
     fn intent(&mut self, intent: Intent) {
+        // Lifecycle intents are queued even while clipboard capture or another file action is pending.
+        if let Some(result) = self.files.route(&intent) {
+            self.report(result);
+            return;
+        }
         if matches!(intent, Intent::Cancel | Intent::SearchClose) {
             self.buffer.client.cancel();
             self.transfers.cancel();
@@ -218,16 +223,6 @@ impl App {
         }
         match intent {
             Intent::Edit(command) => self.edit(command, true),
-            Intent::File(file) => {
-                let action = match file {
-                    FileIntent::New => Action::New,
-                    FileIntent::Open => Action::OpenDialog,
-                    FileIntent::Save { as_new } => Action::Save { save_as: as_new },
-                    FileIntent::Close => Action::Close,
-                };
-                let result = self.files.enqueue(action);
-                self.report(result);
-            }
             Intent::Copy { cut } => {
                 let result = self.transfers.copy(&self.buffer.client, cut);
                 self.report(result);

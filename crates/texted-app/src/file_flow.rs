@@ -4,7 +4,10 @@ use crate::{
     transfers::submit,
 };
 use std::{collections::VecDeque, sync::Arc};
-use texted_app::buffer_service::{BufferClient, Command};
+use texted_app::{
+    buffer_service::{BufferClient, Command, Published},
+    input::{FileIntent, Intent},
+};
 use texted_io::LineEnding;
 use winit::window::Window;
 pub(crate) struct FileFlow {
@@ -32,6 +35,23 @@ impl FileFlow {
         self.queue.push_back(action);
         Ok(())
     }
+    pub fn route(&mut self, intent: &Intent) -> Option<Result<(), String>> {
+        let action = match intent {
+            Intent::File(FileIntent::New) => Action::New,
+            Intent::File(FileIntent::Open) => Action::OpenDialog,
+            Intent::File(FileIntent::Save { as_new }) => Action::Save { save_as: *as_new },
+            Intent::File(FileIntent::Close) => Action::Close,
+            _ => return None,
+        };
+        Some(self.enqueue(action))
+    }
+    fn next_ready(&mut self, p: &Published, accepted: u64, transferring: bool) -> Option<Action> {
+        if self.documents.is_idle() && ready(p, accepted, transferring) {
+            self.queue.pop_front()
+        } else {
+            None
+        }
+    }
     pub fn poll(
         &mut self,
         client: &BufferClient,
@@ -50,8 +70,8 @@ impl FileFlow {
             return Ok(false);
         }
         let mut effect = self.documents.poll(&p.snapshot, client, window);
-        if matches!(effect, Effect::None) && self.documents.is_idle() {
-            if let Some(action) = self.queue.pop_front() {
+        if matches!(effect, Effect::None) {
+            if let Some(action) = self.next_ready(&p, client.barrier(), transferring) {
                 effect = self.documents.handle(action, &p.snapshot, client, window);
             }
         }
@@ -75,6 +95,56 @@ fn ready(p: &texted_app::buffer_service::Published, accepted: u64, transferring:
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn keyboard_save_waits_for_clipboard_capture_and_its_accepted_paste() {
+        use texted_app::commands::EditorCommand;
+        let (wake, events) = std::sync::mpsc::sync_channel(1);
+        let service = texted_app::buffer_service::BufferService::new(move || {
+            let _ = wake.try_send(());
+        });
+        let client = &service.client;
+        let mut flow = FileFlow::new(client.latest().snapshot.content.clone());
+        client
+            .submit(Command::Edit(EditorCommand::Insert("prior".into())))
+            .unwrap_or_else(|_| panic!("rejected"));
+        flow.route(&Intent::File(FileIntent::Save { as_new: false }))
+            .unwrap()
+            .unwrap();
+        flow.route(&Intent::File(FileIntent::Close))
+            .unwrap()
+            .unwrap();
+        assert!(flow.locked());
+        assert!(flow
+            .next_ready(&client.latest(), client.barrier(), true)
+            .is_none());
+        while client.latest().completed_through < client.barrier() {
+            events
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        let context = client.latest().context();
+        client
+            .submit(Command::PasteContext {
+                context,
+                text: "+clipboard".into(),
+            })
+            .unwrap_or_else(|_| panic!("rejected"));
+        while client.latest().completed_through < client.barrier() {
+            events
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        let p = client.latest();
+        assert_eq!(p.snapshot.content.to_string(), "prior+clipboard");
+        assert!(matches!(
+            flow.next_ready(&p, client.barrier(), false),
+            Some(Action::Save { save_as: false })
+        ));
+        assert!(matches!(
+            flow.next_ready(&p, client.barrier(), false),
+            Some(Action::Close)
+        ));
+    }
     #[test]
     fn file_barrier_waits_for_worker_failure_and_clipboard_continuations() {
         let service = texted_app::buffer_service::BufferService::new(|| {});
