@@ -35,6 +35,7 @@ impl Default for ViewportConfig {
 #[derive(Clone, Debug)]
 pub struct VisibleLine {
     pub line_index: usize,
+    pub is_continuation: bool,
     pub text: String,
     pub y_px: f32,
 }
@@ -68,41 +69,97 @@ impl LayoutEngine {
         let lines: Vec<&str> = snapshot.content.split('\n').collect();
         let total_lines = lines.len();
 
-        let visible_row_capacity = (config.height_px / config.line_height_px).ceil() as usize;
-        let start_line = config.top_line.min(total_lines.saturating_sub(1));
-        let end_line = (start_line + visible_row_capacity + 1).min(total_lines);
-
-        let mut visible_lines = Vec::with_capacity(end_line - start_line);
         let gutter_offset = if config.show_line_numbers {
             config.line_number_gutter_width_px
         } else {
             10.0
         };
 
-        for (idx, line_str) in lines.iter().enumerate().take(end_line).skip(start_line) {
-            let row_y = (idx - start_line) as f32 * config.line_height_px;
-            visible_lines.push(VisibleLine {
-                line_index: idx,
-                text: line_str.to_string(),
-                y_px: row_y,
-            });
+        let mut visible_lines = Vec::new();
+        let mut cur_y = 0.0f32;
+
+        if config.word_wrap {
+            let max_chars = ((config.width_px - gutter_offset - 20.0).max(100.0) / config.char_width_px).floor().max(10.0) as usize;
+            let mut skipped_visual_rows = 0usize;
+
+            for (idx, line_str) in lines.iter().enumerate() {
+                let char_vec: Vec<char> = line_str.chars().collect();
+                if char_vec.is_empty() {
+                    if skipped_visual_rows >= config.top_line {
+                        if cur_y + config.line_height_px <= config.height_px + config.line_height_px {
+                            visible_lines.push(VisibleLine {
+                                line_index: idx,
+                                is_continuation: false,
+                                text: String::new(),
+                                y_px: cur_y,
+                            });
+                            cur_y += config.line_height_px;
+                        }
+                    } else {
+                        skipped_visual_rows += 1;
+                    }
+                } else {
+                    let mut chunk_start = 0;
+                    let mut is_first = true;
+
+                    while chunk_start < char_vec.len() {
+                        let chunk_end = (chunk_start + max_chars).min(char_vec.len());
+                        let chunk_text: String = char_vec[chunk_start..chunk_end].iter().collect();
+
+                        if skipped_visual_rows >= config.top_line {
+                            if cur_y + config.line_height_px <= config.height_px + config.line_height_px {
+                                visible_lines.push(VisibleLine {
+                                    line_index: idx,
+                                    is_continuation: !is_first,
+                                    text: chunk_text,
+                                    y_px: cur_y,
+                                });
+                                cur_y += config.line_height_px;
+                            }
+                        } else {
+                            skipped_visual_rows += 1;
+                        }
+
+                        chunk_start = chunk_end;
+                        is_first = false;
+                    }
+                }
+
+                if cur_y > config.height_px {
+                    break;
+                }
+            }
+        } else {
+            let visible_row_capacity = (config.height_px / config.line_height_px).ceil() as usize;
+            let start_line = config.top_line.min(total_lines.saturating_sub(1));
+            let end_line = (start_line + visible_row_capacity + 2).min(total_lines);
+
+            for (idx, line_str) in lines.iter().enumerate().take(end_line).skip(start_line) {
+                let row_y = (idx - start_line) as f32 * config.line_height_px;
+                visible_lines.push(VisibleLine {
+                    line_index: idx,
+                    is_continuation: false,
+                    text: line_str.to_string(),
+                    y_px: row_y,
+                });
+            }
         }
 
         // Calculate cursor position (line, col)
         let (cursor_line, cursor_col) = Self::offset_to_line_col(&snapshot.content, snapshot.cursor_offset);
 
-        // Calculate caret screen rect
-        let caret_x = if cursor_line >= start_line && cursor_line < end_line {
-            gutter_offset + (cursor_col as f32 * config.char_width_px)
-        } else {
-            -100.0 // Off-screen
-        };
+        // Find visual position of cursor
+        let mut caret_x = -100.0f32;
+        let mut caret_y = -100.0f32;
 
-        let caret_y = if cursor_line >= start_line && cursor_line < end_line {
-            (cursor_line - start_line) as f32 * config.line_height_px
-        } else {
-            -100.0
-        };
+        for v_line in &visible_lines {
+            if v_line.line_index == cursor_line {
+                // If not word wrap or first line with col
+                caret_y = v_line.y_px;
+                caret_x = gutter_offset + (cursor_col as f32 * config.char_width_px);
+                break;
+            }
+        }
 
         let caret_rect = Rect {
             x: caret_x,
@@ -117,22 +174,24 @@ impl LayoutEngine {
             let (e_line, e_col) = Self::offset_to_line_col(&snapshot.content, sel_start.max(sel_end));
 
             for line_idx in s_line..=e_line {
-                if line_idx >= start_line && line_idx < end_line {
-                    let y = (line_idx - start_line) as f32 * config.line_height_px;
-                    let line_len = lines.get(line_idx).map(|s| s.chars().count()).unwrap_or(0);
+                for v_line in &visible_lines {
+                    if v_line.line_index == line_idx && !v_line.is_continuation {
+                        let y = v_line.y_px;
+                        let line_len = lines.get(line_idx).map(|s| s.chars().count()).unwrap_or(0);
 
-                    let col_from = if line_idx == s_line { s_col } else { 0 };
-                    let col_to = if line_idx == e_line { e_col } else { line_len };
+                        let col_from = if line_idx == s_line { s_col } else { 0 };
+                        let col_to = if line_idx == e_line { e_col } else { line_len };
 
-                    let x = gutter_offset + (col_from as f32 * config.char_width_px);
-                    let w = ((col_to - col_from) as f32 * config.char_width_px).max(config.char_width_px / 2.0);
+                        let x = gutter_offset + (col_from as f32 * config.char_width_px);
+                        let w = ((col_to - col_from) as f32 * config.char_width_px).max(config.char_width_px / 2.0);
 
-                    selection_rects.push(Rect {
-                        x,
-                        y,
-                        width: w,
-                        height: config.line_height_px,
-                    });
+                        selection_rects.push(Rect {
+                            x,
+                            y,
+                            width: w,
+                            height: config.line_height_px,
+                        });
+                    }
                 }
             }
         }
@@ -152,7 +211,8 @@ impl LayoutEngine {
 
         for (offset, ch) in text.char_indices() {
             if offset >= target_offset {
-                return (cur_line, target_offset - line_start_offset);
+                let col = text[line_start_offset..offset].chars().count();
+                return (cur_line, col);
             }
             if ch == '\n' {
                 cur_line += 1;
@@ -160,7 +220,9 @@ impl LayoutEngine {
             }
         }
 
-        (cur_line, target_offset.saturating_sub(line_start_offset))
+        let clamped = target_offset.min(text.len());
+        let col = text[line_start_offset..clamped].chars().count();
+        (cur_line, col)
     }
 
     /// Maps a screen click coordinate (x, y) to a text buffer byte offset

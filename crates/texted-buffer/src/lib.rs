@@ -335,41 +335,27 @@ impl TextBuffer {
 
     /// Converts byte offset to 0-based (line, column)
     pub fn offset_to_line_col(&self, offset: usize) -> (usize, usize) {
-        let mut cur_offset = 0;
+        let full = self.to_string();
+        Self::offset_to_line_col_str(&full, offset)
+    }
+
+    pub fn offset_to_line_col_str(text: &str, target_offset: usize) -> (usize, usize) {
         let mut cur_line = 0;
         let mut line_start_offset = 0;
 
-        for piece in &self.pieces {
-            let piece_end = cur_offset + piece.len;
-            if offset <= piece_end {
-                let piece_text = self.slice_piece(piece, 0, piece.len);
-                for (idx, ch) in piece_text.char_indices() {
-                    let global_pos = cur_offset + idx;
-                    if global_pos >= offset {
-                        let col = offset - line_start_offset;
-                        return (cur_line, col);
-                    }
-                    if ch == '\n' {
-                        cur_line += 1;
-                        line_start_offset = global_pos + 1;
-                    }
-                }
-                let col = offset - line_start_offset;
+        for (offset, ch) in text.char_indices() {
+            if offset >= target_offset {
+                let col = text[line_start_offset..offset].chars().count();
                 return (cur_line, col);
-            } else {
-                cur_line += piece.summary.lines;
-                // find last newline in piece if it had any
-                if piece.summary.lines > 0 {
-                    let piece_text = self.slice_piece(piece, 0, piece.len);
-                    if let Some(pos) = piece_text.rfind('\n') {
-                        line_start_offset = cur_offset + pos + 1;
-                    }
-                }
-                cur_offset = piece_end;
+            }
+            if ch == '\n' {
+                cur_line += 1;
+                line_start_offset = offset + 1;
             }
         }
 
-        let col = offset.saturating_sub(line_start_offset);
+        let clamped = target_offset.min(text.len());
+        let col = text[line_start_offset..clamped].chars().count();
         (cur_line, col)
     }
 
@@ -430,6 +416,85 @@ impl TextBuffer {
         let full = self.to_string();
         let (line, _) = self.offset_to_line_col(self.cursor_offset);
         self.cursor_offset = Self::line_col_to_offset_str(&full, line, usize::MAX);
+    }
+
+    pub fn move_word_left(&mut self) {
+        if self.cursor_offset == 0 {
+            return;
+        }
+        let full = self.to_string();
+        let chars: Vec<(usize, char)> = full.char_indices().collect();
+        let cur_idx = chars.iter().position(|&(b, _)| b >= self.cursor_offset).unwrap_or(chars.len());
+        if cur_idx == 0 {
+            self.cursor_offset = 0;
+            return;
+        }
+        let mut i = cur_idx - 1;
+        while i > 0 && !chars[i].1.is_alphanumeric() {
+            i -= 1;
+        }
+        while i > 0 && chars[i - 1].1.is_alphanumeric() {
+            i -= 1;
+        }
+        self.cursor_offset = chars[i].0;
+    }
+
+    pub fn move_word_right(&mut self) {
+        let total = self.total_bytes();
+        if self.cursor_offset >= total {
+            return;
+        }
+        let full = self.to_string();
+        let chars: Vec<(usize, char)> = full.char_indices().collect();
+        let cur_idx = chars.iter().position(|&(b, _)| b >= self.cursor_offset).unwrap_or(chars.len());
+        if cur_idx >= chars.len() {
+            return;
+        }
+        let mut i = cur_idx;
+        while i < chars.len() && chars[i].1.is_alphanumeric() {
+            i += 1;
+        }
+        while i < chars.len() && !chars[i].1.is_alphanumeric() {
+            i += 1;
+        }
+        self.cursor_offset = if i < chars.len() { chars[i].0 } else { total };
+    }
+
+    pub fn delete_word_left(&mut self) {
+        let before = self.cursor_offset;
+        self.move_word_left();
+        let after = self.cursor_offset;
+        if after < before {
+            self.delete(after, before);
+        }
+    }
+
+    pub fn delete_word_right(&mut self) {
+        let before = self.cursor_offset;
+        self.move_word_right();
+        let after = self.cursor_offset;
+        if before < after {
+            self.delete(before, after);
+            self.cursor_offset = before;
+        }
+    }
+
+    pub fn delete_to_line_start(&mut self) {
+        let full = self.to_string();
+        let (line, _) = self.offset_to_line_col(self.cursor_offset);
+        let line_start = Self::line_col_to_offset_str(&full, line, 0);
+        if line_start < self.cursor_offset {
+            self.delete(line_start, self.cursor_offset);
+        }
+    }
+
+    pub fn delete_to_line_end(&mut self) {
+        let full = self.to_string();
+        let (line, _) = self.offset_to_line_col(self.cursor_offset);
+        let line_end = Self::line_col_to_offset_str(&full, line, usize::MAX);
+        if self.cursor_offset < line_end {
+            self.delete(self.cursor_offset, line_end);
+        }
     }
 
     pub fn line_col_to_offset_str(text: &str, line: usize, col: usize) -> usize {
