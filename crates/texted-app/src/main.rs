@@ -32,83 +32,18 @@ pub struct AppEvent(DocumentAction);
 mod horizontal_scroll;
 use graphics::{draw_box, draw_rect, DrawList, FontEngine};
 use horizontal_scroll::{HorizontalScroll, BAR_HEIGHT};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use texted_buffer::{BufferSnapshot, TextBuffer};
+use texted_buffer::BufferSnapshot;
 use texted_io::LineEnding;
-use texted_kernel::{ChannelEvent, ChannelPair, CH_BUFFER};
 use texted_layout::{LayoutEngine, ViewportConfig};
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::WindowBuilder;
 
-/// Messages sent to the Buffer Server
-#[derive(Debug)]
-pub enum BufferRequest {
-    Shutdown,
-    BreakUndoGroup,
-    LoadDocument(ropey::Rope),
-    Insert {
-        offset: usize,
-        text: String,
-    },
-    DeleteRange {
-        start: usize,
-        end: usize,
-    },
-    GetSnapshot,
-    Undo,
-    Redo,
-    MoveLeft,
-    MoveRight,
-    MoveUp,
-    MoveDown,
-    MoveHome,
-    MoveEnd,
-    MoveWordLeft,
-    MoveWordRight,
-    Backspace,
-    DeleteForward,
-    DeleteWordLeft,
-    DeleteWordRight,
-    DeleteToLineStart,
-    DeleteToLineEnd,
-    SetCursorOffset(usize),
-    BlockInsert {
-        start_line: usize,
-        end_line: usize,
-        col: usize,
-        text: String,
-    },
-    BlockDelete {
-        start_line: usize,
-        end_line: usize,
-        start_col: usize,
-        end_col: usize,
-    },
-    BlockExtract {
-        start_line: usize,
-        end_line: usize,
-        start_col: usize,
-        end_col: usize,
-    },
-    CommitReplacement {
-        revision: u64,
-        cursor: usize,
-        edited: BufferSnapshot,
-    },
-}
-
-/// Responses from the Buffer Server
-#[derive(Debug)]
-pub enum BufferResponse {
-    Snapshot(BufferSnapshot),
-    Text(String),
-    Committed(bool),
-    Success,
-}
+use texted_app::buffer_host::BufferHost;
+pub use texted_app::buffer_host::{BufferRequest, BufferResponse};
 
 // Dark Mode Palette (VS Code / Zed Dark Charcoal aesthetic)
 const COLOR_BG: u32 = 0x001E1E1E; // Editor canvas dark charcoal
@@ -133,33 +68,7 @@ const COLOR_STATUS_BORDER: u32 = 0x00282828; // Status bar border
 const COLOR_STATUS_TEXT: u32 = 0x00888888; // Status bar text
 const COLOR_STATUS_ACCENT: u32 = 0x00569CD6; // Status bar accent blue
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SelectionMode {
-    None,
-    Stream, // Standard stream selection
-    Block,  // Rectangular / column selection
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct SelectionState {
-    pub mode: SelectionMode,
-    pub anchor_line: usize,
-    pub anchor_col: usize,
-    pub active_line: usize,
-    pub active_col: usize,
-}
-
-impl Default for SelectionState {
-    fn default() -> Self {
-        Self {
-            mode: SelectionMode::None,
-            anchor_line: 0,
-            anchor_col: 0,
-            active_line: 0,
-            active_col: 0,
-        }
-    }
-}
+pub use texted_app::selection::{SelectionMode, SelectionState};
 
 // System clipboard helpers via macOS pbcopy / pbpaste
 fn copy_to_system_clipboard(text: &str) {
@@ -283,161 +192,8 @@ fn main() {
         file_actions.push_back(DocumentAction::OpenPath(path));
     }
 
-    // 1. Initialize Microkernel Channels (QNX ChannelCreate)
-    let buffer_channel: ChannelPair<BufferRequest, BufferResponse> = ChannelPair::new(CH_BUFFER);
-    let buffer_client = buffer_channel.connect();
-
-    // 2. Spawn Isolated Buffer Server Thread (handles Piece Table)
-    let init_text = initial_content;
-    let buffer_thread = thread::Builder::new()
-        .name("server-buffer".to_string())
-        .spawn(move || {
-            let mut buffer = TextBuffer::from_rope(init_text);
-            let server = buffer_channel.server;
-
-            while let Ok(event) = server.receive() {
-                match event {
-                    ChannelEvent::Pulse(_) => {}
-                    ChannelEvent::Message(req) => match req.payload {
-                        BufferRequest::BreakUndoGroup => {
-                            buffer.break_undo_group();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::LoadDocument(ref text) => {
-                            buffer.load_document(text.clone());
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::Shutdown => {
-                            req.reply(BufferResponse::Success);
-                            break;
-                        }
-                        BufferRequest::Insert { offset, ref text } => {
-                            let insert_pos = if offset == usize::MAX {
-                                buffer.cursor_offset()
-                            } else {
-                                offset
-                            };
-                            buffer.insert(insert_pos, text);
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::DeleteRange { start, end } => {
-                            buffer.delete(start, end);
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::GetSnapshot => {
-                            let snap = buffer.create_snapshot();
-                            req.reply(BufferResponse::Snapshot(snap));
-                        }
-                        BufferRequest::Undo => {
-                            buffer.undo();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::Redo => {
-                            buffer.redo();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::MoveLeft => {
-                            buffer.move_cursor_left();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::MoveRight => {
-                            buffer.move_cursor_right();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::MoveWordLeft => {
-                            buffer.move_word_left();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::MoveWordRight => {
-                            buffer.move_word_right();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::MoveUp => {
-                            buffer.move_cursor_up();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::MoveDown => {
-                            buffer.move_cursor_down();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::MoveHome => {
-                            buffer.move_cursor_home();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::MoveEnd => {
-                            buffer.move_cursor_end();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::Backspace => {
-                            buffer.backspace();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::DeleteForward => {
-                            buffer.delete_forward();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::DeleteWordLeft => {
-                            buffer.delete_word_left();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::DeleteWordRight => {
-                            buffer.delete_word_right();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::DeleteToLineStart => {
-                            buffer.delete_to_line_start();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::DeleteToLineEnd => {
-                            buffer.delete_to_line_end();
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::SetCursorOffset(offset) => {
-                            buffer.set_cursor_offset(offset);
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::BlockInsert {
-                            start_line,
-                            end_line,
-                            col,
-                            ref text,
-                        } => {
-                            buffer.block_insert(start_line, end_line, col, text);
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::BlockDelete {
-                            start_line,
-                            end_line,
-                            start_col,
-                            end_col,
-                        } => {
-                            buffer.block_delete(start_line, end_line, start_col, end_col);
-                            req.reply(BufferResponse::Success);
-                        }
-                        BufferRequest::BlockExtract {
-                            start_line,
-                            end_line,
-                            start_col,
-                            end_col,
-                        } => {
-                            let extracted =
-                                buffer.block_extract(start_line, end_line, start_col, end_col);
-                            req.reply(BufferResponse::Text(extracted));
-                        }
-                        BufferRequest::CommitReplacement {
-                            revision,
-                            cursor,
-                            ref edited,
-                        } => {
-                            let committed =
-                                buffer.commit_snapshot(revision, cursor, edited.clone());
-                            req.reply(BufferResponse::Committed(committed));
-                        }
-                    },
-                }
-            }
-        })
-        .expect("Failed to spawn buffer server");
+    let mut buffer_host = BufferHost::spawn(initial_content);
+    let buffer_client = buffer_host.client.clone();
 
     // 3. Initialize Display & Typography
     let mut renderer = match pollster::block_on(gpu::Renderer::new(window.clone())) {
@@ -489,7 +245,6 @@ fn main() {
 
     println!("[Texted] GUI editor running: Dark Mode, Word Wrap, macOS Cmd/Opt navigation.");
 
-    let shutdown_client = buffer_client.clone();
     let _ = event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::WaitUntil(
             if search_state.pending || search_state.mutation.is_some() {
@@ -2642,8 +2397,7 @@ fn main() {
         }
     });
 
-    let _ = shutdown_client.send(BufferRequest::Shutdown);
-    buffer_thread.join().unwrap();
+    buffer_host.shutdown();
 }
 
 #[cfg(test)]
