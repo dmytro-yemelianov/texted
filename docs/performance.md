@@ -1,5 +1,7 @@
 # Implementation audit and follow-up — 2026-11-05
 
+The later audit found remaining off-screen highlight work, unbounded search results, blocking bulk commands, the oversized event loop and whole-line word-selection copies. See the proposed [hardening specification](performance-hardening-spec.md) and [implementation plan](performance-hardening-plan.md). The historical changes below do not establish that all highlight work is currently viewport-bounded.
+
 ## Changes
 
 The original `Vec<Piece>` copied every previous piece list into undo history. Repeated typing therefore retained quadratic metadata. A persistent [Ropey tree](https://docs.rs/ropey/1.6.1/ropey/struct.Rope.html) now provides shared roots for snapshots and history. Consecutive single-character input is grouped until navigation, a different operation, a newline or a 750 ms pause. History retains at most 1,000 transactions.
