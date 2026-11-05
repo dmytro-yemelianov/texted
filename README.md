@@ -41,11 +41,34 @@ Snapshots do not flatten the document. Search streams across rope chunks. Text c
 | Horizontal scrolling (wrap off) | Trackpad / Shift+wheel / scrollbar |
 | Block selection | Option+drag or Cmd+B |
 | Toggle line numbers | Cmd+L |
+| Appearance / styles | Cmd+, or the Style button |
+| Editor font size | Cmd++ / Cmd+- / Cmd+0 (reset size) |
 | Diagnostics | F3 |
 
 Physical letter keys keep shortcuts working with Ukrainian keyboard layouts. Wrapping currently breaks at character-cell boundaries. Text uses character columns rather than grapheme clusters or shaped display cells; complex-script shaping and IME composition remain future work. No-wrap mode supports the trackpad horizontal axis, Shift+wheel, scrollbar dragging and page clicks. Navigation and typing keep the caret visible; manual scrolling leaves its document position unchanged.
 
 The status bar counts Unicode scalar values and reports UTF-8 buffer bytes. The byte count excludes the BOM and uses normalized LF, so it can differ from the saved file's size. Encoding and line-ending labels describe the save format.
+
+## Themes and typography
+
+Appearance offers Modern Dark/Light, VGA, EGA, Atari, Commander, C64, ZX Spectrum, Amber and Green CRT palettes. The theme applies to the document, selection/search highlights, gutter, status, search and appearance panels. Palettes and editor fonts are independent.
+
+Open **Style** in the status bar or press **Cmd+,**. Use the row arrows, or Tab/Shift+Tab to select a field and Left/Right to change it. Changes apply immediately; Escape/Done closes the panel. Choose Courier New, Menlo, Monaco or Pixel 8x8, an 8–40 px editor size and 100–180% line height. Pixel mode uses integer 8 px steps and a nearest-neighbor bitmap; Ukrainian and other non-bitmap characters use a pixel-rasterized system-font fallback. UI labels keep a separate fixed size. Settings do not edit the document or its undo history.
+
+Preferences save atomically in the background to `~/Library/Application Support/Texted/appearance.json`. The latest accepted settings are flushed on normal exit. An invalid or newer-version file is left intact; the app uses session-only defaults and reports the load error. `TEXTED_SETTINGS_PATH` selects an alternate file for isolated previews.
+
+For custom colors, edit that file while Texted is closed; for example:
+
+```json
+{
+  "version": 1,
+  "theme": "c64",
+  "typography": { "family": "menlo", "size_px": 18, "line_spacing": 120 },
+  "colors": { "text": "#E8DCFF", "selection": "#6454A0" }
+}
+```
+
+Optional `colors` keys are `bg`, `text`, `caret`, `selection`, `block_selection`, `search_match`, `search_active`, `gutter_bg`, `gutter_border`, `gutter_text`, `panel_bg`, `panel_border`, `input_bg`, `input_border`, `input_active`, `button_bg`, `button_border`, `status_bg`, `status_border`, `status_text`, and `status_accent`. Values must be `#RRGGBB`; unknown keys are rejected. Selecting another palette clears color overrides; typography changes retain them. Reset defaults restores the built-in appearance. Unavailable font families fall back to an available face. This feature adds static themes and typography; shader effects are a separate future change.
 
 ## Validation
 

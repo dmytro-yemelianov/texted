@@ -22,6 +22,9 @@ pub enum Intent {
     SearchBackspace,
     SearchTab,
     SearchClose,
+    ToggleAppearance,
+    Zoom(i32),
+    ResetFontSize,
     ToggleWrap,
     ToggleLineNumbers,
     ToggleDiagnostics,
@@ -45,6 +48,17 @@ fn is(input: &KeyInput<'_>, code: KeyCode, letter: char) -> bool {
 }
 fn shortcut(input: &KeyInput<'_>) -> Option<Intent> {
     let shift = input.modifiers.shift_key();
+    match input.physical {
+        PhysicalKey::Code(KeyCode::Comma) => return Some(Intent::ToggleAppearance),
+        PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => return Some(Intent::Zoom(1)),
+        PhysicalKey::Code(KeyCode::Minus | KeyCode::NumpadSubtract) => {
+            return Some(Intent::Zoom(-1))
+        }
+        PhysicalKey::Code(KeyCode::Digit0 | KeyCode::Numpad0) => {
+            return Some(Intent::ResetFontSize)
+        }
+        _ => {}
+    }
     let bindings = [
         (KeyCode::KeyA, 'a', Intent::Edit(EditorCommand::SelectAll)),
         (KeyCode::KeyC, 'c', Intent::Copy { cut: false }),
@@ -204,6 +218,36 @@ pub fn decode(input: &KeyInput<'_>, search: SearchContext) -> Option<Intent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn appearance_shortcuts_use_physical_keys_even_with_search_open() {
+        let key = Key::Character("б".into());
+        let mut input = KeyInput {
+            physical: PhysicalKey::Code(KeyCode::Comma),
+            logical: &key,
+            text: Some("б"),
+            modifiers: ModifiersState::SUPER,
+        };
+        assert!(matches!(
+            decode(
+                &input,
+                SearchContext {
+                    open: true,
+                    ..Default::default()
+                }
+            ),
+            Some(Intent::ToggleAppearance)
+        ));
+        input.physical = PhysicalKey::Code(KeyCode::Equal);
+        assert!(matches!(
+            decode(&input, SearchContext::default()),
+            Some(Intent::Zoom(1))
+        ));
+        input.physical = PhysicalKey::Code(KeyCode::Digit0);
+        assert!(matches!(
+            decode(&input, SearchContext::default()),
+            Some(Intent::ResetFontSize)
+        ));
+    }
     #[test]
     fn physical_shortcuts_work_with_ukrainian_logical_keys() {
         let key = Key::Character("а".into());

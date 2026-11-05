@@ -1,5 +1,6 @@
 //! Texted's native entry point. Editing, workers, file lifecycle and painting have separate owners.
 mod app;
+mod appearance_ui;
 mod documents;
 mod editor_view;
 mod file_flow;
@@ -8,7 +9,6 @@ mod graphics;
 mod horizontal_scroll;
 mod mouse;
 mod native_macos;
-mod palette;
 mod search_ui;
 mod transfers;
 mod viewport;

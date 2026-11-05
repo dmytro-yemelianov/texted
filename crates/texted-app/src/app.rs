@@ -1,5 +1,6 @@
 //! Native shell: routes events to controllers and paints immutable published state.
 use crate::{
+    appearance_ui::{self, AppearanceUi},
     documents::Action,
     editor_view::{self, ViewModel},
     file_flow::FileFlow,
@@ -16,13 +17,15 @@ use std::{
     time::{Duration, Instant},
 };
 use texted_app::{
+    appearance::Appearance,
     buffer_service::{BufferService, Command},
     commands::EditorCommand,
     input::{self, Intent, KeyInput, SearchContext},
+    preferences::{self, Preferences},
     search::SearchBarMode,
 };
 use winit::{
-    event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoopWindowTarget},
     keyboard::ModifiersState,
     window::Window,
@@ -32,6 +35,9 @@ pub(crate) struct App {
     renderer: gpu::Renderer,
     failed: bool,
     font: FontEngine,
+    ui_font: FontEngine,
+    appearance: AppearanceUi,
+    preferences: Option<Preferences>,
     draws: DrawList,
     viewport: Viewport,
     mouse: Mouse,
@@ -62,11 +68,28 @@ impl App {
         if let Some(path) = initial {
             let _ = files.enqueue(Action::OpenPath(path));
         }
+        let path = preferences::default_path();
+        let (settings,warning)=match path.as_deref().map(preferences::load) {Some(Ok(settings))=>(settings,None),Some(Err(error))=>(Appearance::default(),Some(format!("Appearance preferences could not be loaded: {error}. Changes apply for this session."))),None=>(Appearance::default(),Some("Appearance preferences path is unavailable; changes apply for this session.".into()))};
+        let mut appearance = AppearanceUi::new(
+            settings,
+            texted_app::appearance::FontFamily::ALL.map(FontEngine::available),
+        );
+        let w = window.clone();
+        let preferences = if warning.is_none() {
+            path.map(|path| Preferences::new(path, move || w.request_redraw()))
+        } else {
+            appearance.save_status = "Session only: preferences could not be loaded".into();
+            None
+        };
+        let font = FontEngine::with_typography(appearance.settings.typography);
         Self {
             window,
             renderer,
             failed: false,
-            font: FontEngine::new(18.0),
+            font,
+            ui_font: FontEngine::new(18.0),
+            appearance,
+            preferences,
             draws: DrawList::default(),
             viewport,
             mouse: Mouse::new(),
@@ -76,7 +99,7 @@ impl App {
             search,
             transfers,
             files,
-            message: None,
+            message: warning,
             snap_after: None,
         }
     }
@@ -88,7 +111,7 @@ impl App {
         self.window.request_redraw();
     }
     fn locked(&self) -> bool {
-        self.failed || self.files.locked() || self.transfers.capturing()
+        self.failed || self.files.locked() || self.transfers.capturing() || self.appearance.open
     }
     pub fn event(&mut self, event: Event<AppEvent>, target: &EventLoopWindowTarget<AppEvent>) {
         target.set_control_flow(ControlFlow::WaitUntil(
@@ -133,25 +156,12 @@ impl App {
                 self.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let state = &self.search.state;
-                let context = SearchContext {
-                    open: state.mode != SearchBarMode::Closed,
-                    replace: state.mode == SearchBarMode::Replace,
-                    replacement_field: state.active_field == 1,
-                };
-                if let Some(intent) = input::decode(
-                    &KeyInput {
-                        physical: event.physical_key,
-                        logical: &event.logical_key,
-                        text: event.text.as_deref(),
-                        modifiers: self.modifiers,
-                    },
-                    context,
-                ) {
-                    self.intent(intent);
-                }
+                self.keyboard(event);
             }
-            WindowEvent::MouseWheel { delta, .. } if !self.files.locked() => {
+
+            WindowEvent::MouseWheel { delta, .. }
+                if !self.files.locked() && !self.appearance.open =>
+            {
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (
                         f64::from(x) * f64::from(self.font.char_width_px) * 3.0,
@@ -180,6 +190,69 @@ impl App {
             _ => {}
         }
     }
+    fn keyboard(&mut self, event: KeyEvent) {
+        let state = &self.search.state;
+        let context = SearchContext {
+            open: state.mode != SearchBarMode::Closed,
+            replace: state.mode == SearchBarMode::Replace,
+            replacement_field: state.active_field == 1,
+        };
+        let input = KeyInput {
+            physical: event.physical_key,
+            logical: &event.logical_key,
+            text: event.text.as_deref(),
+            modifiers: self.modifiers,
+        };
+        let intent = input::decode(&input, context);
+        if self.appearance.open
+            && !matches!(
+                intent,
+                Some(
+                    Intent::ToggleAppearance
+                        | Intent::File(_)
+                        | Intent::Zoom(_)
+                        | Intent::ResetFontSize
+                )
+            )
+        {
+            let before = self.appearance.settings.clone();
+            self.appearance.key(&input);
+            self.appearance_changed(before);
+            return;
+        }
+        if let Some(intent) = intent {
+            self.intent(intent);
+        }
+    }
+    fn appearance_changed(&mut self, before: Appearance) {
+        if before != self.appearance.settings {
+            if before.typography != self.appearance.settings.typography {
+                let typography = self.appearance.settings.typography;
+                if before.typography.family != typography.family
+                    || before.typography.size_px != typography.size_px
+                {
+                    self.font = FontEngine::with_typography(typography);
+                } else {
+                    self.font.set_line_spacing(typography.line_spacing);
+                }
+                self.viewport.current = None;
+                self.viewport.horizontal.reset();
+                self.viewport.bar = None;
+                self.viewport.top_wrap_row = 0;
+                self.viewport.input(true);
+            }
+            if let Some(preferences) = &mut self.preferences {
+                match preferences.save(self.appearance.settings.clone()) {
+                    Ok(()) => self.appearance.save_status = "Saving...".into(),
+                    Err(error) => {
+                        self.appearance.save_status = "Could not save preferences".into();
+                        self.message = Some(error);
+                    }
+                }
+            }
+        }
+        self.window.request_redraw();
+    }
     fn edit(&mut self, command: EditorCommand, snap: bool) {
         self.search.state.cancel_navigation();
         let result = submit(&self.buffer.client, Command::Edit(command));
@@ -196,8 +269,30 @@ impl App {
         self.window.request_redraw();
     }
     fn intent(&mut self, intent: Intent) {
+        if matches!(
+            intent,
+            Intent::ToggleAppearance | Intent::Zoom(_) | Intent::ResetFontSize
+        ) {
+            if self.failed || self.files.locked() {
+                return;
+            }
+            let before = self.appearance.settings.clone();
+            match intent {
+                Intent::ToggleAppearance => {
+                    self.appearance.open = !self.appearance.open;
+                    self.mouse.dragging = false;
+                    self.viewport.horizontal.end_drag();
+                }
+                Intent::Zoom(delta) => self.appearance.zoom(delta),
+                Intent::ResetFontSize => self.appearance.reset_size(),
+                _ => {}
+            }
+            self.appearance_changed(before);
+            return;
+        }
         // Lifecycle intents are queued even while clipboard capture or another file action is pending.
         if let Some(result) = self.files.route(&intent) {
+            self.appearance.open = false;
             self.report(result);
             return;
         }
@@ -284,10 +379,22 @@ impl App {
             self.viewport.horizontal.end_drag();
             return;
         }
+        let (x, y) = self.mouse.position;
+        let size = self.window.inner_size();
+        if self.appearance.open {
+            let before = self.appearance.settings.clone();
+            self.appearance
+                .click(size.width as usize, size.height as usize, x, y);
+            self.appearance_changed(before);
+            return;
+        }
+        if appearance_ui::status_button(size.width as usize, size.height as usize).contains(x, y) {
+            self.intent(Intent::ToggleAppearance);
+            return;
+        }
         if self.locked() {
             return;
         }
-        let (x, y) = self.mouse.position;
         if let Some(hit) = search_ui::hit(
             self.search.state.mode,
             self.window.inner_size().width as f32,
@@ -336,6 +443,16 @@ impl App {
         );
     }
     fn tick(&mut self, target: &EventLoopWindowTarget<AppEvent>) {
+        if let Some(result) = self.preferences.as_mut().and_then(Preferences::poll) {
+            match result {
+                Ok(()) => self.appearance.save_status = "Saved".into(),
+                Err(error) => {
+                    self.appearance.save_status = "Could not save preferences".into();
+                    self.message = Some(format!("Appearance preferences were not saved: {error}"));
+                }
+            }
+            self.window.request_redraw();
+        }
         for done in self.buffer.client.drain() {
             if let Err(error) = done.result {
                 self.message = Some(error);
@@ -446,7 +563,9 @@ impl App {
         editor_view::paint(
             &mut self.draws,
             &mut self.font,
+            &mut self.ui_font,
             &ViewModel {
+                palette: &self.appearance.palette,
                 snap: &p.snapshot,
                 layout: &frame.layout,
                 config: &frame.config,
@@ -471,6 +590,12 @@ impl App {
                 frame_start: start,
                 layout_time: frame.layout_time,
             },
+        );
+        self.appearance.paint(
+            &mut self.draws,
+            &mut self.ui_font,
+            size.width as usize,
+            size.height as usize,
         );
         self.viewport.current = Some(frame);
         if let Err(error) = self.renderer.render(&self.draws, size.width, size.height) {

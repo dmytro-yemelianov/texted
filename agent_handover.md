@@ -8,6 +8,10 @@ The native-file, GPU and hardening stack ([PRs 1–6](https://github.com/dmytro-
 
 A0–A11 are implemented. The [results](docs/performance-hardening-results.md) record reference-machine CPU percentiles, deterministic work/memory/ordering gates and native acceptance evidence. Historical feature branches remain available for tracing the staged changes; new work starts from `main`.
 
+## Appearance work
+
+`feat/themes-typography` adds static theme palettes and editor typography only. `appearance.rs` owns versioned, validated values and optional color overrides; `appearance_ui.rs` owns the modal Style panel; `preferences.rs` coalesces atomic writes off the UI thread. `graphics.rs` loads selectable system faces once at startup and uses a separate fixed UI face. Every font/size/spacing change updates the shared viewport metrics; pixel mode uses integer cells with a Unicode fallback. The default settings file is under Application Support/Texted; use `TEXTED_SETTINGS_PATH` for isolated UI tests. No shader effects or release tag are part of this branch. See README for controls and config.
+
 ## Component map
 
 | Component | Owner / invariant |
