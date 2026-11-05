@@ -107,8 +107,18 @@ impl TextBuffer {
         };
         self.history_suspended = true;
         self.typing = None;
-        let result = edit(self);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| edit(self)));
         self.history_suspended = false;
+        let result = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.text = before.text;
+                self.cursor_offset = before.cursor;
+                self.typing = None;
+                self.revision = self.revision.wrapping_add(1);
+                std::panic::resume_unwind(error);
+            }
+        };
         if !self.text.is_instance(&before.text) {
             if self.undo_stack.len() == HISTORY_LIMIT {
                 self.undo_stack.pop_front();
@@ -375,6 +385,7 @@ impl TextBuffer {
         replacement: &str,
         start: usize,
     ) -> Option<(usize, usize)> {
+        let start = self.clamp_byte(start);
         let (a, _) = self.find_next(query, start)?;
         let plan = replacement::plan(
             &self.create_snapshot(),
@@ -501,6 +512,33 @@ impl BufferSnapshot {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_transaction_restores_root_cursor_and_undo_history() {
+        let mut b = TextBuffer::from_string("base".into());
+        b.insert(4, "ї");
+        let before = b.create_snapshot();
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            b.transaction(|b| {
+                b.delete(0, 4);
+                b.insert(0, "partial");
+                panic!("injected");
+            })
+        }));
+        assert!(failure.is_err());
+        assert!(b.create_snapshot().content.is_instance(&before.content));
+        assert_eq!(b.cursor_offset(), before.cursor_offset);
+        assert!(b.undo());
+        assert_eq!(b.create_snapshot().content.to_string(), "base");
+        b.insert(4, "ok");
+        assert!(b.undo());
+        assert_eq!(b.create_snapshot().content.to_string(), "base");
+    }
+    #[test]
+    fn replacement_start_inside_utf8_uses_the_same_clamped_seek() {
+        let mut b = TextBuffer::from_string("її".into());
+        assert_eq!(b.replace_next("ї", "x", 1), Some((0, 1)));
+        assert_eq!(b.create_snapshot().content.to_string(), "xї");
+    }
     #[test]
     fn document_load_clears_history_and_invalidates_background_revisions() {
         let mut b = TextBuffer::from_string("old".into());

@@ -34,6 +34,12 @@ impl EditorModel {
         result
     }
     pub fn estimated_work(&self, command: &EditorCommand) -> usize {
+        if !matches!(
+            command,
+            EditorCommand::Insert(_) | EditorCommand::Delete { .. }
+        ) {
+            return 0;
+        }
         let snap = self.buffer.create_snapshot();
         let selected = match self.selection.mode {
             SelectionMode::Block => {
@@ -164,14 +170,34 @@ impl EditorModel {
         cancelled: &impl Fn() -> bool,
         progress: &impl Fn(usize, usize),
     ) -> Result<(), String> {
-        if self.selection.mode == SelectionMode::Block && text != "\n" {
-            return self.block_edit(text, false, false, cancelled, progress);
-        }
         let snap = self.buffer.create_snapshot();
-        let (a, b) = self.selection.offsets(&snap);
-        if self.selection.mode == SelectionMode::Block {
-            self.block_edit("", false, false, cancelled, progress)?;
+        if text.len() > texted_buffer::replacement::MAX_GENERATED_GROWTH {
+            return Err("Insertion exceeds 128 MiB capacity".into());
         }
+        if self.selection.mode == SelectionMode::Block {
+            let mut edited = Self::from_snapshot(&snap, self.selection);
+            edited.block_edit(
+                if text == "\n" { "" } else { text },
+                false,
+                false,
+                cancelled,
+                progress,
+            )?;
+            if text == "\n" {
+                edited.buffer.insert(edited.buffer.cursor_offset(), text);
+                edited.selection.mode = SelectionMode::None;
+            }
+            let result = edited.buffer.create_snapshot();
+            if !result.content.is_instance(&snap.content) {
+                self.buffer
+                    .commit_snapshot(snap.revision, snap.cursor_offset, result);
+            } else {
+                self.buffer.set_cursor_offset(result.cursor_offset);
+            }
+            self.selection = edited.selection;
+            return Ok(());
+        }
+        let (a, b) = self.selection.offsets(&snap);
         if self.selection.mode == SelectionMode::Stream && a < b {
             self.buffer.transaction(|buffer| {
                 buffer.delete(a, b);
@@ -222,6 +248,18 @@ impl EditorModel {
         progress: &impl Fn(usize, usize),
     ) -> Result<(), String> {
         let (a, b, c, d) = self.selection.block();
+        let capacity = self
+            .buffer
+            .total_bytes()
+            .saturating_add(texted_buffer::replacement::MAX_GENERATED_GROWTH);
+        if c > capacity
+            || text
+                .len()
+                .checked_mul(b.saturating_sub(a).saturating_add(1))
+                .is_none_or(|n| n > capacity)
+        {
+            return Err("Block edit exceeds generated-text capacity".into());
+        }
         let max = b.min(self.buffer.total_lines() - 1);
         if a > max {
             return Ok(());
@@ -235,6 +273,28 @@ impl EditorModel {
         } else {
             (c, d)
         };
+        let snapshot = self.buffer.create_snapshot();
+        let mut predicted = snapshot.total_bytes;
+        for line in a..=max {
+            if cancelled() {
+                return Err("Operation cancelled".into());
+            }
+            let start = snapshot.line_col_to_offset(line, from);
+            let end = snapshot.line_col_to_offset(line, to);
+            let padding = if text.is_empty() {
+                0
+            } else {
+                from.saturating_sub(snapshot.line(line).len_chars())
+            };
+            predicted = predicted
+                .saturating_sub(end - start)
+                .checked_add(padding)
+                .and_then(|n| n.checked_add(text.len()))
+                .ok_or("Block edit exceeds generated-text capacity")?;
+            if predicted > capacity {
+                return Err("Block edit exceeds generated-text capacity".into());
+            }
+        }
         let mut aborted = false;
         self.buffer.transaction(|buffer| {
             for (index, line) in (a..=max).rev().enumerate() {
@@ -269,6 +329,11 @@ impl EditorModel {
     }
     fn move_cursor(&mut self, motion: Motion, extend: bool, block: bool) {
         let before = self.current_caret();
+        let virtual_col = if block && self.selection.mode == SelectionMode::Block {
+            self.selection.active_col
+        } else {
+            before.active_col
+        };
         if extend {
             let mode = if block {
                 SelectionMode::Block
@@ -317,7 +382,12 @@ impl EditorModel {
             self.selection.extend(
                 pos.active_line,
                 if block {
-                    before.active_col
+                    match motion {
+                        Motion::Left => virtual_col.saturating_sub(1),
+                        Motion::Right => virtual_col.saturating_add(1),
+                        Motion::Up | Motion::Down | Motion::Rows(_) => virtual_col,
+                        _ => pos.active_col,
+                    }
                 } else {
                     pos.active_col
                 },
@@ -437,6 +507,73 @@ impl EditorModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn block_navigation_keeps_virtual_columns_across_short_lines() {
+        let mut model = EditorModel::new(ropey::Rope::from_str(
+            "123456
+x
+123456",
+        ));
+        model
+            .apply(EditorCommand::SetSelection(SelectionState {
+                mode: SelectionMode::Block,
+                anchor_line: 0,
+                active_line: 0,
+                anchor_col: 5,
+                active_col: 5,
+            }))
+            .unwrap();
+        for _ in 0..2 {
+            model
+                .apply(EditorCommand::Move {
+                    motion: Motion::Down,
+                    extend: true,
+                    block: true,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            (model.selection.active_line, model.selection.active_col),
+            (2, 5)
+        );
+        model
+            .apply(EditorCommand::Move {
+                motion: Motion::Left,
+                extend: true,
+                block: true,
+            })
+            .unwrap();
+        assert_eq!(model.selection.active_col, 4);
+    }
+    #[test]
+    fn block_enter_is_one_undo_transaction() {
+        let mut model = EditorModel::new(ropey::Rope::from_str(
+            "one
+two",
+        ));
+        let original = model.buffer.create_snapshot();
+        model.selection = SelectionState {
+            mode: SelectionMode::Block,
+            anchor_line: 0,
+            active_line: 1,
+            anchor_col: 1,
+            active_col: 2,
+        };
+        model
+            .apply(EditorCommand::Insert(
+                "
+"
+                .into(),
+            ))
+            .unwrap();
+        assert!(model.buffer.undo());
+        assert!(model
+            .buffer
+            .create_snapshot()
+            .content
+            .is_instance(&original.content));
+        assert!(!model.buffer.undo());
+    }
     #[test]
     fn replacing_stream_selection_is_one_undo_and_subsequent_typing_groups() {
         let mut e = EditorModel::new(ropey::Rope::from_str("їжак"));

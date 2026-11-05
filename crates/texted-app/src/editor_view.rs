@@ -718,7 +718,4 @@ impl<'a> SnapshotLines<'a> {
     pub(crate) fn get(&self, line: usize) -> Option<ropey::RopeSlice<'a>> {
         (line < self.len()).then(|| self.0.line(line))
     }
-    pub(crate) fn last(&self) -> Option<ropey::RopeSlice<'a>> {
-        self.get(self.len() - 1)
-    }
 }

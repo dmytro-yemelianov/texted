@@ -126,6 +126,62 @@ pub fn run(legacy: bool) {
     measure("block extraction 10k rows / 32 chars", 30, || {
         black_box(source.block_extract(0, 9999, 0, 32));
     });
+    // Time only UI-side admission and published-snapshot reads while a real block worker runs.
+    // A subsequent small edit deliberately invalidates that plan; it must remain usable.
+    {
+        use texted_app::{
+            buffer_service::{BufferService, Command},
+            commands::EditorCommand,
+            selection::{SelectionMode, SelectionState},
+        };
+        let (wake, ready) = std::sync::mpsc::sync_channel(1);
+        let host = BufferService::new(move || {
+            let _ = wake.try_send(());
+        });
+        let client = &host.client;
+        let accept = |command| {
+            client
+                .submit(command)
+                .unwrap_or_else(|_| panic!("unexpected command rejection"))
+        };
+        accept(Command::Load(base.content.clone()));
+        accept(Command::Edit(EditorCommand::SetSelection(SelectionState {
+            mode: SelectionMode::Block,
+            anchor_line: 0,
+            active_line: 9999,
+            anchor_col: 2048,
+            active_col: 2048,
+        })));
+        let through = client.barrier();
+        while client.latest().completed_through < through {
+            ready
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        client.drain();
+        accept(Command::Edit(EditorCommand::Insert("ї".into())));
+        while client.latest().busy.is_none() {
+            ready
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        // Clear the block before typing; this stays a short ordered command on the owner.
+        accept(Command::Edit(EditorCommand::ClearSelection));
+        let mut active_samples = 0;
+        measure(
+            "async snapshot + command admission during 10k-row block",
+            30,
+            || {
+                let published = client.latest();
+                active_samples += usize::from(published.busy.is_some());
+                black_box(accept(Command::Edit(EditorCommand::Insert("x".into()))));
+            },
+        );
+        println!(
+            "block worker active during {active_samples}/33 admission samples (including warmups)"
+        );
+        client.cancel();
+    }
     let paste = "ї".repeat(1_000_000);
     measure("paste 2 MB into isolated buffer", 30, || {
         let mut b = TextBuffer::new();
