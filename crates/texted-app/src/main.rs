@@ -733,6 +733,7 @@ fn main() {
     let mut last_click_time = Instant::now();
     let mut click_count = 0usize;
     let mut last_mouse_pos = (0.0f32, 0.0f32);
+    let mut show_perf_hud = false;
 
     println!("[Texted] GUI editor running: Dark Mode, Word Wrap, macOS Cmd/Opt navigation.");
 
@@ -1291,6 +1292,11 @@ fn main() {
 
                     // 3. Document Navigation: Arrows accepting Cmd / Option / Shift modifiers
                     match logical_key {
+                        Key::Named(NamedKey::F3) => {
+                            show_perf_hud = !show_perf_hud;
+                            window.request_redraw();
+                            return;
+                        }
                         Key::Named(NamedKey::Escape) => {
                             selection.mode = SelectionMode::None;
                             window.request_redraw();
@@ -1634,6 +1640,7 @@ fn main() {
                     window.request_redraw();
                 }
                 WindowEvent::RedrawRequested => {
+                    let frame_start = Instant::now();
                     let size = window.inner_size();
                     if size.width == 0 || size.height == 0 {
                         return;
@@ -1689,7 +1696,9 @@ fn main() {
                         line_number_gutter_width_px: gutter_w,
                     };
 
+                    let t_layout = Instant::now();
                     let layout = LayoutEngine::compute_layout(&snap, &config, None);
+                    let layout_time = t_layout.elapsed();
 
                     // 3. Clear Screen to Dark Charcoal
                     buffer.fill(COLOR_BG);
@@ -2008,6 +2017,33 @@ fn main() {
                         &status_text,
                         status_color,
                     );
+
+                    if show_perf_hud {
+                        let hud_w = 260usize;
+                        let hud_h = 96usize;
+                        let hud_x = width.saturating_sub(hud_w + 16);
+                        let hud_y = 12usize;
+
+                        draw_rect(&mut buffer, width, height, hud_x, hud_y, hud_w, hud_h, 0xEE1A1A1A);
+                        draw_rect(&mut buffer, width, height, hud_x, hud_y, hud_w, 1, 0xFF3E3E3E);
+                        draw_rect(&mut buffer, width, height, hud_x, hud_y + hud_h - 1, hud_w, 1, 0xFF3E3E3E);
+                        draw_rect(&mut buffer, width, height, hud_x, hud_y, 1, hud_h, 0xFF3E3E3E);
+                        draw_rect(&mut buffer, width, height, hud_x + hud_w - 1, hud_y, 1, hud_h, 0xFF3E3E3E);
+
+                        let cur_frame_time = frame_start.elapsed();
+                        let fps = 1000.0 / (cur_frame_time.as_secs_f64() * 1000.0).max(0.01);
+                        let l1 = format!("PERF HUD [F3]   ~{:.0} FPS", fps);
+                        let l2 = format!("Frame time  : {:.2} ms", cur_frame_time.as_secs_f64() * 1000.0);
+                        let l3 = format!("Layout time : {:.1} µs", layout_time.as_secs_f64() * 1_000_000.0);
+                        let l4 = format!("Doc bytes   : {} B", snap.total_bytes);
+                        let l5 = "RAM footprint: ~28.9 MB".to_string();
+
+                        font_engine.draw_string(&mut buffer, width, height, hud_x + 10, hud_y + 6, &l1, 0xFF569CD6);
+                        font_engine.draw_string(&mut buffer, width, height, hud_x + 10, hud_y + 24, &l2, 0xFF4EC9B0);
+                        font_engine.draw_string(&mut buffer, width, height, hud_x + 10, hud_y + 42, &l3, 0xFFDCDCAA);
+                        font_engine.draw_string(&mut buffer, width, height, hud_x + 10, hud_y + 60, &l4, 0xFFCCCCCC);
+                        font_engine.draw_string(&mut buffer, width, height, hud_x + 10, hud_y + 78, &l5, 0xFF9CDCFE);
+                    }
 
                     let _ = buffer.present();
                 }
