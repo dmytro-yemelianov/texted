@@ -16,3 +16,6 @@ texted-render = { path = "../texted-render" }
 texted-io = { path = "../texted-io" }
 parking_lot.workspace = true
 crossbeam-channel.workspace = true
+winit = "0.29"
+softbuffer = "0.4"
+font8x8 = "0.3"

@@ -373,6 +373,127 @@ impl TextBuffer {
         (cur_line, col)
     }
 
+    pub fn move_cursor_left(&mut self) {
+        if self.cursor_offset == 0 {
+            return;
+        }
+        let full = self.to_string();
+        let mut prev = 0;
+        for (idx, _) in full.char_indices() {
+            if idx >= self.cursor_offset {
+                break;
+            }
+            prev = idx;
+        }
+        self.cursor_offset = prev;
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        let total = self.total_bytes();
+        if self.cursor_offset >= total {
+            return;
+        }
+        let full = self.to_string();
+        for (idx, ch) in full.char_indices() {
+            if idx == self.cursor_offset {
+                self.cursor_offset = idx + ch.len_utf8();
+                return;
+            }
+        }
+        self.cursor_offset = total;
+    }
+
+    pub fn move_cursor_up(&mut self) {
+        let full = self.to_string();
+        let (line, col) = self.offset_to_line_col(self.cursor_offset);
+        if line == 0 {
+            return;
+        }
+        let target_line = line - 1;
+        self.cursor_offset = Self::line_col_to_offset_str(&full, target_line, col);
+    }
+
+    pub fn move_cursor_down(&mut self) {
+        let full = self.to_string();
+        let (line, col) = self.offset_to_line_col(self.cursor_offset);
+        let target_line = line + 1;
+        self.cursor_offset = Self::line_col_to_offset_str(&full, target_line, col);
+    }
+
+    pub fn move_cursor_home(&mut self) {
+        let full = self.to_string();
+        let (line, _) = self.offset_to_line_col(self.cursor_offset);
+        self.cursor_offset = Self::line_col_to_offset_str(&full, line, 0);
+    }
+
+    pub fn move_cursor_end(&mut self) {
+        let full = self.to_string();
+        let (line, _) = self.offset_to_line_col(self.cursor_offset);
+        self.cursor_offset = Self::line_col_to_offset_str(&full, line, usize::MAX);
+    }
+
+    pub fn line_col_to_offset_str(text: &str, line: usize, col: usize) -> usize {
+        let mut cur_line = 0;
+        let mut line_start = 0;
+        for (idx, ch) in text.char_indices() {
+            if cur_line == line {
+                let col_chars: usize = text[line_start..idx].chars().count();
+                if col_chars == col {
+                    return idx;
+                }
+            }
+            if ch == '\n' {
+                if cur_line == line {
+                    return idx; // hit newline before reaching col
+                }
+                cur_line += 1;
+                line_start = idx + 1;
+            }
+        }
+        if cur_line == line {
+            let line_text = &text[line_start..];
+            let char_count = line_text.chars().count();
+            let target_chars = col.min(char_count);
+            for (i, (b_idx, _)) in line_text.char_indices().enumerate() {
+                if i == target_chars {
+                    return line_start + b_idx;
+                }
+            }
+            return text.len();
+        }
+        text.len()
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor_offset == 0 {
+            return;
+        }
+        let full = self.to_string();
+        let mut prev = 0;
+        for (idx, _) in full.char_indices() {
+            if idx >= self.cursor_offset {
+                break;
+            }
+            prev = idx;
+        }
+        self.delete(prev, self.cursor_offset);
+    }
+
+    pub fn delete_forward(&mut self) {
+        let total = self.total_bytes();
+        if self.cursor_offset >= total {
+            return;
+        }
+        let full = self.to_string();
+        for (idx, ch) in full.char_indices() {
+            if idx == self.cursor_offset {
+                let next = idx + ch.len_utf8();
+                self.delete(idx, next);
+                return;
+            }
+        }
+    }
+
     /// Create an immutable snapshot for layout and render servers
     pub fn create_snapshot(&self) -> BufferSnapshot {
         BufferSnapshot {
