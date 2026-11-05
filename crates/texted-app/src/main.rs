@@ -361,47 +361,6 @@ fn find_prev_match(
     jump_to_match(client, search, selection, prev_idx);
 }
 
-fn find_word_boundaries(line_str: &str, click_col: usize) -> (usize, usize) {
-    let chars: Vec<char> = line_str.chars().collect();
-    if chars.is_empty() {
-        return (0, 0);
-    }
-    let col = click_col.min(chars.len().saturating_sub(1));
-    let target_ch = chars[col];
-
-    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
-
-    let mut start = col;
-    let mut end = col + 1;
-
-    if is_word_char(target_ch) {
-        while start > 0 && is_word_char(chars[start - 1]) {
-            start -= 1;
-        }
-        while end < chars.len() && is_word_char(chars[end]) {
-            end += 1;
-        }
-    } else if target_ch.is_whitespace() {
-        while start > 0 && chars[start - 1].is_whitespace() && chars[start - 1] != '\n' {
-            start -= 1;
-        }
-        while end < chars.len() && chars[end].is_whitespace() && chars[end] != '\n' {
-            end += 1;
-        }
-    } else {
-        // Punctuation / symbols
-        let is_punct = |c: char| !is_word_char(c) && !c.is_whitespace();
-        while start > 0 && is_punct(chars[start - 1]) {
-            start -= 1;
-        }
-        while end < chars.len() && is_punct(chars[end]) {
-            end += 1;
-        }
-    }
-
-    (start, end)
-}
-
 fn compute_gutter_metrics(
     total_lines: usize,
     show_line_numbers: bool,
@@ -769,13 +728,8 @@ fn main() {
                             if let Ok(BufferResponse::Snapshot(snap)) =
                                 buffer_client.send(BufferRequest::GetSnapshot)
                             {
-                                let lines = SnapshotLines(&snap);
-                                let curr_line_str = lines
-                                    .get(hover_line)
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_default();
-                                let (curr_w_start, curr_w_end) =
-                                    find_word_boundaries(&curr_line_str, hover_col);
+                                let bounds = texted_buffer::word::bounds(snap.line(hover_line),hover_col);
+                                let (curr_w_start,curr_w_end)=(bounds.start,bounds.end);
 
                                 selection.mode = SelectionMode::Stream;
                                 if hover_line > init_line
@@ -1033,12 +987,8 @@ fn main() {
 
                                 if click_count == 2 {
                                     // Double click: Select Word
-                                    let line_str = lines
-                                        .get(click_line)
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_default();
-                                    let (w_start, w_end) =
-                                        find_word_boundaries(&line_str, click_col);
+                                    let bounds=texted_buffer::word::bounds(snap.line(click_line),click_col);
+                                    let (w_start,w_end)=(bounds.start,bounds.end);
                                     selection = SelectionState {
                                         mode: SelectionMode::Stream,
                                         anchor_line: click_line,
@@ -2877,6 +2827,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn find_word_boundaries(text: &str, col: usize) -> (usize, usize) {
+        let rope = ropey::Rope::from_str(text);
+        let bounds = texted_buffer::word::bounds(rope.slice(..), col);
+        (bounds.start, bounds.end)
+    }
 
     #[test]
     fn background_search_is_keyed_by_revision_and_query() {

@@ -100,6 +100,14 @@ pub fn run(legacy: bool) {
         b.insert(0, &paste);
         black_box(b.create_snapshot());
     });
+    let words = TextBuffer::from_string("x ".repeat(5_000_000)).create_snapshot();
+    for col in [0, 9_999_998] {
+        let b = texted_buffer::word::bounds(words.line(0), col);
+        println!("short word col={col}: inspected={}", b.inspected);
+        measure(&format!("rope-native word col={col}"), 30, || {
+            black_box(texted_buffer::word::bounds(words.line(0), col));
+        });
+    }
     let line = "x ".repeat(5_000_000);
     if legacy {
         measure("legacy short-word whole-line copies", 30, || {
