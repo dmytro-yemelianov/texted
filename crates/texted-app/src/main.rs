@@ -1,6 +1,7 @@
-//! Texted - Ultra-Minimal High-Performance QNX-Microkernel GUI Text Editor
+//! Minimal GPU text editor with an isolated buffer server.
 //!
 //! Features:
+//! - Metal rendering through wgpu, with cached glyph masks and instanced quads
 //! - Dark Mode by default
 //! - Word wrap (toggle with Alt+Z)
 //! - Proper character column tracking (zero cursor double-jumping in Ukrainian / Unicode)
@@ -13,22 +14,22 @@
 //!   - Opt+Delete / Cmd+Delete: Delete word / to line end
 //! - Decoupled mouse wheel scrolling (no cursor lock)
 //! - Interactive Find & Replace bar with [< Prev] and [Next >] buttons
-//! - Full Ukrainian & Unicode typography via TrueType font rasterizer (ab_glyph)
+//! - Ukrainian and Unicode glyphs via the TrueType rasterizer (ab_glyph)
 //! - Block Select (Column / Rectangular selection): Alt/Option + drag or Cmd+B
 
 use std::io::Write;
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 mod documents;
+mod gpu;
 mod graphics;
 mod native_macos;
 use documents::{Action as DocumentAction, Documents, Effect as DocumentEffect};
 #[derive(Debug, Clone)]
 pub struct AppEvent(DocumentAction);
 mod horizontal_scroll;
-use graphics::{draw_box, draw_rect, FontEngine};
+use graphics::{draw_box, draw_rect, DrawList, FontEngine};
 use horizontal_scroll::{HorizontalScroll, BAR_HEIGHT};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -623,10 +624,21 @@ fn main() {
         .expect("Failed to spawn buffer server");
 
     // 3. Initialize Display & Typography
-    let context =
-        softbuffer::Context::new(window.clone()).expect("Failed to create softbuffer context");
-    let mut surface =
-        softbuffer::Surface::new(&context, window.clone()).expect("Failed to create surface");
+    let mut renderer = match pollster::block_on(gpu::Renderer::new(window.clone())) {
+        Ok(renderer) => renderer,
+        Err(error) => {
+            eprintln!("{error}");
+            rfd::MessageDialog::new()
+                .set_title("Texted GPU initialization failed")
+                .set_description(&error)
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+            let _ = buffer_client.send(BufferRequest::Shutdown);
+            return;
+        }
+    };
+    let mut draw_list = DrawList::default();
+    let mut renderer_failed = false;
 
     // Typography Engine (18px crisp scalable font)
     let mut font_engine = FontEngine::new(18.0);
@@ -661,7 +673,6 @@ fn main() {
     println!("[Texted] GUI editor running: Dark Mode, Word Wrap, macOS Cmd/Opt navigation.");
 
     let shutdown_client = buffer_client.clone();
-    let mut last_present: Option<Instant> = None;
     let _ = event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::WaitUntil(
             if search_state.pending || search_state.mutation.is_some() {
@@ -728,7 +739,7 @@ fn main() {
                     window.request_redraw();
                 }
                 WindowEvent::CursorMoved { position, .. } => {
-                    if documents.locked() {
+                    if documents.locked() || renderer_failed {
                         return;
                     }
                     last_mouse_pos = (position.x as f32, position.y as f32);
@@ -868,7 +879,7 @@ fn main() {
                     button: MouseButton::Left,
                     ..
                 } => {
-                    if documents.locked() {
+                    if documents.locked() || renderer_failed {
                         return;
                     }
                     if state == ElementState::Released && horizontal.end_drag() {
@@ -1111,7 +1122,7 @@ fn main() {
                         },
                     ..
                 } => {
-                    if documents.locked() {
+                    if documents.locked() || renderer_failed {
                         return;
                     }
                     caret_visible = true;
@@ -1959,11 +1970,17 @@ fn main() {
                 }
                 WindowEvent::RedrawRequested => {
                     let frame_start = Instant::now();
-                    if let Some(plan) = search_state
+                    let replacement = search_state
                         .mutation
                         .as_ref()
-                        .and_then(|rx| rx.try_recv().ok())
-                    {
+                        .map(|rx| rx.try_recv());
+                    if matches!(replacement.as_ref(), Some(Err(std::sync::mpsc::TryRecvError::Disconnected))) {
+                        search_state.mutation = None;
+                        file_actions.push_back(DocumentAction::ReportError(
+                            "The replacement worker stopped before completing.".into()
+                        ));
+                    }
+                    if let Some(Ok(plan)) = replacement {
                         // Commit on the UI event boundary so an input handler cannot race a background mutation.
                         let (revision, cursor, edited) = plan;
                         let committed = edited.is_none_or(|edited| {
@@ -1984,6 +2001,7 @@ fn main() {
                         }
                         search_state.mutation = None;
                     }
+                    if renderer_failed { return; }
                     let size = window.inner_size();
                     if size.width == 0 || size.height == 0 {
                         return;
@@ -1994,15 +2012,7 @@ fn main() {
                     let text_height =
                         height.saturating_sub(28 + if word_wrap { 0 } else { BAR_HEIGHT });
 
-                    let _ = surface.resize(
-                        NonZeroU32::new(size.width).unwrap(),
-                        NonZeroU32::new(size.height).unwrap(),
-                    );
-
-                    let mut buffer = match surface.buffer_mut() {
-                        Ok(b) => b,
-                        Err(_) => return,
-                    };
+                    let buffer = &mut draw_list;
 
                     // Blinking cursor pacing
                     if last_caret_blink.elapsed() >= Duration::from_millis(500) {
@@ -2122,13 +2132,13 @@ fn main() {
                     let layout_time = t_layout.elapsed();
 
                     // 3. Clear Screen to Dark Charcoal
-                    buffer.fill(COLOR_BG);
+                    buffer.reset(COLOR_BG);
 
                     // 4. Render Gutter (Line numbers)
                     if show_line_numbers && gutter_w > 0.0 {
                         let gutter_width_int = gutter_w as usize;
                         draw_rect(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             0,
@@ -2138,7 +2148,7 @@ fn main() {
                             COLOR_GUTTER_BG,
                         );
                         draw_rect(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             gutter_width_int.saturating_sub(1),
@@ -2196,7 +2206,7 @@ fn main() {
                                         let h_w = rect.width.round() as usize;
 
                                         draw_rect(
-                                            &mut buffer,
+                                            buffer,
                                             width,
                                             height,
                                             h_x,
@@ -2232,7 +2242,7 @@ fn main() {
                                     let sel_w = rect.width.round() as usize;
 
                                     draw_rect(
-                                        &mut buffer,
+                                        buffer,
                                         width,
                                         height,
                                         sel_x,
@@ -2287,7 +2297,7 @@ fn main() {
                                         let sel_w = rect.width.round() as usize;
 
                                         draw_rect(
-                                            &mut buffer,
+                                            buffer,
                                             width,
                                             height,
                                             sel_x,
@@ -2314,7 +2324,7 @@ fn main() {
                             let num_str =
                                 format!("{:>width$}", line.line_index + 1, width = line_digits);
                             font_engine.draw_string(
-                                &mut buffer,
+                                buffer,
                                 width,
                                 height,
                                 10,
@@ -2326,7 +2336,7 @@ fn main() {
 
                         // Text content
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             text_start_x,
@@ -2343,7 +2353,7 @@ fn main() {
 
                         if cy + (font_engine.line_height_px as usize) <= text_height {
                             draw_rect(
-                                &mut buffer,
+                                buffer,
                                 width,
                                 height,
                                 cx,
@@ -2357,7 +2367,7 @@ fn main() {
 
                     if let Some(bar) = current_scrollbar {
                         draw_rect(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             bar.track.x as usize,
@@ -2367,7 +2377,7 @@ fn main() {
                             COLOR_GUTTER_BG,
                         );
                         draw_rect(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             bar.thumb.x.round() as usize,
@@ -2389,7 +2399,7 @@ fn main() {
                         let panel_y = 10usize;
 
                         draw_box(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             panel_x,
@@ -2411,7 +2421,7 @@ fn main() {
                             COLOR_INPUT_BORDER
                         };
                         draw_box(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             input_x,
@@ -2423,7 +2433,7 @@ fn main() {
                         );
 
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             panel_x + 8,
@@ -2434,7 +2444,7 @@ fn main() {
 
                         let query_display = &search_state.find_query;
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             input_x + 5,
@@ -2451,7 +2461,7 @@ fn main() {
                                     .round() as usize;
                             if cur_x < input_x + input_w - 4 {
                                 draw_rect(
-                                    &mut buffer,
+                                    buffer,
                                     width,
                                     height,
                                     cur_x,
@@ -2473,7 +2483,7 @@ fn main() {
                             format!("{}/{}", cur_idx, search_state.matches.len())
                         };
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             input_x + input_w + 8,
@@ -2485,7 +2495,7 @@ fn main() {
                         // Interactive [< Prev] button
                         let prev_btn_x = panel_x + 285;
                         draw_box(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             prev_btn_x,
@@ -2496,7 +2506,7 @@ fn main() {
                             COLOR_BUTTON_BORDER,
                         );
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             prev_btn_x + 6,
@@ -2508,7 +2518,7 @@ fn main() {
                         // Interactive [Next >] button
                         let next_btn_x = panel_x + 343;
                         draw_box(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             next_btn_x,
@@ -2519,7 +2529,7 @@ fn main() {
                             COLOR_BUTTON_BORDER,
                         );
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             next_btn_x + 6,
@@ -2530,7 +2540,7 @@ fn main() {
 
                         // Close button [x]
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             panel_x + panel_w - 22,
@@ -2548,7 +2558,7 @@ fn main() {
                                 COLOR_INPUT_BORDER
                             };
                             draw_box(
-                                &mut buffer,
+                                buffer,
                                 width,
                                 height,
                                 input_x,
@@ -2560,7 +2570,7 @@ fn main() {
                             );
 
                             font_engine.draw_string(
-                                &mut buffer,
+                                buffer,
                                 width,
                                 height,
                                 panel_x + 8,
@@ -2569,7 +2579,7 @@ fn main() {
                                 COLOR_STATUS_TEXT,
                             );
                             font_engine.draw_string(
-                                &mut buffer,
+                                buffer,
                                 width,
                                 height,
                                 input_x + 5,
@@ -2586,7 +2596,7 @@ fn main() {
                                         .round() as usize;
                                 if cur_x < input_x + input_w - 4 {
                                     draw_rect(
-                                        &mut buffer,
+                                        buffer,
                                         width,
                                         height,
                                         cur_x,
@@ -2601,7 +2611,7 @@ fn main() {
                             // Interactive [Replace] button
                             let repl_btn_x = panel_x + 245;
                             draw_box(
-                                &mut buffer,
+                                buffer,
                                 width,
                                 height,
                                 repl_btn_x,
@@ -2612,7 +2622,7 @@ fn main() {
                                 COLOR_BUTTON_BORDER,
                             );
                             font_engine.draw_string(
-                                &mut buffer,
+                                buffer,
                                 width,
                                 height,
                                 repl_btn_x + 6,
@@ -2624,7 +2634,7 @@ fn main() {
                             // Interactive [All] button
                             let all_btn_x = panel_x + 320;
                             draw_box(
-                                &mut buffer,
+                                buffer,
                                 width,
                                 height,
                                 all_btn_x,
@@ -2635,7 +2645,7 @@ fn main() {
                                 COLOR_BUTTON_BORDER,
                             );
                             font_engine.draw_string(
-                                &mut buffer,
+                                buffer,
                                 width,
                                 height,
                                 all_btn_x + 8,
@@ -2649,7 +2659,7 @@ fn main() {
                     // 10. Render Status Bar
                     let status_y = height.saturating_sub(28);
                     draw_rect(
-                        &mut buffer,
+                        buffer,
                         width,
                         height,
                         0,
@@ -2659,7 +2669,7 @@ fn main() {
                         COLOR_STATUS_BORDER,
                     );
                     draw_rect(
-                        &mut buffer,
+                        buffer,
                         width,
                         height,
                         0,
@@ -2690,11 +2700,12 @@ fn main() {
                     let wrap_text = if word_wrap { "Wrap: ON" } else { "Wrap: OFF" };
 
                     let status_text = format!(
-                        "  Ln {}, Col {}    {}    {}    {} chars    100%    {}    {}",
+                        "  Ln {}, Col {}    {}    {}    {} chars / {} B    {}    {}",
                         cur_line + 1,
                         cur_col + 1,
                         status_mode,
                         wrap_text,
+                        snap.content.len_chars(),
                         snap.total_bytes,
                         if documents.bom { "UTF-8 BOM" } else { "UTF-8" },
                         if documents.ending == LineEnding::Crlf {
@@ -2711,7 +2722,7 @@ fn main() {
                     };
 
                     font_engine.draw_string(
-                        &mut buffer,
+                        buffer,
                         width,
                         height,
                         8,
@@ -2721,13 +2732,13 @@ fn main() {
                     );
 
                     if show_perf_hud {
-                        let hud_w = 260usize;
-                        let hud_h = 96usize;
+                        let hud_w = 360usize;
+                        let hud_h = 114usize;
                         let hud_x = width.saturating_sub(hud_w + 16);
                         let hud_y = 12usize;
 
                         draw_rect(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             hud_x,
@@ -2737,7 +2748,7 @@ fn main() {
                             0xEE1A1A1A,
                         );
                         draw_rect(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             hud_x,
@@ -2747,7 +2758,7 @@ fn main() {
                             0xFF3E3E3E,
                         );
                         draw_rect(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             hud_x,
@@ -2757,7 +2768,7 @@ fn main() {
                             0xFF3E3E3E,
                         );
                         draw_rect(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             hud_x,
@@ -2767,7 +2778,7 @@ fn main() {
                             0xFF3E3E3E,
                         );
                         draw_rect(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             hud_x + hud_w - 1,
@@ -2778,11 +2789,9 @@ fn main() {
                         );
 
                         let cur_frame_time = frame_start.elapsed();
-                        let fps = last_present
-                            .map_or(0.0, |at| 1.0 / at.elapsed().as_secs_f64().max(0.000001));
-                        let l1 = format!("PERF HUD [F3]   ~{fps:.0} FPS");
+                        let l1 = "PERF HUD [F3]";
                         let l2 = format!(
-                            "Frame time  : {:.2} ms",
+                            "UI prepare  : {:.2} ms",
                             cur_frame_time.as_secs_f64() * 1000.0
                         );
                         let l3 = format!(
@@ -2793,16 +2802,16 @@ fn main() {
                         let l5 = "Snapshot: shared rope".to_string();
 
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             hud_x + 10,
                             hud_y + 6,
-                            &l1,
+                            l1,
                             0xFF569CD6,
                         );
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             hud_x + 10,
@@ -2811,7 +2820,7 @@ fn main() {
                             0xFF4EC9B0,
                         );
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             hud_x + 10,
@@ -2820,7 +2829,7 @@ fn main() {
                             0xFFDCDCAA,
                         );
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             hud_x + 10,
@@ -2829,7 +2838,7 @@ fn main() {
                             0xFFCCCCCC,
                         );
                         font_engine.draw_string(
-                            &mut buffer,
+                            buffer,
                             width,
                             height,
                             hud_x + 10,
@@ -2837,11 +2846,18 @@ fn main() {
                             &l5,
                             0xFF9CDCFE,
                         );
+                        font_engine.draw_string(buffer,width,height,hud_x+10,hud_y+96,&renderer.description,0xFF9CDCFE);
                     }
 
-                    last_present = Some(Instant::now());
                     current_view = Some((layout, config));
-                    let _ = buffer.present();
+                    if let Err(error) = renderer.render(buffer, size.width, size.height) {
+                        // Preserve in-flight file work; report the failure only after it finishes.
+                        renderer_failed = true;
+                        file_actions.push_back(DocumentAction::ReportError(format!(
+                            "GPU rendering failed: {error}. Texted will close; you can save unsaved changes before closing."
+                        )));
+                        file_actions.push_back(DocumentAction::Close);
+                    }
                 }
                 _ => {}
             },
