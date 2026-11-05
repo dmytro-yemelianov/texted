@@ -510,6 +510,47 @@ fn find_prev_match(
     jump_to_match(client, search, selection, prev_idx);
 }
 
+fn find_word_boundaries(line_str: &str, click_col: usize) -> (usize, usize) {
+    let chars: Vec<char> = line_str.chars().collect();
+    if chars.is_empty() {
+        return (0, 0);
+    }
+    let col = click_col.min(chars.len().saturating_sub(1));
+    let target_ch = chars[col];
+
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+
+    let mut start = col;
+    let mut end = col + 1;
+
+    if is_word_char(target_ch) {
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+    } else if target_ch.is_whitespace() {
+        while start > 0 && chars[start - 1].is_whitespace() && chars[start - 1] != '\n' {
+            start -= 1;
+        }
+        while end < chars.len() && chars[end].is_whitespace() && chars[end] != '\n' {
+            end += 1;
+        }
+    } else {
+        // Punctuation / symbols
+        let is_punct = |c: char| !is_word_char(c) && !c.is_whitespace();
+        while start > 0 && is_punct(chars[start - 1]) {
+            start -= 1;
+        }
+        while end < chars.len() && is_punct(chars[end]) {
+            end += 1;
+        }
+    }
+
+    (start, end)
+}
+
 fn main() {
     let event_loop = EventLoop::new().expect("Failed to initialize winit EventLoop");
 
@@ -734,6 +775,8 @@ fn main() {
     let mut click_count = 0usize;
     let mut last_mouse_pos = (0.0f32, 0.0f32);
     let mut show_perf_hud = false;
+    let mut word_drag_anchor: Option<(usize, usize, usize)> = None; // (line, w_start, w_end)
+    let mut line_drag_anchor: Option<usize> = None; // line
 
     println!("[Texted] GUI editor running: Dark Mode, Word Wrap, macOS Cmd/Opt navigation.");
 
@@ -777,20 +820,82 @@ fn main() {
                         let hover_line = (rel_y / font_engine.line_height_px).floor() as usize + top_line;
                         let hover_col = (rel_x / font_engine.char_width_px).round() as usize;
 
-                        selection.active_line = hover_line;
-                        selection.active_col = hover_col;
+                        if let Some((init_line, init_w_start, init_w_end)) = word_drag_anchor {
+                            if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                let lines: Vec<&str> = snap.content.split('\n').collect();
+                                let curr_line_str = lines.get(hover_line).copied().unwrap_or("");
+                                let (curr_w_start, curr_w_end) = find_word_boundaries(curr_line_str, hover_col);
 
-                        // Alt / Option key triggers Block Select!
-                        if current_modifiers.alt_key() {
-                            selection.mode = SelectionMode::Block;
-                        } else if selection.mode == SelectionMode::None {
-                            selection.mode = SelectionMode::Stream;
-                        }
+                                selection.mode = SelectionMode::Stream;
+                                if hover_line > init_line || (hover_line == init_line && hover_col > init_w_end) {
+                                    selection.anchor_line = init_line;
+                                    selection.anchor_col = init_w_start;
+                                    selection.active_line = hover_line;
+                                    selection.active_col = curr_w_end;
+                                } else if hover_line < init_line || (hover_line == init_line && hover_col < init_w_start) {
+                                    selection.anchor_line = init_line;
+                                    selection.anchor_col = init_w_end;
+                                    selection.active_line = hover_line;
+                                    selection.active_col = curr_w_start;
+                                } else {
+                                    selection.anchor_line = init_line;
+                                    selection.anchor_col = init_w_start;
+                                    selection.active_line = init_line;
+                                    selection.active_col = init_w_end;
+                                }
 
-                        // Position cursor at active position
-                        if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
-                            let offset = TextBuffer::line_col_to_offset_str(&snap.content, hover_line, hover_col);
-                            let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
+                                let offset = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
+                            }
+                        } else if let Some(init_line) = line_drag_anchor {
+                            if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                let lines: Vec<&str> = snap.content.split('\n').collect();
+                                let total_lines = lines.len();
+
+                                selection.mode = SelectionMode::Stream;
+                                if hover_line >= init_line {
+                                    let (e_line, e_col) = if hover_line + 1 < total_lines {
+                                        (hover_line + 1, 0)
+                                    } else {
+                                        let last_line_len = lines.get(hover_line).map(|l| l.chars().count()).unwrap_or(0);
+                                        (hover_line, last_line_len)
+                                    };
+                                    selection.anchor_line = init_line;
+                                    selection.anchor_col = 0;
+                                    selection.active_line = e_line;
+                                    selection.active_col = e_col;
+                                } else {
+                                    let (a_line, a_col) = if init_line + 1 < total_lines {
+                                        (init_line + 1, 0)
+                                    } else {
+                                        let init_len = lines.get(init_line).map(|l| l.chars().count()).unwrap_or(0);
+                                        (init_line, init_len)
+                                    };
+                                    selection.anchor_line = a_line;
+                                    selection.anchor_col = a_col;
+                                    selection.active_line = hover_line;
+                                    selection.active_col = 0;
+                                }
+
+                                let offset = TextBuffer::line_col_to_offset_str(&snap.content, selection.active_line, selection.active_col);
+                                let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
+                            }
+                        } else {
+                            selection.active_line = hover_line;
+                            selection.active_col = hover_col;
+
+                            // Alt / Option key triggers Block Select!
+                            if current_modifiers.alt_key() {
+                                selection.mode = SelectionMode::Block;
+                            } else if selection.mode == SelectionMode::None {
+                                selection.mode = SelectionMode::Stream;
+                            }
+
+                            // Position cursor at active position
+                            if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                let offset = TextBuffer::line_col_to_offset_str(&snap.content, hover_line, hover_col);
+                                let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
+                            }
                         }
 
                         caret_visible = true;
@@ -900,41 +1005,42 @@ fn main() {
 
                                 if click_count == 2 {
                                     // Double click: Select Word
-                                    if let Some(line_str) = lines.get(click_line) {
-                                        let chars: Vec<char> = line_str.chars().collect();
-                                        let mut w_start = click_col.min(chars.len());
-                                        let mut w_end = w_start;
-
-                                        while w_start > 0 && chars[w_start - 1].is_alphanumeric() {
-                                            w_start -= 1;
-                                        }
-                                        while w_end < chars.len() && chars[w_end].is_alphanumeric() {
-                                            w_end += 1;
-                                        }
-
-                                        selection = SelectionState {
-                                            mode: SelectionMode::Stream,
-                                            anchor_line: click_line,
-                                            anchor_col: w_start,
-                                            active_line: click_line,
-                                            active_col: w_end,
-                                        };
-                                        let offset = TextBuffer::line_col_to_offset_str(&snap.content, click_line, w_end);
-                                        let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
-                                    }
+                                    let line_str = lines.get(click_line).copied().unwrap_or("");
+                                    let (w_start, w_end) = find_word_boundaries(line_str, click_col);
+                                    selection = SelectionState {
+                                        mode: SelectionMode::Stream,
+                                        anchor_line: click_line,
+                                        anchor_col: w_start,
+                                        active_line: click_line,
+                                        active_col: w_end,
+                                    };
+                                    word_drag_anchor = Some((click_line, w_start, w_end));
+                                    line_drag_anchor = None;
+                                    let offset = TextBuffer::line_col_to_offset_str(&snap.content, click_line, w_end);
+                                    let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
                                 } else if click_count >= 3 {
                                     // Triple click: Select Entire Line
+                                    let total_lines = lines.len();
+                                    let (e_line, e_col) = if click_line + 1 < total_lines {
+                                        (click_line + 1, 0)
+                                    } else {
+                                        (click_line, line_len)
+                                    };
                                     selection = SelectionState {
                                         mode: SelectionMode::Stream,
                                         anchor_line: click_line,
                                         anchor_col: 0,
-                                        active_line: click_line,
-                                        active_col: line_len,
+                                        active_line: e_line,
+                                        active_col: e_col,
                                     };
-                                    let offset = TextBuffer::line_col_to_offset_str(&snap.content, click_line, line_len);
+                                    line_drag_anchor = Some(click_line);
+                                    word_drag_anchor = None;
+                                    let offset = TextBuffer::line_col_to_offset_str(&snap.content, e_line, e_col);
                                     let _ = buffer_client.send(BufferRequest::SetCursorOffset(offset));
                                 } else {
                                     // Single click
+                                    word_drag_anchor = None;
+                                    line_drag_anchor = None;
                                     let is_block = current_modifiers.alt_key();
                                     selection = SelectionState {
                                         mode: if is_block { SelectionMode::Block } else { SelectionMode::None },
@@ -954,6 +1060,8 @@ fn main() {
                         }
                         ElementState::Released => {
                             is_mouse_dragging = false;
+                            word_drag_anchor = None;
+                            line_drag_anchor = None;
                             if selection.anchor_line == selection.active_line
                                 && selection.anchor_col == selection.active_col
                                 && click_count == 1
@@ -1824,8 +1932,20 @@ fn main() {
                                         let from_c = if l_idx == s_line { s_col } else { 0 };
                                         let to_c = if l_idx == e_line { e_col } else { line_len };
 
+                                        if l_idx == e_line && from_c >= to_c {
+                                            continue;
+                                        }
+
                                         let sel_x = text_start_x + (from_c as f32 * font_engine.char_width_px).round() as usize;
-                                        let sel_w = (((to_c.saturating_sub(from_c)) as f32 * font_engine.char_width_px).round() as usize).max(4);
+                                        let base_w = (to_c.saturating_sub(from_c)) as f32 * font_engine.char_width_px;
+                                        let sel_w = if l_idx < e_line {
+                                            (base_w + font_engine.char_width_px * 0.6).round() as usize
+                                        } else {
+                                            base_w.round() as usize
+                                        };
+                                        if sel_w == 0 {
+                                            continue;
+                                        }
 
                                         draw_rect(
                                             &mut buffer,
@@ -2059,4 +2179,56 @@ fn main() {
     });
 
     buffer_thread.join().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_word_boundaries_alphanumeric_and_underscores() {
+        let line = "let my_variable_name = 12345;";
+        // 'm' in my_variable_name is at index 4
+        let (s, e) = find_word_boundaries(line, 4);
+        assert_eq!(&line[s..e], "my_variable_name");
+
+        // inside 12345 (index 24)
+        let (s, e) = find_word_boundaries(line, 24);
+        assert_eq!(&line[s..e], "12345");
+    }
+
+    #[test]
+    fn test_find_word_boundaries_ukrainian() {
+        let line = "Привіт, чарівний світе!";
+        let (s, e) = find_word_boundaries(line, 2);
+        let chars: Vec<char> = line.chars().collect();
+        let selected: String = chars[s..e].iter().collect();
+        assert_eq!(selected, "Привіт");
+
+        let (s2, e2) = find_word_boundaries(line, 10);
+        let selected2: String = chars[s2..e2].iter().collect();
+        assert_eq!(selected2, "чарівний");
+    }
+
+    #[test]
+    fn test_find_word_boundaries_punctuation_and_whitespace() {
+        let line = "foo == bar   baz;";
+        // '==' is at index 4..6
+        let (s, e) = find_word_boundaries(line, 5);
+        assert_eq!(&line[s..e], "==");
+
+        // spaces at index 11
+        let (s, e) = find_word_boundaries(line, 11);
+        assert_eq!(&line[s..e], "   ");
+    }
+
+    #[test]
+    fn test_find_word_boundaries_empty_and_out_of_bounds() {
+        assert_eq!(find_word_boundaries("", 0), (0, 0));
+        assert_eq!(find_word_boundaries("", 5), (0, 0));
+
+        let line = "hello";
+        let (s, e) = find_word_boundaries(line, 10);
+        assert_eq!(&line[s..e], "hello");
+    }
 }
