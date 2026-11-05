@@ -551,6 +551,18 @@ fn find_word_boundaries(line_str: &str, click_col: usize) -> (usize, usize) {
     (start, end)
 }
 
+fn compute_gutter_metrics(total_lines: usize, show_line_numbers: bool, char_w: f32) -> (f32, usize, usize) {
+    if !show_line_numbers {
+        return (0.0, 10, 0);
+    }
+    let digits = total_lines.max(1).to_string().len().max(3);
+    // 10px left pad, digits * char_w, 10px right pad before border
+    let gutter_w = (10.0 + (digits as f32 * char_w) + 10.0).ceil();
+    // 8px margin after the separator line before text begins
+    let text_start_x = (gutter_w + 8.0).round() as usize;
+    (gutter_w, text_start_x, digits)
+}
+
 fn main() {
     let event_loop = EventLoop::new().expect("Failed to initialize winit EventLoop");
 
@@ -777,6 +789,7 @@ fn main() {
     let mut show_perf_hud = false;
     let mut word_drag_anchor: Option<(usize, usize, usize)> = None; // (line, w_start, w_end)
     let mut line_drag_anchor: Option<usize> = None; // line
+    let mut current_text_start_x = 64.0f32;
 
     println!("[Texted] GUI editor running: Dark Mode, Word Wrap, macOS Cmd/Opt navigation.");
 
@@ -813,9 +826,8 @@ fn main() {
                     last_mouse_pos = (position.x as f32, position.y as f32);
 
                     if is_mouse_dragging {
-                        let gutter_w = if show_line_numbers { 58.0 } else { 12.0 };
                         let rel_y = (last_mouse_pos.1 - 4.0).max(0.0);
-                        let rel_x = (last_mouse_pos.0 - gutter_w - 6.0).max(0.0);
+                        let rel_x = (last_mouse_pos.0 - current_text_start_x).max(0.0);
 
                         let hover_line = (rel_y / font_engine.line_height_px).floor() as usize + top_line;
                         let hover_col = (rel_x / font_engine.char_width_px).round() as usize;
@@ -904,9 +916,8 @@ fn main() {
                     }
                 }
                 WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                    let gutter_w = if show_line_numbers { 58.0 } else { 12.0 };
                     let rel_y = (last_mouse_pos.1 - 4.0).max(0.0);
-                    let rel_x = (last_mouse_pos.0 - gutter_w - 6.0).max(0.0);
+                    let rel_x = (last_mouse_pos.0 - current_text_start_x).max(0.0);
 
                     // Check interaction with Search Bar buttons
                     if search_state.mode != SearchBarMode::Closed {
@@ -1000,6 +1011,9 @@ fn main() {
                             last_click_time = now;
 
                             if let Ok(BufferResponse::Snapshot(snap)) = buffer_client.send(BufferRequest::GetSnapshot) {
+                                let (_, t_start, _) = compute_gutter_metrics(snap.total_lines, show_line_numbers, font_engine.char_width_px);
+                                current_text_start_x = t_start as f32;
+
                                 let lines: Vec<&str> = snap.content.split('\n').collect();
                                 let line_len = lines.get(click_line).map(|l| l.chars().count()).unwrap_or(0);
 
@@ -1792,7 +1806,13 @@ fn main() {
                         snap_to_cursor_needed = false;
                     }
 
-                    let gutter_w = if show_line_numbers { 58.0 } else { 12.0 };
+                    let (gutter_w, text_start_x, line_digits) = compute_gutter_metrics(
+                        snap.total_lines,
+                        show_line_numbers,
+                        font_engine.char_width_px,
+                    );
+                    current_text_start_x = text_start_x as f32;
+
                     let config = ViewportConfig {
                         width_px: width as f32,
                         height_px: (height.saturating_sub(28)) as f32,
@@ -1812,7 +1832,7 @@ fn main() {
                     buffer.fill(COLOR_BG);
 
                     // 4. Render Gutter (Line numbers)
-                    if show_line_numbers {
+                    if show_line_numbers && gutter_w > 0.0 {
                         let gutter_width_int = gutter_w as usize;
                         draw_rect(
                             &mut buffer,
@@ -1828,15 +1848,13 @@ fn main() {
                             &mut buffer,
                             width,
                             height,
-                            gutter_width_int - 1,
+                            gutter_width_int.saturating_sub(1),
                             0,
                             1,
                             height.saturating_sub(28),
                             COLOR_GUTTER_BORDER,
                         );
                     }
-
-                    let text_start_x = gutter_w as usize + 6;
 
                     // 5. Render Search Match Highlights
                     if !search_state.find_query.is_empty() {
@@ -1972,12 +1990,12 @@ fn main() {
 
                         // Gutter line number (only on non-continuation rows)
                         if show_line_numbers && !line.is_continuation {
-                            let num_str = format!("{:>3}", line.line_index + 1);
+                            let num_str = format!("{:>width$}", line.line_index + 1, width = line_digits);
                             font_engine.draw_string(
                                 &mut buffer,
                                 width,
                                 height,
-                                6,
+                                10,
                                 y_int + 2,
                                 &num_str,
                                 COLOR_GUTTER_TEXT,
@@ -2230,5 +2248,32 @@ mod tests {
         let line = "hello";
         let (s, e) = find_word_boundaries(line, 10);
         assert_eq!(&line[s..e], "hello");
+    }
+
+    #[test]
+    fn test_compute_gutter_metrics() {
+        // Small file (10 lines): minimum 3 digits, compact gutter
+        let (g_w_small, t_x_small, digits_small) = compute_gutter_metrics(10, true, 8.0);
+        assert_eq!(digits_small, 3);
+        assert_eq!(g_w_small, 44.0); // 10 + 3*8 + 10
+        assert_eq!(t_x_small, 52);   // 44 + 8
+
+        // Huge file (3.12M lines): 7 digits, expands dynamically without text overlap
+        let (g_w_3m, t_x_3m, digits_3m) = compute_gutter_metrics(3_125_761, true, 8.0);
+        assert_eq!(digits_3m, 7);
+        assert_eq!(g_w_3m, 76.0); // 10 + 7*8 + 10
+        assert_eq!(t_x_3m, 84);   // 76 + 8
+
+        // 100M lines: 9 digits
+        let (g_w_100m, t_x_100m, digits_100m) = compute_gutter_metrics(100_000_000, true, 8.0);
+        assert_eq!(digits_100m, 9);
+        assert_eq!(g_w_100m, 92.0); // 10 + 9*8 + 10
+        assert_eq!(t_x_100m, 100);
+
+        // Line numbers disabled
+        let (g_w_off, t_x_off, digits_off) = compute_gutter_metrics(3_125_761, false, 8.0);
+        assert_eq!(digits_off, 0);
+        assert_eq!(g_w_off, 0.0);
+        assert_eq!(t_x_off, 10);
     }
 }
