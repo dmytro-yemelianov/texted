@@ -24,6 +24,7 @@ use std::sync::Arc;
 mod documents;
 mod gpu;
 mod graphics;
+use texted_app::search::{SearchBarMode, SearchState};
 mod native_macos;
 use documents::{Action as DocumentAction, Documents, Effect as DocumentEffect};
 #[derive(Debug, Clone)]
@@ -160,63 +161,6 @@ impl Default for SelectionState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchBarMode {
-    Closed,
-    Find,
-    Replace,
-}
-
-type MutationPlan = (u64, usize, Option<BufferSnapshot>);
-type SearchResult = (u64, String, Vec<(usize, usize)>);
-pub struct SearchState {
-    pub mode: SearchBarMode,
-    pub find_query: String,
-    pub replace_query: String,
-    pub active_field: usize, // 0 = Find, 1 = Replace
-    pub matches: Vec<(usize, usize)>,
-    pub current_match_idx: Option<usize>,
-    worker: std::sync::mpsc::Sender<(BufferSnapshot, String)>,
-    results: std::sync::mpsc::Receiver<SearchResult>,
-    submitted: Option<(u64, String)>,
-    pending: bool,
-    pending_navigation: Option<bool>,
-    mutation: Option<std::sync::mpsc::Receiver<MutationPlan>>,
-}
-
-impl Default for SearchState {
-    fn default() -> Self {
-        let (worker, jobs) = std::sync::mpsc::channel::<(BufferSnapshot, String)>();
-        let (out, results) = std::sync::mpsc::channel();
-        thread::spawn(move || {
-            while let Ok(mut job) = jobs.recv() {
-                while let Ok(next) = jobs.try_recv() {
-                    job = next;
-                }
-                let (snap, query) = job;
-                let matches = snap.find_matches(&query);
-                if out.send((snap.revision, query, matches)).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
-            mode: SearchBarMode::Closed,
-            find_query: String::new(),
-            replace_query: String::new(),
-            active_field: 0,
-            matches: Vec::new(),
-            current_match_idx: None,
-            worker,
-            results,
-            submitted: None,
-            pending: false,
-            pending_navigation: None,
-            mutation: None,
-        }
-    }
-}
-
 // System clipboard helpers via macOS pbcopy / pbpaste
 fn copy_to_system_clipboard(text: &str) {
     if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
@@ -244,121 +188,34 @@ fn update_search_matches(
     }
 }
 fn submit_search(snap: BufferSnapshot, search: &mut SearchState) {
-    let key = (snap.revision, search.find_query.clone());
-    if search.submitted.as_ref() == Some(&key) {
-        return;
-    }
-    if search
-        .submitted
-        .as_ref()
-        .is_none_or(|(_, query)| query != &search.find_query)
-    {
-        search.pending_navigation = Some(true);
-    }
-    search.matches.clear();
-    search.current_match_idx = None;
-    search.submitted = Some(key);
-    search.pending = !search.find_query.is_empty();
-    if search.pending {
-        let _ = search.worker.send((snap, search.find_query.clone()));
-    }
+    search.submit(snap);
 }
-
 fn start_replacement(
     client: &texted_kernel::ChannelClient<BufferRequest, BufferResponse>,
     search: &mut SearchState,
     all: bool,
 ) {
-    if search.mutation.is_some() || search.find_query.is_empty() {
-        return;
-    }
-    let Ok(BufferResponse::Snapshot(snap)) = client.send(BufferRequest::GetSnapshot) else {
-        return;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    search.mutation = Some(rx);
-    let query = search.find_query.clone();
-    let replacement = search.replace_query.clone();
-    thread::spawn(move || {
-        let (revision, cursor) = (snap.revision, snap.cursor_offset);
-        let mut edited = TextBuffer::from_rope(snap.content);
-        edited.set_cursor_offset(cursor);
-        let changed = if all {
-            edited.replace_all(&query, &replacement) > 0
-        } else {
-            edited.replace_next(&query, &replacement, cursor).is_some()
-        };
-        let _ = tx.send((revision, cursor, changed.then(|| edited.create_snapshot())));
-    });
-}
-fn jump_to_match(
-    client: &texted_kernel::ChannelClient<BufferRequest, BufferResponse>,
-    search: &mut SearchState,
-    selection: &mut SelectionState,
-    match_idx: usize,
-) {
-    if let Some(&(start, end)) = search.matches.get(match_idx) {
-        search.current_match_idx = Some(match_idx);
-        if let Ok(BufferResponse::Snapshot(snap)) = client.send(BufferRequest::GetSnapshot) {
-            let (s_line, s_col) = snap.offset_to_line_col(start);
-            let (e_line, e_col) = snap.offset_to_line_col(end);
-
-            *selection = SelectionState {
-                mode: SelectionMode::Stream,
-                anchor_line: s_line,
-                anchor_col: s_col,
-                active_line: e_line,
-                active_col: e_col,
-            };
-            let _ = client.send(BufferRequest::SetCursorOffset(end));
-        }
+    if let Ok(BufferResponse::Snapshot(snap)) = client.send(BufferRequest::GetSnapshot) {
+        search.start_replacement(snap, all);
     }
 }
-
 fn find_next_match(
     client: &texted_kernel::ChannelClient<BufferRequest, BufferResponse>,
     search: &mut SearchState,
-    selection: &mut SelectionState,
+    _selection: &mut SelectionState,
 ) {
-    update_search_matches(client, search);
-    if search.pending {
-        search.pending_navigation = Some(true);
-        return;
+    if let Ok(BufferResponse::Snapshot(snap)) = client.send(BufferRequest::GetSnapshot) {
+        search.navigate(snap, true);
     }
-    if search.matches.is_empty() {
-        return;
-    }
-    let next_idx = match search.current_match_idx {
-        Some(cur) => (cur + 1) % search.matches.len(),
-        None => 0,
-    };
-    jump_to_match(client, search, selection, next_idx);
 }
-
 fn find_prev_match(
     client: &texted_kernel::ChannelClient<BufferRequest, BufferResponse>,
     search: &mut SearchState,
-    selection: &mut SelectionState,
+    _selection: &mut SelectionState,
 ) {
-    update_search_matches(client, search);
-    if search.pending {
-        search.pending_navigation = Some(false);
-        return;
+    if let Ok(BufferResponse::Snapshot(snap)) = client.send(BufferRequest::GetSnapshot) {
+        search.navigate(snap, false);
     }
-    if search.matches.is_empty() {
-        return;
-    }
-    let prev_idx = match search.current_match_idx {
-        Some(cur) => {
-            if cur == 0 {
-                search.matches.len() - 1
-            } else {
-                cur - 1
-            }
-        }
-        None => 0,
-    };
-    jump_to_match(client, search, selection, prev_idx);
 }
 
 fn compute_gutter_metrics(
@@ -619,7 +476,8 @@ fn main() {
 
     // Mouse & Selection Tracking
     let mut selection = SelectionState::default();
-    let mut search_state = SearchState::default();
+    let search_wake = window.clone();
+    let mut search_state = SearchState::new(move || search_wake.request_redraw());
     let mut is_mouse_dragging = false;
     let mut last_click_time = Instant::now();
     let mut click_count = 0usize;
@@ -878,7 +736,7 @@ fn main() {
                                 if last_mouse_pos.0 >= panel_x + panel_w - 28.0
                                     && last_mouse_pos.1 <= 36.0
                                 {
-                                    search_state.mode = SearchBarMode::Closed;
+                                    search_state.close();
                                     window.request_redraw();
                                     return;
                                 }
@@ -985,6 +843,7 @@ fn main() {
                                 let line_len =
                                     lines.get(click_line).map(|l| l.len_chars()).unwrap_or(0);
 
+                                search_state.cancel_navigation();
                                 if click_count == 2 {
                                     // Double click: Select Word
                                     let bounds=texted_buffer::word::bounds(snap.line(click_line),click_col);
@@ -1397,7 +1256,7 @@ fn main() {
                     if search_state.mode != SearchBarMode::Closed {
                         match logical_key {
                             Key::Named(NamedKey::Escape) => {
-                                search_state.mode = SearchBarMode::Closed;
+                                search_state.close();
                                 window.request_redraw();
                                 return;
                             }
@@ -1482,6 +1341,7 @@ fn main() {
                             return;
                         }
                         Key::Named(NamedKey::Escape) => {
+                            search_state.cancel_mutation();
                             selection.mode = SelectionMode::None;
                             window.request_redraw();
                             return;
@@ -1494,6 +1354,7 @@ fn main() {
                         | Key::Named(NamedKey::End)
                         | Key::Named(NamedKey::PageUp)
                         | Key::Named(NamedKey::PageDown) => {
+                            search_state.cancel_navigation();
                             // 1. Shift+Option+Up/Down: Block/Column Selection Mode
                             if is_shift
                                 && is_alt
@@ -1930,7 +1791,11 @@ fn main() {
                             "The replacement worker stopped before completing.".into()
                         ));
                     }
-                    if let Some(Ok(plan)) = replacement {
+                    if let Some(Ok(Err(error)))=&replacement {
+                        file_actions.push_back(DocumentAction::ReportError(error.clone()));
+                        search_state.mutation=None;
+                    }
+                    if let Some(Ok(Ok(plan))) = replacement {
                         // Commit on the UI event boundary so an input handler cannot race a background mutation.
                         let (revision, cursor, edited) = plan;
                         let committed = edited.is_none_or(|edited| {
@@ -1979,28 +1844,16 @@ fn main() {
                     if search_state.mode != SearchBarMode::Closed {
                         submit_search(snap.clone(), &mut search_state);
                     }
-                    while let Ok((revision, query, matches)) = search_state.results.try_recv() {
-                        if search_state.submitted.as_ref() == Some(&(revision, query)) {
-                            search_state.matches = matches;
-                            search_state.current_match_idx = None;
-                            search_state.pending = false;
+                    if let Some((revision,(start,end)))=search_state.poll() {
+                        if revision==snap.revision {
+                            let (sl,sc)=snap.offset_to_line_col(start);let (el,ec)=snap.offset_to_line_col(end);
+                            selection=SelectionState {mode:SelectionMode::Stream,anchor_line:sl,anchor_col:sc,active_line:el,active_col:ec};
+                            let _=buffer_client.send(BufferRequest::SetCursorOffset(end));
+                            if let Ok(BufferResponse::Snapshot(updated))=buffer_client.send(BufferRequest::GetSnapshot){snap=updated;}
+                            snap_to_cursor_needed=true;
                         }
                     }
-                    if !search_state.pending && search_state.mode != SearchBarMode::Closed {
-                        if let Some(forward) = search_state.pending_navigation.take() {
-                            if forward {
-                                find_next_match(&buffer_client, &mut search_state, &mut selection);
-                            } else {
-                                find_prev_match(&buffer_client, &mut search_state, &mut selection);
-                            }
-                            if let Ok(BufferResponse::Snapshot(updated)) =
-                                buffer_client.send(BufferRequest::GetSnapshot)
-                            {
-                                snap = updated;
-                            }
-                            snap_to_cursor_needed = true;
-                        }
-                    }
+                    if let Some(error)=search_state.error.take(){file_actions.push_back(DocumentAction::ReportError(error));}
                     window.set_title(&documents.title(&snap));
                     let (cur_line, cur_col) = snap.offset_to_line_col(snap.cursor_offset);
 
@@ -2109,18 +1962,11 @@ fn main() {
                         );
                     }
 
-                    // 5. Render only revision-valid matches intersecting visible rows.
-                    let match_revision = search_state.submitted.as_ref()
-                        .filter(|(_, query)| query == &search_state.find_query)
-                        .map(|(revision, _)| *revision)
-                        .unwrap_or(u64::MAX);
-                    let active = search_state.current_match_idx.and_then(|i| search_state.matches.get(i).copied());
-                    for highlight in layout.search_highlights(&snap, &config, match_revision, &search_state.matches, active).highlights {
-                        let rect = highlight.rect;
-                        draw_rect(buffer, width, height, rect.x.round() as usize,
-                            rect.y.round() as usize + 2, rect.width.round() as usize,
-                            rect.height as usize,
-                            if highlight.active { COLOR_SEARCH_ACTIVE } else { COLOR_SEARCH_MATCH });
+                    search_state.set_view(&snap,&layout);
+                    for highlight in search_state.highlights(&snap,&layout,&config).highlights {
+                        let rect=highlight.rect;
+                        draw_rect(buffer,width,height,rect.x.round() as usize,rect.y.round() as usize+2,rect.width.round() as usize,rect.height as usize,
+                            if highlight.active {COLOR_SEARCH_ACTIVE}else{COLOR_SEARCH_MATCH});
                     }
 
                     // 6. Render Selection Highlights
@@ -2376,14 +2222,7 @@ fn main() {
                         }
 
                         // Match count info
-                        let match_info = if search_state.find_query.is_empty() {
-                            "".to_string()
-                        } else if search_state.matches.is_empty() {
-                            "0/0".to_string()
-                        } else {
-                            let cur_idx = search_state.current_match_idx.map_or(0, |i| i + 1);
-                            format!("{}/{}", cur_idx, search_state.matches.len())
-                        };
+                        let match_info = search_state.label();
                         font_engine.draw_string(
                             buffer,
                             width,
@@ -2796,7 +2635,7 @@ fn main() {
                             horizontal.reset();
                             current_scrollbar = None;
                             selection = SelectionState::default();
-                            search_state = SearchState::default();
+                            search_state.reset_document();
                             is_mouse_dragging = false;
                             click_count = 0;
                             word_drag_anchor = None;
@@ -2833,26 +2672,6 @@ mod tests {
         (bounds.start, bounds.end)
     }
 
-    #[test]
-    fn background_search_is_keyed_by_revision_and_query() {
-        let mut b = TextBuffer::from_string("їжак їжак".into());
-        let mut search = SearchState {
-            find_query: "їжак".into(),
-            ..Default::default()
-        };
-        submit_search(b.create_snapshot(), &mut search);
-        let (revision, query, matches) =
-            search.results.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(search.submitted, Some((revision, query)));
-        assert_eq!(matches, vec![(0, 8), (9, 17)]);
-        b.insert(0, "!");
-        submit_search(b.create_snapshot(), &mut search);
-        assert!(search.matches.is_empty());
-        let (new_revision, _, matches) =
-            search.results.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_ne!(new_revision, revision);
-        assert_eq!(matches, vec![(1, 9), (10, 18)]);
-    }
     #[test]
     fn test_find_word_boundaries_alphanumeric_and_underscores() {
         let line = "let my_variable_name = 12345;";

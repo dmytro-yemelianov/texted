@@ -93,7 +93,17 @@ impl SearchSession {
     /// Checkpoints retain the global non-overlap phase, including partial matches across chunks.
     pub fn scan(
         &self,
+        at: Checkpoint,
+        cancelled: impl FnMut() -> bool,
+        visit: impl FnMut(SearchMatch) -> bool,
+        checkpoint: impl FnMut(Checkpoint),
+    ) -> ScanReport {
+        self.scan_until(at, self.snapshot.total_bytes, cancelled, visit, checkpoint)
+    }
+    pub fn scan_until(
+        &self,
         mut at: Checkpoint,
+        stop_at: usize,
         mut cancelled: impl FnMut() -> bool,
         mut visit: impl FnMut(SearchMatch) -> bool,
         mut checkpoint: impl FnMut(Checkpoint),
@@ -114,7 +124,12 @@ impl SearchSession {
             return report(ScanState::Cancelled, at);
         }
         let pattern = self.query.as_bytes();
-        for byte in self.snapshot.content.bytes_at(at.offset) {
+        for byte in self
+            .snapshot
+            .content
+            .bytes_at(at.offset)
+            .take(stop_at.saturating_sub(at.offset))
+        {
             while at.prefix > 0 && byte != pattern[at.prefix] {
                 at.prefix = self.failure[at.prefix - 1];
             }
@@ -145,8 +160,10 @@ impl SearchSession {
         report(
             if cancelled() {
                 ScanState::Cancelled
-            } else {
+            } else if at.offset == self.snapshot.total_bytes {
                 ScanState::Complete
+            } else {
+                ScanState::Stopped
             },
             at,
         )
