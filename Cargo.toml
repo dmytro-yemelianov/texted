@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/texted-kernel",
+    "crates/texted-buffer",
+    "crates/texted-layout",
+    "crates/texted-render",
+    "crates/texted-io",
+    "crates/texted-app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Dmytro Yemelianov"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+memmap2 = "0.9"
+bytemuck = { version = "1.16", features = ["derive"] }

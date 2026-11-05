@@ -1,0 +1,9 @@
+[package]
+name = "texted-buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+texted-kernel = { path = "../texted-kernel" }
+parking_lot.workspace = true

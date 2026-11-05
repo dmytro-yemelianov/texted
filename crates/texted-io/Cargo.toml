@@ -1,0 +1,9 @@
+[package]
+name = "texted-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+texted-kernel = { path = "../texted-kernel" }
+memmap2.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "texted-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+texted-kernel = { path = "../texted-kernel" }
+texted-layout = { path = "../texted-layout" }
+bytemuck.workspace = true
