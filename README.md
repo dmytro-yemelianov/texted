@@ -51,6 +51,8 @@ The status bar counts Unicode scalar values and reports UTF-8 buffer bytes. The 
 
 ## Themes and typography
 
+Available in `main` development builds; the published v0.2.0 preview predates this feature.
+
 Appearance offers Modern Dark/Light, VGA, EGA, Atari, Commander, C64, ZX Spectrum, Amber and Green CRT palettes. The theme applies to the document, selection/search highlights, gutter, status, search and appearance panels. Palettes and editor fonts are independent.
 
 Open **Style** in the status bar or press **Cmd+,**. Use the row arrows, or Tab/Shift+Tab to select a field and Left/Right to change it. Changes apply immediately; Escape/Done closes the panel. Choose Courier New, Menlo, Monaco or Pixel 8x8, an 8–40 px editor size and 100–180% line height. Pixel mode uses integer 8 px steps and a nearest-neighbor bitmap; Ukrainian and other non-bitmap characters use a pixel-rasterized system-font fallback. UI labels keep a separate fixed size. Settings do not edit the document or its undo history.

@@ -1,4 +1,4 @@
-# Texted handover — 2026-11-05
+# Texted handover — 2026-11-06
 
 Start with [README](README.md), the [hardening results](docs/performance-hardening-results.md), and the [spec/plan](docs/performance-hardening-plan.md). The original design in `HANDOVER.md` and `docs/design-spec.md` is historical: the current buffer is Ropey, the GUI renderer is wgpu/Metal, and the GUI transport is asynchronous.
 
@@ -10,7 +10,7 @@ A0–A11 are implemented. The [results](docs/performance-hardening-results.md) r
 
 ## Appearance work
 
-`feat/themes-typography` adds static theme palettes and editor typography only. `appearance.rs` owns versioned, validated values and optional color overrides; `appearance_ui.rs` owns the modal Style panel; `preferences.rs` coalesces atomic writes off the UI thread. `graphics.rs` loads selectable system faces once at startup and uses a separate fixed UI face. Every font/size/spacing change updates the shared viewport metrics; pixel mode uses integer cells with a Unicode fallback. The default settings file is under Application Support/Texted; use `TEXTED_SETTINGS_PATH` for isolated UI tests. No shader effects or release tag are part of this branch. See README for controls and config.
+[PR #7](https://github.com/dmytro-yemelianov/texted/pull/7) is merged into `main` and adds static theme palettes and editor typography only. `appearance.rs` owns versioned, validated values and optional color overrides; `appearance_ui.rs` owns the modal Style panel; `preferences.rs` coalesces atomic writes off the UI thread. `graphics.rs` loads selectable system faces once at startup and uses a separate fixed UI face. Every font/size/spacing change updates the shared viewport metrics; pixel mode uses integer cells with a Unicode fallback. The default settings file is under Application Support/Texted; use `TEXTED_SETTINGS_PATH` for isolated UI tests. The final feature commit is `549d312`; the merge commit is `bcd3a77`, with the same source tree. ARM/Intel CI, universal packaging, 95 tests and review passed. Native checks confirmed corrected Ukrainian pixel glyphs, punctuation, Style/zoom controls and persistence across restart without changing document bytes. No shader effects were added. These changes are in development builds; the existing `v0.2.0` preview predates PR #7. See README for controls and config.
 
 ## Component map
 
