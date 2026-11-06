@@ -164,6 +164,12 @@ impl TextBuffer {
         self.checkpoint();
         self.replace_range_raw(start, end, "");
     }
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
     pub fn undo(&mut self) -> bool {
         self.typing = None;
         if let Some(r) = self.undo_stack.pop_back() {
