@@ -1,0 +1,436 @@
+{
+  "bios_8x8": [
+    {
+      "character": "ʼ",
+      "codepoint": "U+02BC",
+      "basis": "’",
+      "method": "Reuse this face’s apostrophe bitmap",
+      "rows": [
+        "30",
+        "30",
+        "60",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "₴",
+      "codepoint": "U+20B4",
+      "basis": "S",
+      "method": "Add two full-cell currency bars through the native S",
+      "rows": [
+        "78",
+        "CC",
+        "FF",
+        "70",
+        "FF",
+        "CC",
+        "78",
+        "00"
+      ]
+    }
+  ],
+  "ega_8x14": [
+    {
+      "character": "ʼ",
+      "codepoint": "U+02BC",
+      "basis": "’",
+      "method": "Reuse this face’s apostrophe bitmap",
+      "rows": [
+        "00",
+        "18",
+        "18",
+        "30",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "₴",
+      "codepoint": "U+20B4",
+      "basis": "S",
+      "method": "Add two full-cell currency bars through the native S",
+      "rows": [
+        "00",
+        "00",
+        "7C",
+        "C6",
+        "C6",
+        "FF",
+        "38",
+        "0C",
+        "FF",
+        "C6",
+        "7C",
+        "00",
+        "00",
+        "00"
+      ]
+    }
+  ],
+  "vga_8x16": [
+    {
+      "character": "ʼ",
+      "codepoint": "U+02BC",
+      "basis": "’",
+      "method": "Reuse this face’s apostrophe bitmap",
+      "rows": [
+        "00",
+        "18",
+        "18",
+        "30",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "₴",
+      "codepoint": "U+20B4",
+      "basis": "S",
+      "method": "Add two full-cell currency bars through the native S",
+      "rows": [
+        "00",
+        "00",
+        "7C",
+        "C6",
+        "C6",
+        "FF",
+        "38",
+        "0C",
+        "FF",
+        "C6",
+        "C6",
+        "7C",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    }
+  ],
+  "spleen_6x12": [
+    {
+      "character": "Є",
+      "codepoint": "U+0404",
+      "basis": "Э",
+      "method": "Mirror ink within original side bearings",
+      "rows": [
+        "00",
+        "78",
+        "80",
+        "80",
+        "F0",
+        "80",
+        "80",
+        "80",
+        "78",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "є",
+      "codepoint": "U+0454",
+      "basis": "э",
+      "method": "Mirror ink within original side bearings",
+      "rows": [
+        "00",
+        "00",
+        "00",
+        "78",
+        "80",
+        "80",
+        "F0",
+        "80",
+        "78",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "ʼ",
+      "codepoint": "U+02BC",
+      "basis": "'",
+      "method": "Reuse this face’s apostrophe bitmap",
+      "rows": [
+        "00",
+        "20",
+        "20",
+        "20",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "’",
+      "codepoint": "U+2019",
+      "basis": "'",
+      "method": "Reuse this face’s apostrophe bitmap",
+      "rows": [
+        "00",
+        "20",
+        "20",
+        "20",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "–",
+      "codepoint": "U+2013",
+      "basis": "-",
+      "method": "Extend the native hyphen horizontally, retaining its scanlines",
+      "rows": [
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "F8",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "—",
+      "codepoint": "U+2014",
+      "basis": "-",
+      "method": "Extend the native hyphen horizontally, retaining its scanlines",
+      "rows": [
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "FC",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "…",
+      "codepoint": "U+2026",
+      "basis": ".",
+      "method": "Repeat three native dots at their original baseline",
+      "rows": [
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "A8",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "₴",
+      "codepoint": "U+20B4",
+      "basis": "S",
+      "method": "Add two full-cell currency bars through the native S",
+      "rows": [
+        "00",
+        "78",
+        "80",
+        "FC",
+        "70",
+        "08",
+        "FC",
+        "08",
+        "F0",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "�",
+      "codepoint": "U+FFFD",
+      "basis": "native cell",
+      "method": "Outlined missing-character box",
+      "rows": [
+        "00",
+        "78",
+        "48",
+        "48",
+        "48",
+        "48",
+        "48",
+        "48",
+        "48",
+        "48",
+        "78",
+        "00"
+      ]
+    }
+  ],
+  "spleen_8x16": [
+    {
+      "character": "Є",
+      "codepoint": "U+0404",
+      "basis": "Э",
+      "method": "Mirror ink within original side bearings",
+      "rows": [
+        "00",
+        "00",
+        "7E",
+        "C0",
+        "C0",
+        "C0",
+        "F8",
+        "C0",
+        "C0",
+        "C0",
+        "C0",
+        "7E",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "є",
+      "codepoint": "U+0454",
+      "basis": "э",
+      "method": "Mirror ink within original side bearings",
+      "rows": [
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "7E",
+        "C0",
+        "C0",
+        "F8",
+        "C0",
+        "C0",
+        "7E",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "ʼ",
+      "codepoint": "U+02BC",
+      "basis": "’",
+      "method": "Reuse this face’s apostrophe bitmap",
+      "rows": [
+        "00",
+        "18",
+        "18",
+        "18",
+        "18",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "₴",
+      "codepoint": "U+20B4",
+      "basis": "S",
+      "method": "Add two full-cell currency bars through the native S",
+      "rows": [
+        "00",
+        "00",
+        "7E",
+        "C0",
+        "C0",
+        "FF",
+        "7C",
+        "06",
+        "FF",
+        "06",
+        "06",
+        "FC",
+        "00",
+        "00",
+        "00",
+        "00"
+      ]
+    },
+    {
+      "character": "�",
+      "codepoint": "U+FFFD",
+      "basis": "native cell",
+      "method": "Outlined missing-character box",
+      "rows": [
+        "00",
+        "7E",
+        "42",
+        "42",
+        "42",
+        "42",
+        "42",
+        "42",
+        "42",
+        "42",
+        "42",
+        "42",
+        "42",
+        "42",
+        "7E",
+        "00"
+      ]
+    }
+  ]
+}

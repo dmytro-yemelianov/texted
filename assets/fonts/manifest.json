@@ -1,0 +1,95 @@
+{
+  "format": "u32-le codepoint + native MSB-left u8 scanlines",
+  "fonts": [
+    {
+      "id": "bios_8x8",
+      "width": 8,
+      "height": 8,
+      "baseline": 7,
+      "license": "CC-BY-SA-4.0",
+      "glyphs": 757,
+      "source_glyphs": 755,
+      "source_rows_sha256": "ce56d5668fbb491005574fbfc9dc007b84b304076ae5e66288fef894bc3f8649",
+      "file": "bios_8x8.bin",
+      "sha256": "1614e74fb35d550e79853622141c8ae2d9a9dd87762a76df62ecf1d57cc31d98",
+      "added": [
+        "U+02BC",
+        "U+20B4"
+      ]
+    },
+    {
+      "id": "ega_8x14",
+      "width": 8,
+      "height": 14,
+      "baseline": 11,
+      "license": "CC-BY-SA-4.0",
+      "glyphs": 756,
+      "source_glyphs": 754,
+      "source_rows_sha256": "79450d31a373fd283255a39413e2fab8bd0a3ec56c0afab56dd187aeaa6c3521",
+      "file": "ega_8x14.bin",
+      "sha256": "272bb77050bce6dd3ce92e38d432c1c96fa043f890aa75a868ab0cea869d01b0",
+      "added": [
+        "U+02BC",
+        "U+20B4"
+      ]
+    },
+    {
+      "id": "vga_8x16",
+      "width": 8,
+      "height": 16,
+      "baseline": 12,
+      "license": "CC-BY-SA-4.0",
+      "glyphs": 756,
+      "source_glyphs": 754,
+      "source_rows_sha256": "2293a844ec4f007b550de20deb376984af3d0528f5536fac0c7e4b351f0f58b9",
+      "file": "vga_8x16.bin",
+      "sha256": "725ecbd8bfecbfd412d655b8f9662265523ba0bb2737debddd984801794ac707",
+      "added": [
+        "U+02BC",
+        "U+20B4"
+      ]
+    },
+    {
+      "id": "spleen_6x12",
+      "width": 6,
+      "height": 12,
+      "baseline": 9,
+      "license": "BSD-2-Clause",
+      "glyphs": 557,
+      "source_glyphs": 548,
+      "source_rows_sha256": "4901c2087afb33c5e9b5c7c3c515950a4a2426c87de5fdab6e1108e333337f3b",
+      "file": "spleen_6x12.bin",
+      "sha256": "52f0482b120777af73aa8629e7fb6a3b37a3294a4058e829b7fdd4746321e81d",
+      "added": [
+        "U+0404",
+        "U+0454",
+        "U+02BC",
+        "U+2019",
+        "U+2013",
+        "U+2014",
+        "U+2026",
+        "U+20B4",
+        "U+FFFD"
+      ]
+    },
+    {
+      "id": "spleen_8x16",
+      "width": 8,
+      "height": 16,
+      "baseline": 12,
+      "license": "BSD-2-Clause",
+      "glyphs": 1006,
+      "source_glyphs": 1001,
+      "source_rows_sha256": "440953a1592e9fc4f03839a9ad832396e2f8cf9bcb437d0bd27500ebd6edb466",
+      "file": "spleen_8x16.bin",
+      "sha256": "f3ceea6afd67731047c6af0f00ac07c280980aa3ed85fbae956a38d08c9b5197",
+      "added": [
+        "U+0404",
+        "U+0454",
+        "U+02BC",
+        "U+20B4",
+        "U+FFFD"
+      ]
+    }
+  ]
+}

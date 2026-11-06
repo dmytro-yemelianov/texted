@@ -1,15 +1,15 @@
-//! Ordered GPU drawing commands. Font outlines are rasterized once per cached glyph.
-use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
-use font8x8::UnicodeFonts;
+//! Ordered GPU drawing commands and exact native bitmap glyphs; all font masks are one-bit.
 use std::{
     collections::HashMap,
-    fs,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc,
     },
 };
-use texted_app::appearance::{FontFamily, Typography};
+use texted_app::{
+    appearance::Typography,
+    bitmap_fonts::{self, BitmapFace},
+};
 
 static NEXT_FONT_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_CACHED_GLYPHS: usize = 4096;
@@ -20,8 +20,6 @@ pub(crate) struct CachedGlyph {
     pub key: GlyphKey,
     pub width: u32,
     pub height: u32,
-    x_offset: i32,
-    y_offset: i32,
     pub coverage: Vec<u8>,
 }
 pub(crate) struct Draw {
@@ -72,39 +70,13 @@ impl DrawList {
     }
 }
 
-// All selectable system faces are loaded once at startup; switching/zooming clones shared font data.
-static FONTS: OnceLock<[Option<FontArc>; 3]> = OnceLock::new();
-fn fonts() -> &'static [Option<FontArc>; 3] {
-    FONTS.get_or_init(|| {
-        [
-            "/System/Library/Fonts/Supplemental/Courier New.ttf",
-            "/System/Library/Fonts/Menlo.ttc",
-            "/System/Library/Fonts/Monaco.ttf",
-        ]
-        .map(|path| {
-            fs::read(path)
-                .ok()
-                .and_then(|bytes| FontArc::try_from_vec(bytes).ok())
-        })
-    })
-}
-fn bitmap(ch: char) -> Option<[u8; 8]> {
-    font8x8::BASIC_FONTS
-        .get(ch)
-        .or_else(|| font8x8::LATIN_FONTS.get(ch))
-        .or_else(|| font8x8::BLOCK_FONTS.get(ch))
-        .or_else(|| font8x8::BOX_FONTS.get(ch))
-}
 pub struct FontEngine {
-    font: Option<FontArc>,
+    face: BitmapFace,
     font_id: u64,
-    scale_px: f32,
-    pixel: bool,
-    pixel_scale: u32,
+    scale: u32,
     pub char_width_px: f32,
     pub line_height_px: f32,
     natural_line_height_px: f32,
-    pub ascent_px: f32,
     cache: HashMap<u32, Arc<CachedGlyph>>,
 }
 impl FontEngine {
@@ -114,53 +86,19 @@ impl FontEngine {
             ..Default::default()
         })
     }
-    pub fn available(family: FontFamily) -> bool {
-        match family {
-            FontFamily::Courier => fonts()[0].is_some(),
-            FontFamily::Menlo => fonts()[1].is_some(),
-            FontFamily::Monaco => fonts()[2].is_some(),
-            FontFamily::Pixel => true,
-        }
-    }
     pub fn with_typography(mut settings: Typography) -> Self {
         settings.normalize();
-        let index = match settings.family {
-            FontFamily::Courier | FontFamily::Pixel => 0,
-            FontFamily::Menlo => 1,
-            FontFamily::Monaco => 2,
-        };
-        let font = fonts()[index]
-            .clone()
-            .or_else(|| fonts().iter().find_map(Clone::clone));
-        let pixel = settings.family == FontFamily::Pixel || font.is_none();
-        let scale_px = f32::from(settings.size_px);
-        let pixel_scale = (scale_px / 8.0).round().max(1.0) as u32;
-        let (char_width_px, natural_height, ascent_px) = if pixel {
-            (
-                8.0 * pixel_scale as f32,
-                10.0 * pixel_scale as f32,
-                8.0 * pixel_scale as f32,
-            )
-        } else {
-            let scaled = font.as_ref().unwrap().as_scaled(PxScale::from(scale_px));
-            (
-                scaled.h_advance(scaled.glyph_id('M')).round().max(1.0),
-                (scaled.ascent() - scaled.descent() + scaled.line_gap())
-                    .ceil()
-                    .max(scale_px * 1.25),
-                scaled.ascent(),
-            )
-        };
+        let face = bitmap_fonts::face(settings.family);
+        let scale = u32::from(settings.size_px / face.height);
+        let natural_line_height_px = f32::from(settings.size_px);
         Self {
-            font,
+            face,
             font_id: NEXT_FONT_ID.fetch_add(1, Ordering::Relaxed),
-            scale_px,
-            pixel,
-            pixel_scale,
-            char_width_px,
-            natural_line_height_px: natural_height,
-            line_height_px: (natural_height * f32::from(settings.line_spacing) / 100.0).ceil(),
-            ascent_px,
+            scale,
+            char_width_px: f32::from(face.width) * scale as f32,
+            line_height_px: (natural_line_height_px * f32::from(settings.line_spacing) / 100.0)
+                .ceil(),
+            natural_line_height_px,
             cache: HashMap::new(),
         }
     }
@@ -169,13 +107,7 @@ impl FontEngine {
             (self.natural_line_height_px * f32::from(percent.clamp(100, 180)) / 100.0).ceil();
     }
     fn glyph(&mut self, ch: char) -> Arc<CachedGlyph> {
-        let id = if self.pixel {
-            ch as u32
-        } else {
-            self.font
-                .as_ref()
-                .map_or(0, |f| u32::from(f.glyph_id(ch).0))
-        };
+        let id = ch as u32;
         if let Some(glyph) = self.cache.get(&id) {
             return glyph.clone();
         }
@@ -186,86 +118,31 @@ impl FontEngine {
             key: GlyphKey(self.font_id, id),
             width: 0,
             height: 0,
-            x_offset: 0,
-            y_offset: 0,
             coverage: Vec::new(),
         };
-        if self.pixel {
-            self.pixel_glyph(ch, &mut glyph);
-        } else if let Some(ref font) = self.font {
-            let scaled = font.as_scaled(PxScale::from(self.scale_px));
-            if let Some(outlined) = font.outline_glyph(scaled.scaled_glyph(ch)) {
-                let bounds = outlined.px_bounds();
-                glyph.width = bounds.width().ceil() as u32;
-                glyph.height = bounds.height().ceil() as u32;
-                glyph.x_offset = bounds.min.x.round() as i32;
-                glyph.y_offset = (bounds.min.y + self.ascent_px).round() as i32;
+        if !ch.is_control() {
+            let rows = self
+                .face
+                .glyph(ch)
+                .unwrap_or_else(|| self.face.glyph('\u{fffd}').expect("bundled missing glyph"));
+            if rows.iter().any(|row| *row != 0) {
+                glyph.width = u32::from(self.face.width) * self.scale;
+                glyph.height = u32::from(self.face.height) * self.scale;
                 glyph
                     .coverage
                     .resize((glyph.width * glyph.height) as usize, 0);
-                outlined.draw(|x, y, a| {
-                    glyph.coverage[(y * glyph.width + x) as usize] =
-                        (a * 255.0).round().clamp(0.0, 255.0) as u8
-                });
+                for y in 0..glyph.height {
+                    for x in 0..glyph.width {
+                        if rows[(y / self.scale) as usize] & (0x80 >> (x / self.scale)) != 0 {
+                            glyph.coverage[(y * glyph.width + x) as usize] = 255;
+                        }
+                    }
+                }
             }
         }
         let glyph = Arc::new(glyph);
         self.cache.insert(id, glyph.clone());
         glyph
-    }
-    fn pixel_glyph(&self, ch: char, glyph: &mut CachedGlyph) {
-        let bits = bitmap(ch).unwrap_or_else(|| {
-            // Keep non-bitmap Unicode (including Ukrainian) in the same 8x8 cell, using the system face.
-            let mut bits = [0u8; 8];
-            if let Some(font) = self.font.as_ref().filter(|font| font.glyph_id(ch).0 != 0) {
-                // Match the bitmap face's cap/x-height, rather than fitting the font's padded em box.
-                let scaled = font.as_scaled(PxScale::from(13.0));
-                if let Some(outline) = font.outline_glyph(scaled.scaled_glyph(ch)) {
-                    let bounds = outline.px_bounds();
-                    let sx = (8.0 / bounds.width().max(1.0)).min(1.0);
-                    let sy = (8.0 / bounds.height().max(1.0)).min(1.0);
-                    let dx = ((8.0 - bounds.width() * sx) / 2.0).floor();
-                    let dy = (7.0 + bounds.min.y).clamp(0.0, (8.0 - bounds.height() * sy).max(0.0));
-                    let mut coverage = [0f32; 64];
-                    outline.draw(|x, y, a| {
-                        let x = (x as f32 * sx + dx).floor() as i32;
-                        let y = (y as f32 * sy + dy).floor() as i32;
-                        if (0..8).contains(&x) && (0..8).contains(&y) {
-                            let cell = &mut coverage[y as usize * 8 + x as usize];
-                            *cell = cell.max(a);
-                        }
-                    });
-                    let peak = coverage.iter().copied().fold(0.0, f32::max);
-                    if peak > 0.0 {
-                        let threshold = 0.35f32.min(peak * 0.65);
-                        for (i, a) in coverage.into_iter().enumerate() {
-                            if a >= threshold {
-                                bits[i / 8] |= 1 << (i % 8);
-                            }
-                        }
-                    }
-                }
-            } else {
-                bits = bitmap('?').unwrap();
-            }
-            bits
-        });
-        if bits == [0; 8] {
-            return;
-        }
-        let scale = self.pixel_scale;
-        glyph.width = 8 * scale;
-        glyph.height = 8 * scale;
-        glyph
-            .coverage
-            .resize((glyph.width * glyph.height) as usize, 0);
-        for y in 0..glyph.height {
-            for x in 0..glyph.width {
-                if bits[(y / scale) as usize] & (1 << (x / scale)) != 0 {
-                    glyph.coverage[(y * glyph.width + x) as usize] = 255;
-                }
-            }
-        }
     }
 
     #[expect(
@@ -284,12 +161,7 @@ impl FontEngine {
     ) {
         let glyph = self.glyph(ch);
         buffer.push(
-            [
-                x as f32 + glyph.x_offset as f32,
-                y as f32 + glyph.y_offset as f32,
-                glyph.width as f32,
-                glyph.height as f32,
-            ],
+            [x as f32, y as f32, glyph.width as f32, glyph.height as f32],
             [stride as f32, max_height as f32],
             color,
             Some(glyph),
@@ -392,10 +264,11 @@ pub(crate) fn draw_box(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use texted_app::appearance::FontFamily;
     #[test]
-    fn pixel_fallback_keeps_thin_punctuation_visible() {
+    fn native_bitmap_punctuation_stays_visible() {
         let mut font = FontEngine::with_typography(Typography {
-            family: FontFamily::Pixel,
+            family: FontFamily::Bios,
             size_px: 8,
             ..Default::default()
         });
@@ -406,7 +279,7 @@ mod tests {
     #[test]
     fn pixel_ukrainian_capitals_match_bitmap_letter_height() {
         let mut font = FontEngine::with_typography(Typography {
-            family: FontFamily::Pixel,
+            family: FontFamily::Bios,
             size_px: 8,
             ..Default::default()
         });
@@ -435,29 +308,54 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &font.glyph('ї')));
     }
     #[test]
-    fn pixel_glyphs_are_integer_scaled_and_keep_ukrainian_visible() {
-        let mut font = FontEngine::with_typography(Typography {
-            family: FontFamily::Pixel,
-            size_px: 24,
-            line_spacing: 130,
-        });
-        assert_eq!(font.char_width_px, 24.0);
-        assert_eq!(font.line_height_px, 39.0);
-        for ch in "AҐґІіЇїЄє".chars() {
-            let g = font.glyph(ch);
-            assert!(g.coverage.contains(&255), "missing {ch}");
-            assert!(g.coverage.iter().all(|p| *p == 0 || *p == 255));
-            assert_eq!((g.width, g.height), (24, 24));
-            for y in 0..24 {
-                for x in 0..24 {
+    fn every_ukrainian_glyph_retains_exact_native_pixels_at_every_supported_scale() {
+        let alphabet = "АБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯабвгґдеєжзиіїйклмнопрстуфхцчшщьюяʼ’'₴—–…";
+        for family in FontFamily::ALL {
+            let face = bitmap_fonts::face(family);
+            for scale in 1..=64 / face.height {
+                let mut font = FontEngine::with_typography(Typography {
+                    family,
+                    size_px: face.height * scale,
+                    line_spacing: 130,
+                });
+                assert_eq!(font.char_width_px, f32::from(face.width * scale));
+                assert_eq!(
+                    font.line_height_px,
+                    (f32::from(face.height * scale) * 1.3).ceil()
+                );
+                for ch in alphabet.chars() {
+                    let rows = face.glyph(ch).unwrap();
+                    let g = font.glyph(ch);
                     assert_eq!(
-                        g.coverage[y * 24 + x],
-                        g.coverage[(y / 3 * 3) * 24 + x / 3 * 3]
+                        (g.width, g.height),
+                        (
+                            u32::from(face.width * scale),
+                            u32::from(face.height * scale)
+                        )
                     );
+                    for y in 0..g.height {
+                        for x in 0..g.width {
+                            let expected = if rows[(y / u32::from(scale)) as usize]
+                                & (0x80 >> (x / u32::from(scale)))
+                                != 0
+                            {
+                                255
+                            } else {
+                                0
+                            };
+                            assert_eq!(
+                                g.coverage[(y * g.width + x) as usize],
+                                expected,
+                                "{} {ch} scale {scale}",
+                                family.name()
+                            );
+                        }
+                    }
                 }
+                assert_eq!(font.glyph(' ').width, 0);
+                assert_eq!(font.glyph('🦔').coverage, font.glyph('\u{fffd}').coverage);
             }
         }
-        assert_eq!(font.glyph(' ').width, 0);
     }
     #[test]
     fn every_typography_uses_the_same_geometry_for_text_caret_and_hit_testing() {

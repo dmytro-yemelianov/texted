@@ -4,7 +4,7 @@ use crate::{
     graphics::{draw_box, draw_rect, DrawList, FontEngine},
 };
 use texted_app::{
-    appearance::{Appearance, FontFamily, Palette, Theme, Typography},
+    appearance::{Appearance, FontFamily, Palette, Theme},
     framebuffer::Framebuffer,
     input::KeyInput,
 };
@@ -145,25 +145,12 @@ pub(crate) struct AppearanceUi {
     pub open: bool,
     pub save_status: String,
     focus: usize,
-    available: [bool; 4],
     dropdown: Option<Dropdown>,
 }
 impl AppearanceUi {
-    pub fn new(mut settings: Appearance, available: [bool; 4]) -> Self {
-        for typography in [&mut settings.typography, &mut settings.pixel_typography] {
-            if !available[FontFamily::ALL
-                .iter()
-                .position(|f| *f == typography.family)
-                .unwrap()]
-            {
-                typography.family = FontFamily::ALL
-                    .iter()
-                    .zip(available)
-                    .find(|(_, a)| *a)
-                    .map_or(FontFamily::Pixel, |(f, _)| *f);
-            }
-            typography.normalize();
-        }
+    pub fn new(mut settings: Appearance) -> Self {
+        settings.typography.normalize();
+        settings.pixel_typography.normalize();
         let palette = settings
             .palette()
             .expect("Appearance was validated at load");
@@ -173,7 +160,6 @@ impl AppearanceUi {
             open: false,
             save_status: "Changes save automatically".into(),
             focus: 0,
-            available,
             dropdown: None,
         }
     }
@@ -206,25 +192,13 @@ impl AppearanceUi {
                 .collect(),
             2 => FontFamily::ALL
                 .into_iter()
-                .zip(self.available)
-                .map(|(v, enabled)| Choice {
-                    label: if enabled {
-                        v.name().into()
-                    } else {
-                        format!("{} (unavailable)", v.name())
-                    },
-                    value: Value::Font(v),
-                    enabled,
-                })
+                .map(|v| Choice::new(v.name().into(), Value::Font(v)))
                 .collect(),
             row => {
                 let t = self.settings.editor_typography();
                 let mut numbers: Vec<u16> = if row == 3 {
-                    if t.family == FontFamily::Pixel {
-                        (8..=40).step_by(8).collect()
-                    } else {
-                        (8..=40).collect()
-                    }
+                    let height = t.family.cell().1;
+                    (height..=64).step_by(usize::from(height)).collect()
                 } else {
                     (100..=180).step_by(10).collect()
                 };
@@ -339,11 +313,7 @@ impl AppearanceUi {
     }
     pub fn reset_size(&mut self) {
         self.dropdown = None;
-        let size = if self.settings.resolution().is_some() {
-            8
-        } else {
-            Typography::default().size_px
-        };
+        let size = self.settings.editor_typography().family.cell().1;
         let t = self.settings.editor_typography_mut();
         t.size_px = size;
         t.normalize();
@@ -383,7 +353,7 @@ impl AppearanceUi {
             Some(Hit::Reset) => {
                 let open = self.open;
                 let status = self.save_status.clone();
-                *self = Self::new(Appearance::default(), self.available);
+                *self = Self::new(Appearance::default());
                 self.open = open;
                 self.save_status = status;
             }
@@ -794,7 +764,7 @@ mod tests {
     fn browsing_and_cancelling_a_list_preserves_values_and_custom_colors() {
         let mut settings = Appearance::default();
         settings.colors.insert("text".into(), "#ABCDEF".into());
-        let mut ui = AppearanceUi::new(settings, [true; 4]);
+        let mut ui = AppearanceUi::new(settings);
         ui.set_open(true);
         let original = ui.settings.clone();
         let r = Panel::new(980, 700, false).row(0);
@@ -818,32 +788,26 @@ mod tests {
         assert!(ui.dropdown.is_none());
     }
     #[test]
-    fn disabled_fonts_cannot_be_clicked_and_keyboard_selection_skips_them() {
-        let mut ui = AppearanceUi::new(Appearance::default(), [true, false, false, true]);
-        ui.set_open(true);
-        ui.open_dropdown(2, 980, 700, false);
-        let d = ui.dropdown.unwrap();
+    fn every_bundled_face_is_selectable_and_sizes_are_native_integer_multiples() {
+        let mut ui = AppearanceUi::new(Appearance::default());
         let choices = ui.choices(2);
-        let popup = ui.popup(d, 980, 700, false, &choices);
-        let row = popup.row(1, d.first).unwrap();
-        ui.click(980, 700, (row.x + 10) as f32, (row.y + 10) as f32, false);
-        assert_eq!(ui.settings.typography.family, FontFamily::Courier);
-        assert!(ui.dropdown.is_some());
-        press(&mut ui, NamedKey::ArrowDown, false);
-        assert_eq!(ui.dropdown.unwrap().highlighted, 3);
-        assert_eq!(ui.settings.typography.family, FontFamily::Courier);
-        press(&mut ui, NamedKey::Enter, false);
-        assert_eq!(ui.settings.typography.family, FontFamily::Pixel);
+        assert_eq!(choices.len(), 5);
+        for choice in choices {
+            assert!(choice.enabled);
+            ui.choose(&choice);
+            let family = ui.settings.typography.family;
+            let sizes = ui.choices(3);
+            assert!(sizes
+                .iter()
+                .all(|c| matches!(c.value,Value::Size(v) if v % family.cell().1 == 0 && v<=64)));
+        }
     }
     #[test]
     fn compact_lists_commit_clicked_values_and_outside_clicks_dismiss_only_the_list() {
-        let mut ui = AppearanceUi::new(
-            Appearance {
-                theme: Theme::C64,
-                ..Default::default()
-            },
-            [true; 4],
-        );
+        let mut ui = AppearanceUi::new(Appearance {
+            theme: Theme::C64,
+            ..Default::default()
+        });
         ui.set_open(true);
         ui.open_dropdown(1, 256, 192, true);
         let d = ui.dropdown.unwrap();
@@ -863,29 +827,16 @@ mod tests {
         assert!(ui.dropdown.is_none());
     }
     #[test]
-    fn long_size_lists_scroll_and_keyboard_navigation_reveals_and_commits_the_last_value() {
-        let mut ui = AppearanceUi::new(
-            Appearance {
-                theme: Theme::C64,
-                ..Default::default()
-            },
-            [true; 4],
-        );
-        ui.settings.pixel_typography.family = FontFamily::Courier;
+    fn font_size_list_commits_a_valid_native_scale() {
+        let mut ui = AppearanceUi::new(Appearance {
+            theme: Theme::C64,
+            ..Default::default()
+        });
         ui.open_dropdown(3, 256, 192, true);
-        ui.wheel(100.0, 256, 192, true);
-        let d = ui.dropdown.unwrap();
-        let choices = ui.choices(3);
-        let popup = ui.popup(d, 256, 192, true, &choices);
-        assert_eq!(d.first + popup.visible, choices.len());
-        assert_eq!(ui.settings.pixel_typography.size_px, 8);
         press(&mut ui, NamedKey::End, true);
-        press(&mut ui, NamedKey::PageDown, true);
-        let d = ui.dropdown.unwrap();
-        assert_eq!(d.highlighted, choices.len() - 1);
-        assert!(popup.row(d.highlighted, d.first).is_some());
         press(&mut ui, NamedKey::Enter, true);
-        assert_eq!(ui.settings.pixel_typography.size_px, 40);
+        assert_eq!(ui.settings.pixel_typography.size_px, 64);
+        assert!(ui.dropdown.is_none());
     }
     #[test]
     fn compact_panel_controls_fit_the_smallest_canvas_and_share_hit_geometry() {
@@ -915,12 +866,12 @@ mod tests {
     }
     #[test]
     fn palette_and_typography_controls_are_independent_and_pixel_sizes_are_integral() {
-        let mut ui = AppearanceUi::new(Appearance::default(), [true; 4]);
+        let mut ui = AppearanceUi::new(Appearance::default());
         let typography = ui.settings.typography;
         ui.choose(&Choice::new("C64".into(), Value::Theme(Theme::C64)));
         assert_eq!(ui.settings.theme, Theme::C64);
         assert_eq!(ui.settings.typography, typography);
-        assert_eq!(ui.settings.editor_typography().family, FontFamily::Pixel);
+        assert_eq!(ui.settings.editor_typography().family, FontFamily::Bios);
         assert_eq!(ui.settings.editor_typography().size_px, 8);
         ui.zoom(1);
         assert_eq!(ui.settings.editor_typography().size_px, 16);
@@ -928,12 +879,12 @@ mod tests {
         assert_eq!(ui.settings.theme, Theme::C64);
     }
     #[test]
-    fn keyboard_panel_consumes_text_without_touching_settings_and_skips_unavailable_fonts() {
-        let mut ui = AppearanceUi::new(Appearance::default(), [true, false, false, true]);
+    fn keyboard_panel_consumes_text_without_touching_settings() {
+        let mut ui = AppearanceUi::new(Appearance::default());
         ui.open_dropdown(2, 980, 700, false);
         press(&mut ui, NamedKey::End, false);
         press(&mut ui, NamedKey::Enter, false);
-        assert_eq!(ui.settings.typography.family, FontFamily::Pixel);
+        assert_eq!(ui.settings.typography.family, FontFamily::Spleen);
         let old = ui.settings.clone();
         ui.key(
             &KeyInput {

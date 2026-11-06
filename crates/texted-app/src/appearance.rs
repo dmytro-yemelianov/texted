@@ -192,24 +192,41 @@ impl Palette {
 #[serde(rename_all = "snake_case")]
 pub enum FontFamily {
     #[default]
-    Courier,
-    Menlo,
-    Monaco,
-    Pixel,
+    #[serde(rename = "vga_8x16", alias = "courier")]
+    Vga,
+    #[serde(rename = "bios_8x8", alias = "pixel")]
+    Bios,
+    #[serde(rename = "ega_8x14")]
+    Ega,
+    #[serde(rename = "spleen_6x12", alias = "monaco")]
+    SpleenSmall,
+    #[serde(rename = "spleen_8x16", alias = "menlo")]
+    Spleen,
 }
 impl FontFamily {
-    pub const ALL: [Self; 4] = [Self::Courier, Self::Menlo, Self::Monaco, Self::Pixel];
+    pub const ALL: [Self; 5] = [
+        Self::Bios,
+        Self::Ega,
+        Self::Vga,
+        Self::SpleenSmall,
+        Self::Spleen,
+    ];
     pub fn name(self) -> &'static str {
         match self {
-            Self::Courier => "Courier New",
-            Self::Menlo => "Menlo",
-            Self::Monaco => "Monaco",
-            Self::Pixel => "Pixel 8x8",
+            Self::Bios => "IBM BIOS 8x8",
+            Self::Ega => "IBM EGA 8x14",
+            Self::Vga => "IBM VGA 8x16",
+            Self::SpleenSmall => "Spleen 6x12",
+            Self::Spleen => "Spleen 8x16",
         }
     }
-    pub fn step(self, delta: i32) -> Self {
-        let i = Self::ALL.iter().position(|v| *v == self).unwrap();
-        Self::ALL[(i as i32 + delta).rem_euclid(4) as usize]
+    pub fn cell(self) -> (u16, u16) {
+        match self {
+            Self::Bios => (8, 8),
+            Self::Ega => (8, 14),
+            Self::Vga | Self::Spleen => (8, 16),
+            Self::SpleenSmall => (6, 12),
+        }
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,27 +239,22 @@ pub struct Typography {
 impl Default for Typography {
     fn default() -> Self {
         Self {
-            family: FontFamily::Courier,
-            size_px: 18,
+            family: FontFamily::Vga,
+            size_px: 16,
             line_spacing: 100,
         }
     }
 }
 impl Typography {
     pub fn normalize(&mut self) {
-        self.size_px = self.size_px.clamp(8, 40);
+        let height = self.family.cell().1;
+        self.size_px = ((self.size_px.clamp(height, 64) + height / 2) / height * height)
+            .clamp(height, 64 / height * height);
         self.line_spacing = self.line_spacing.clamp(100, 180);
-        if self.family == FontFamily::Pixel {
-            self.size_px = ((self.size_px + 4) / 8 * 8).clamp(8, 40);
-        }
     }
     pub fn resize(&mut self, delta: i32) {
-        let step = if self.family == FontFamily::Pixel {
-            8
-        } else {
-            2
-        };
-        self.size_px = (i32::from(self.size_px) + delta * step).clamp(8, 40) as u16;
+        let height = i32::from(self.family.cell().1);
+        self.size_px = (i32::from(self.size_px) + delta * height).clamp(height, 64) as u16;
         self.normalize();
     }
 }
@@ -265,7 +277,7 @@ impl Default for Appearance {
             typography: Typography::default(),
             framebuffer: Framebuffer::default(),
             pixel_typography: Typography {
-                family: FontFamily::Pixel,
+                family: FontFamily::Bios,
                 size_px: 8,
                 line_spacing: 100,
             },
@@ -319,6 +331,37 @@ impl Appearance {
 mod tests {
     use super::*;
     #[test]
+    fn legacy_outline_preferences_migrate_to_bundled_faces_and_valid_native_sizes() {
+        for (old, family) in [
+            ("courier", FontFamily::Vga),
+            ("menlo", FontFamily::Spleen),
+            ("monaco", FontFamily::SpleenSmall),
+            ("pixel", FontFamily::Bios),
+        ] {
+            let mut t: Typography =
+                serde_json::from_value(serde_json::json!({"family":old,"size_px":18})).unwrap();
+            t.normalize();
+            assert_eq!(t.family, family);
+            assert_eq!(t.size_px % family.cell().1, 0);
+            assert_ne!(serde_json::to_value(t).unwrap()["family"], old);
+        }
+        for family in FontFamily::ALL {
+            for size_px in 0..=u16::MAX {
+                let mut t = Typography {
+                    family,
+                    size_px,
+                    line_spacing: 100,
+                };
+                t.normalize();
+                assert!((family.cell().1..=64).contains(&t.size_px));
+                assert_eq!(t.size_px % family.cell().1, 0);
+                let before = t;
+                t.normalize();
+                assert_eq!(before, t);
+            }
+        }
+    }
+    #[test]
     fn existing_preferences_get_auto_resolution_and_isolated_pixel_typography() {
         let mut a: Appearance = serde_json::from_str(
             r#"{"version":1,"theme":"zx_spectrum","typography":{"family":"menlo","size_px":24}}"#,
@@ -328,7 +371,7 @@ mod tests {
         let native = a.typography;
         assert_eq!(a.resolution(), Some((256, 192)));
         assert_eq!(a.editor_typography().size_px, 8);
-        assert_eq!(a.editor_typography().family, FontFamily::Pixel);
+        assert_eq!(a.editor_typography().family, FontFamily::Bios);
         a.editor_typography_mut().resize(1);
         a.framebuffer = Framebuffer::Native;
         assert_eq!(a.editor_typography(), native);
@@ -343,7 +386,7 @@ mod tests {
         let mut a = Appearance {
             theme: Theme::C64,
             typography: Typography {
-                family: FontFamily::Pixel,
+                family: FontFamily::Bios,
                 size_px: 19,
                 ..Default::default()
             },

@@ -56,6 +56,17 @@ def build_icon(destination, work):
     run("iconutil", "-c", "icns", iconset, "-o", destination)
 
 
+def verify_font_resources(resources):
+    fonts = resources / "fonts"
+    # Ship the complete reproducible source/attribution set, also after ZIP restoration.
+    for source in (ROOT / "assets/fonts").rglob("*"):
+        if source.is_file():
+            relative = source.relative_to(ROOT / "assets/fonts")
+            delivered = fonts / relative
+            if not delivered.is_file() or delivered.read_bytes() != source.read_bytes():
+                raise ValueError(f"Missing or changed bundled font resource: {relative}")
+
+
 def verify_bundle(app):
     with (app / "Contents/Info.plist").open("rb") as source:
         info = plistlib.load(source)
@@ -66,6 +77,7 @@ def verify_bundle(app):
         raise ValueError("Expected both arm64 and x86_64 in the universal executable")
     if not (app / "Contents/Resources" / info["CFBundleIconFile"]).is_file():
         raise ValueError("Bundle icon is missing")
+    verify_font_resources(app / "Contents/Resources")
     run("plutil", "-lint", app / "Contents/Info.plist")
     run("codesign", "--verify", "--deep", "--strict", app)
     expected = "Texted " + info["TextedVersion"]
@@ -121,6 +133,7 @@ def package(output, tag=None):
         (resources / "build-info.json").write_text(manifest_text)
         for name in ("LICENSE-MIT", "LICENSE-APACHE"):
             shutil.copy2(ROOT / name, resources / name)
+        shutil.copytree(ROOT / "assets/fonts", resources / "fonts")
         # Give arm64 executables a valid local signature after lipo assembles the two slices.
         run("codesign", "--force", "--sign", "-", "--timestamp=none", app)
         verify_bundle(app)
