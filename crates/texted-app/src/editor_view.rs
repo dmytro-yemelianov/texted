@@ -228,7 +228,7 @@ fn paint_text(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewM
         show_line_numbers,
         ..
     } = *model;
-    // 7. Render Visible Lines (with antialiased Ukrainian font support)
+    // 7. Render visible lines using the selected native bitmap strike.
     for line in &layout.visible_lines {
         let y_int = line.y_px as usize;
         if y_int + (font_engine.line_height_px as usize) > text_height {
