@@ -2,7 +2,6 @@
 use crate::{
     graphics::{draw_box, draw_rect, DrawList, FontEngine},
     horizontal_scroll::{Scrollbar, BAR_HEIGHT},
-    palette::*,
     search_ui::{CLOSE_X, NEXT_X, PANEL_WIDTH, PREVIOUS_X},
 };
 use std::time::{Duration, Instant};
@@ -14,6 +13,7 @@ use texted_buffer::BufferSnapshot;
 use texted_io::LineEnding;
 use texted_layout::{ViewportConfig, ViewportLayout};
 pub(crate) struct ViewModel<'a> {
+    pub palette: &'a texted_app::appearance::Palette,
     pub snap: &'a BufferSnapshot,
     pub layout: &'a ViewportLayout,
     pub config: &'a ViewportConfig,
@@ -38,17 +38,22 @@ pub(crate) struct ViewModel<'a> {
     pub frame_start: Instant,
     pub layout_time: Duration,
 }
-pub(crate) fn paint(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewModel<'_>) {
-    buffer.reset(COLOR_BG);
+pub(crate) fn paint(
+    buffer: &mut DrawList,
+    font_engine: &mut FontEngine,
+    ui_font: &mut FontEngine,
+    model: &ViewModel<'_>,
+) {
+    buffer.reset(model.palette.bg);
     paint_gutter(buffer, model);
     paint_search(buffer, model);
     paint_selection(buffer, font_engine, model);
     paint_text(buffer, font_engine, model);
     paint_caret(buffer, font_engine, model);
-    paint_search_bar(buffer, font_engine, model);
-    paint_status(buffer, font_engine, model);
+    paint_search_bar(buffer, ui_font, model);
+    paint_status(buffer, ui_font, model);
     if model.show_perf_hud {
-        paint_hud(buffer, font_engine, model);
+        paint_hud(buffer, ui_font, model);
     }
 }
 fn paint_gutter(buffer: &mut DrawList, model: &ViewModel<'_>) {
@@ -70,7 +75,7 @@ fn paint_gutter(buffer: &mut DrawList, model: &ViewModel<'_>) {
             0,
             gutter_width_int,
             height.saturating_sub(28),
-            COLOR_GUTTER_BG,
+            model.palette.gutter_bg,
         );
         draw_rect(
             buffer,
@@ -80,7 +85,7 @@ fn paint_gutter(buffer: &mut DrawList, model: &ViewModel<'_>) {
             0,
             1,
             height.saturating_sub(28),
-            COLOR_GUTTER_BORDER,
+            model.palette.gutter_border,
         );
     }
 }
@@ -106,9 +111,9 @@ fn paint_search(buffer: &mut DrawList, model: &ViewModel<'_>) {
             rect.width.round() as usize,
             rect.height as usize,
             if highlight.active {
-                COLOR_SEARCH_ACTIVE
+                model.palette.search_active
             } else {
-                COLOR_SEARCH_MATCH
+                model.palette.search_match
             },
         );
     }
@@ -150,7 +155,7 @@ fn paint_selection(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &
                         row_y + 2,
                         sel_w,
                         font_engine.line_height_px as usize,
-                        COLOR_BLOCK_SELECTION,
+                        model.palette.block_selection,
                     );
                 }
             }
@@ -202,7 +207,7 @@ fn paint_selection(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &
                             row_y + 2,
                             sel_w,
                             font_engine.line_height_px as usize,
-                            COLOR_SELECTION,
+                            model.palette.selection,
                         );
                     }
                 }
@@ -239,7 +244,7 @@ fn paint_text(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewM
                 10,
                 y_int + 2,
                 &num_str,
-                COLOR_GUTTER_TEXT,
+                model.palette.gutter_text,
             );
         }
 
@@ -251,7 +256,7 @@ fn paint_text(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewM
             text_start_x,
             y_int + 2,
             &line.text,
-            COLOR_TEXT,
+            model.palette.text,
         );
     }
 }
@@ -280,7 +285,7 @@ fn paint_caret(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &View
                 cy,
                 2,
                 font_engine.line_height_px as usize,
-                COLOR_CARET,
+                model.palette.caret,
             );
         }
     }
@@ -294,7 +299,7 @@ fn paint_caret(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &View
             bar.track.y as usize,
             bar.track.width as usize,
             BAR_HEIGHT,
-            COLOR_GUTTER_BG,
+            model.palette.gutter_bg,
         );
         draw_rect(
             buffer,
@@ -304,7 +309,7 @@ fn paint_caret(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &View
             bar.thumb.y as usize,
             bar.thumb.width.round() as usize,
             bar.thumb.height as usize,
-            COLOR_GUTTER_TEXT,
+            model.palette.gutter_text,
         );
     }
 }
@@ -326,11 +331,11 @@ fn input_box(
         y,
         w,
         h,
-        COLOR_INPUT_BG,
+        model.palette.input_bg,
         if active {
-            COLOR_INPUT_ACTIVE
+            model.palette.input_active
         } else {
-            COLOR_INPUT_BORDER
+            model.palette.input_border
         },
     );
     font_engine.draw_string(
@@ -340,7 +345,7 @@ fn input_box(
         x + 5,
         y + 3,
         text,
-        COLOR_TEXT,
+        model.palette.text,
     );
     if active && model.caret_visible {
         let max_chars = (w.saturating_sub(9) as f32 / font_engine.char_width_px).ceil() as usize;
@@ -355,7 +360,7 @@ fn input_box(
                 y + 4,
                 2,
                 h - 8,
-                COLOR_CARET,
+                model.palette.caret,
             );
         }
     }
@@ -377,8 +382,8 @@ fn button(
         y,
         w,
         24,
-        COLOR_BUTTON_BG,
-        COLOR_BUTTON_BORDER,
+        model.palette.button_bg,
+        model.palette.button_border,
     );
     font_engine.draw_string(
         buffer,
@@ -387,7 +392,7 @@ fn button(
         x + padding,
         y + 3,
         label,
-        COLOR_TEXT,
+        model.palette.text,
     );
 }
 fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewModel<'_>) {
@@ -415,8 +420,8 @@ fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: 
         panel_y,
         PANEL_WIDTH,
         panel_h,
-        COLOR_PANEL_BG,
-        COLOR_PANEL_BORDER,
+        model.palette.panel_bg,
+        model.palette.panel_border,
     );
     let input_x = panel_x + 50;
     let input_y = panel_y + 6;
@@ -427,7 +432,7 @@ fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: 
         panel_x + 8,
         input_y + 3,
         "Find:",
-        COLOR_STATUS_TEXT,
+        model.palette.status_text,
     );
     input_box(
         buffer,
@@ -444,7 +449,7 @@ fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: 
         input_x + 168,
         input_y + 3,
         &search_state.label(),
-        COLOR_STATUS_TEXT,
+        model.palette.status_text,
     );
     button(
         buffer,
@@ -469,7 +474,7 @@ fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: 
         panel_x + CLOSE_X,
         input_y + 3,
         "X",
-        COLOR_GUTTER_TEXT,
+        model.palette.gutter_text,
     );
     if search_state.mode == SearchBarMode::Replace {
         let y = panel_y + 36;
@@ -480,7 +485,7 @@ fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: 
             panel_x + 8,
             y + 3,
             "Repl:",
-            COLOR_STATUS_TEXT,
+            model.palette.status_text,
         );
         input_box(
             buffer,
@@ -526,7 +531,7 @@ fn paint_status(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &Vie
         status_y,
         width,
         1,
-        COLOR_STATUS_BORDER,
+        model.palette.status_border,
     );
     draw_rect(
         buffer,
@@ -536,7 +541,7 @@ fn paint_status(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &Vie
         status_y + 1,
         width,
         27,
-        COLOR_STATUS_BG,
+        model.palette.status_bg,
     );
 
     let status_mode = match selection.mode {
@@ -576,20 +581,21 @@ fn paint_status(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &Vie
     );
 
     let status_color = if selection.mode == SelectionMode::Block {
-        COLOR_STATUS_ACCENT
+        model.palette.status_accent
     } else {
-        COLOR_STATUS_TEXT
+        model.palette.status_text
     };
 
     font_engine.draw_string(
         buffer,
-        width,
+        width.saturating_sub(100),
         height,
         8,
         status_y + 5,
         &status_text,
         status_color,
     );
+    crate::appearance_ui::paint_status_button(buffer, font_engine, width, height, model.palette);
 }
 
 fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewModel<'_>) {
@@ -609,9 +615,25 @@ fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewMo
     let hud_y = 12usize;
 
     draw_rect(
-        buffer, width, height, hud_x, hud_y, hud_w, hud_h, 0xEE1A1A1A,
+        buffer,
+        width,
+        height,
+        hud_x,
+        hud_y,
+        hud_w,
+        hud_h,
+        model.palette.panel_bg,
     );
-    draw_rect(buffer, width, height, hud_x, hud_y, hud_w, 1, 0xFF3E3E3E);
+    draw_rect(
+        buffer,
+        width,
+        height,
+        hud_x,
+        hud_y,
+        hud_w,
+        1,
+        model.palette.panel_border,
+    );
     draw_rect(
         buffer,
         width,
@@ -620,9 +642,18 @@ fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewMo
         hud_y + hud_h - 1,
         hud_w,
         1,
-        0xFF3E3E3E,
+        model.palette.panel_border,
     );
-    draw_rect(buffer, width, height, hud_x, hud_y, 1, hud_h, 0xFF3E3E3E);
+    draw_rect(
+        buffer,
+        width,
+        height,
+        hud_x,
+        hud_y,
+        1,
+        hud_h,
+        model.palette.panel_border,
+    );
     draw_rect(
         buffer,
         width,
@@ -631,7 +662,7 @@ fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewMo
         hud_y,
         1,
         hud_h,
-        0xFF3E3E3E,
+        model.palette.panel_border,
     );
 
     let cur_frame_time = frame_start.elapsed();
@@ -647,7 +678,15 @@ fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewMo
     let l4 = format!("Doc bytes   : {} B", snap.total_bytes);
     let l5 = "Snapshot: shared rope".to_string();
 
-    font_engine.draw_string(buffer, width, height, hud_x + 10, hud_y + 6, l1, 0xFF569CD6);
+    font_engine.draw_string(
+        buffer,
+        width,
+        height,
+        hud_x + 10,
+        hud_y + 6,
+        l1,
+        model.palette.status_accent,
+    );
     font_engine.draw_string(
         buffer,
         width,
@@ -655,7 +694,7 @@ fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewMo
         hud_x + 10,
         hud_y + 24,
         &l2,
-        0xFF4EC9B0,
+        model.palette.text,
     );
     font_engine.draw_string(
         buffer,
@@ -664,7 +703,7 @@ fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewMo
         hud_x + 10,
         hud_y + 42,
         &l3,
-        0xFFDCDCAA,
+        model.palette.text,
     );
     font_engine.draw_string(
         buffer,
@@ -673,7 +712,7 @@ fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewMo
         hud_x + 10,
         hud_y + 60,
         &l4,
-        0xFFCCCCCC,
+        model.palette.text,
     );
     font_engine.draw_string(
         buffer,
@@ -682,7 +721,7 @@ fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewMo
         hud_x + 10,
         hud_y + 78,
         &l5,
-        0xFF9CDCFE,
+        model.palette.text,
     );
     font_engine.draw_string(
         buffer,
@@ -691,7 +730,7 @@ fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewMo
         hud_x + 10,
         hud_y + 96,
         gpu_name,
-        0xFF9CDCFE,
+        model.palette.text,
     );
 }
 
