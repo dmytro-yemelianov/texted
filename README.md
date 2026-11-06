@@ -50,7 +50,7 @@ Development builds include native **Texted / File / Edit / Search / View / Windo
 
 Physical letter keys keep shortcuts working with Ukrainian keyboard layouts. Wrapping currently breaks at character-cell boundaries. Text uses character columns rather than grapheme clusters or shaped display cells; complex-script shaping and IME composition remain future work. No-wrap mode supports the trackpad horizontal axis, Shift+wheel, scrollbar dragging and page clicks. Navigation and typing keep the caret visible; manual scrolling leaves its document position unchanged.
 
-The status bar counts Unicode scalar values and reports UTF-8 buffer bytes. The byte count excludes the BOM and uses normalized LF, so it can differ from the saved file's size. Encoding and line-ending labels describe the save format.
+In Native mode, the status bar counts Unicode scalar values and reports UTF-8 buffer bytes. The byte count excludes the BOM and uses normalized LF, so it can differ from the saved file's size. Encoding and line-ending labels describe the save format.
 
 ## Themes and typography
 
@@ -58,7 +58,9 @@ Available in `main` development builds; the published v0.2.0 preview predates th
 
 Appearance offers Modern Dark/Light, VGA, EGA, Atari, Commander, C64, ZX Spectrum, Amber and Green CRT palettes. The theme applies to the document, selection/search highlights, gutter, status, search and appearance panels. Palettes and editor fonts are independent.
 
-Open **Style** in the status bar or press **Cmd+,**. Use the row arrows, or Tab/Shift+Tab to select a field and Left/Right to change it. Changes apply immediately; Escape/Done closes the panel. Choose Courier New, Menlo, Monaco or Pixel 8x8, an 8–40 px editor size and 100–180% line height. Pixel mode uses integer 8 px steps and a nearest-neighbor bitmap; Ukrainian and other non-bitmap characters use a pixel-rasterized system-font fallback. UI labels keep a separate fixed size. Settings do not edit the document or its undo history.
+Open **Style** in the status bar or press **Cmd+,**. Use the row arrows, or Tab/Shift+Tab to select a field and Left/Right to change it. Changes apply immediately; Escape/Done closes the panel. Choose Courier New, Menlo, Monaco or Pixel 8x8, an 8–40 px editor size and 100–180% line height. The Pixel font uses integer 8 px steps and a nearest-neighbor bitmap; Ukrainian and other non-bitmap characters use a pixel-rasterized system-font fallback. UI labels use a separate font: 18 px in Native mode and an 8 px bitmap inside framebuffers. Settings do not edit the document or its undo history.
+
+Style also offers a **Screen / Resolution** row. **Auto (theme)** renders retro palettes into a real limited-resolution framebuffer: VGA 640×480, EGA 640×350, Atari/C64 320×200, Commander 720×400, ZX Spectrum 256×192, and monochrome 720×350. Modern themes stay native. Choose **Native** for a full-resolution palette, or select an explicit raster independently of the theme. The complete in-app scene uses nearest-texel integer scaling and letterboxing; small windows fit the canvas with nearest sampling. Compact Style/search/status controls remain usable at 256×192. Native and framebuffer typography are saved separately; framebuffers start with Pixel 8x8 at 8 px. See [framebuffer behavior and reference platforms](docs/framebuffer.md).
 
 Preferences save atomically in the background to `~/Library/Application Support/Texted/appearance.json`. The latest accepted settings are flushed on normal exit. An invalid or newer-version file is left intact; the app uses session-only defaults and reports the load error. `TEXTED_SETTINGS_PATH` selects an alternate file for isolated previews.
 
@@ -68,12 +70,14 @@ For custom colors, edit that file while Texted is closed; for example:
 {
   "version": 1,
   "theme": "c64",
+  "framebuffer": "auto",
+  "pixel_typography": { "family": "pixel", "size_px": 8, "line_spacing": 100 },
   "typography": { "family": "menlo", "size_px": 18, "line_spacing": 120 },
   "colors": { "text": "#E8DCFF", "selection": "#6454A0" }
 }
 ```
 
-Optional `colors` keys are `bg`, `text`, `caret`, `selection`, `block_selection`, `search_match`, `search_active`, `gutter_bg`, `gutter_border`, `gutter_text`, `panel_bg`, `panel_border`, `input_bg`, `input_border`, `input_active`, `button_bg`, `button_border`, `status_bg`, `status_border`, `status_text`, and `status_accent`. Values must be `#RRGGBB`; unknown keys are rejected. Selecting another palette clears color overrides; typography changes retain them. Reset defaults restores the built-in appearance. Unavailable font families fall back to an available face. This feature adds static themes and typography; shader effects are a separate future change.
+Optional `colors` keys are `bg`, `text`, `caret`, `selection`, `block_selection`, `search_match`, `search_active`, `gutter_bg`, `gutter_border`, `gutter_text`, `panel_bg`, `panel_border`, `input_bg`, `input_border`, `input_active`, `button_bg`, `button_border`, `status_bg`, `status_border`, `status_text`, and `status_accent`. Values must be `#RRGGBB`; unknown keys are rejected. Selecting another palette clears color overrides; typography changes retain them. Reset defaults restores the built-in appearance. Unavailable font families fall back to an available face. Fixed framebuffers use a nearest-texel presentation pass. CRT effects remain a separate future change.
 
 ## Validation
 
@@ -82,7 +86,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 # Hardware rendering test, explicitly run on a Mac with a Metal GPU:
-cargo test -p texted-app metal_renders_clipping_alpha_and_paint_order -- --ignored --nocapture
+cargo test -p texted-app metal_ -- --ignored --nocapture
 cargo run --release --bin bench
 cargo run --release --bin bench -- --hardening
 ```

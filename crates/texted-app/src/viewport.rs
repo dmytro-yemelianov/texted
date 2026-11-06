@@ -114,12 +114,15 @@ impl Viewport {
         font: &FontEngine,
         width: usize,
         height: usize,
+        compact: bool,
     ) -> Frame {
         if self.blink.elapsed() >= Duration::from_millis(500) {
             self.caret = !self.caret;
             self.blink = Instant::now();
         }
-        let text_height = height.saturating_sub(28 + if self.wrap { 0 } else { BAR_HEIGHT });
+        let text_height = height.saturating_sub(
+            (if compact { 14 } else { 28 }) + if self.wrap { 0 } else { BAR_HEIGHT },
+        );
         let (cur_line, cur_col) = snap.offset_to_line_col(snap.cursor_offset);
         let visible_rows = (text_height as f32 / font.line_height_px).floor() as usize;
         let snap_horizontal = self.snap;

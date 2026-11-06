@@ -16,6 +16,10 @@ A0–A11 are implemented. The [results](docs/performance-hardening-results.md) r
 
 The `feat/native-menus` branch adds macOS application menus (Texted, File, Edit, Search, View, Window) and a document context menu (right-click / Shift+F10). `menus.rs` owns native items and their enable/check state; callbacks send `AppEvent::Menu` into the existing typed intent path. `context_menu.rs` owns selection hit rules and the pending invocation value. The shell waits for accepted commands before testing the selection or positioning the caret, and cancels a popup request if newer input, document identity or modal state makes it obsolete. Published snapshots now include undo/redo availability. Clipboard and file barriers remain authoritative. winit's default menu and automatic window tabbing are disabled because this is a single-document editor. Local validation: 99 Rust tests, Clippy, formatting, two packaging tests and the explicit Metal test passed. Native checks covered both popup entry points, selection preservation, context deletion and undo, history enablement, Style, single-dispatch Cmd+L and saving an exact UTF-8 fixture. These changes are development-only; no release tag was created.
 
+## Platform framebuffers
+
+`feat/platform-framebuffer` builds on the native-menu branch and adds real fixed-resolution GPU canvases. Style's Screen/Resolution row defaults to Auto by theme, with Native and explicit platform presets. `framebuffer.rs` owns bounded resolutions and presentation/input transforms; `presentation.rs` caches one GPU texture and presents exact texels, with integer scaling and letterboxing. The last successful frame's transform governs clicks, drags, pixel-wheel events and context-menu positions. Compact Style/search/status controls fit the smallest 256×192 canvas. Existing version-1 preferences load with Auto and separate 8 px pixel typography; native typography stays intact. See [framebuffer details and primary references](docs/framebuffer.md). Local validation passed 105 Rust tests, Clippy, formatting, two packaging tests and both explicit Metal tests. Native checks confirmed C64/ZX raster changes, Native bypass, compact controls, pointer mapping, restart persistence and unchanged document bytes. No release tag is created.
+
 ## Component map
 
 | Component | Owner / invariant |
@@ -29,6 +33,7 @@ The `feat/native-menus` branch adds macOS application menus (Texted, File, Edit,
 | `clipboard.rs`, `transfers.rs` | Snapshot extraction and child I/O off UI; invocation barrier, write-before-cut and context-fenced completion |
 | `documents.rs`, `file_flow.rs` | Native async sheets, background file I/O, saved-root dirty state, command/clipboard barriers |
 | `viewport.rs`, `texted-layout` | Visible geometry, scrolling, caret, compact search coverage and pure highlight clipping |
+| `framebuffer.rs`, `presentation.rs` | Fixed source canvases, bounded GPU targets and matching presentation/input transforms |
 | `editor_view.rs`, `graphics.rs`, `gpu.rs` | Immutable drawing-command preparation, bounded glyph caches, ordered Metal submission |
 | `texted-buffer` | Persistent rope, byte-safe coordinates/history, resumable scanner, streaming replacement planner, local word traversal |
 | `texted-io` | Streaming UTF-8/BOM/CRLF load and atomic save |
@@ -53,7 +58,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 python3 -m unittest discover -s scripts -p 'test_*.py'
-cargo test --release -p texted-app --bin texted metal_renders_clipping_alpha_and_paint_order -- --ignored
+cargo test --release -p texted-app --bin texted metal_ -- --ignored
 cargo run --locked --release --bin bench -- --hardening
 python3 scripts/package_macos.py
 ```

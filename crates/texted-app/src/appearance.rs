@@ -1,4 +1,5 @@
 //! Versioned appearance values. Document contents and editing state are independent of these settings.
+use crate::framebuffer::Framebuffer;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +252,8 @@ pub struct Appearance {
     pub version: u32,
     pub theme: Theme,
     pub typography: Typography,
+    pub framebuffer: Framebuffer,
+    pub pixel_typography: Typography,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub colors: BTreeMap<String, String>,
 }
@@ -260,16 +263,41 @@ impl Default for Appearance {
             version: 1,
             theme: Theme::default(),
             typography: Typography::default(),
+            framebuffer: Framebuffer::default(),
+            pixel_typography: Typography {
+                family: FontFamily::Pixel,
+                size_px: 8,
+                line_spacing: 100,
+            },
             colors: BTreeMap::new(),
         }
     }
 }
 impl Appearance {
+    pub fn resolution(&self) -> Option<(u32, u32)> {
+        self.framebuffer.resolve(self.theme)
+    }
+    pub fn editor_typography(&self) -> Typography {
+        if self.resolution().is_some() {
+            self.pixel_typography
+        } else {
+            self.typography
+        }
+    }
+    pub fn editor_typography_mut(&mut self) -> &mut Typography {
+        if self.resolution().is_some() {
+            &mut self.pixel_typography
+        } else {
+            &mut self.typography
+        }
+    }
+
     pub fn normalize(&mut self) -> Result<(), String> {
         if self.version != 1 {
             return Err(format!("Unsupported appearance version {}", self.version));
         }
         self.typography.normalize();
+        self.pixel_typography.normalize();
         self.palette()?;
         Ok(())
     }
@@ -290,6 +318,26 @@ impl Appearance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn existing_preferences_get_auto_resolution_and_isolated_pixel_typography() {
+        let mut a: Appearance = serde_json::from_str(
+            r#"{"version":1,"theme":"zx_spectrum","typography":{"family":"menlo","size_px":24}}"#,
+        )
+        .unwrap();
+        a.normalize().unwrap();
+        let native = a.typography;
+        assert_eq!(a.resolution(), Some((256, 192)));
+        assert_eq!(a.editor_typography().size_px, 8);
+        assert_eq!(a.editor_typography().family, FontFamily::Pixel);
+        a.editor_typography_mut().resize(1);
+        a.framebuffer = Framebuffer::Native;
+        assert_eq!(a.editor_typography(), native);
+        a.framebuffer = Framebuffer::Auto;
+        assert_eq!(a.editor_typography().size_px, 16);
+        let copy: Appearance = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(copy, a);
+        assert!(serde_json::from_str::<Appearance>(r#"{"framebuffer":"4k"}"#).is_err());
+    }
     #[test]
     fn settings_round_trip_preserves_custom_colors_and_normalizes_pixel_metrics() {
         let mut a = Appearance {
