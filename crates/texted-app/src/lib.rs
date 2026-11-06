@@ -1,5 +1,6 @@
 //! Window-independent editor controllers and services.
 pub mod appearance;
+pub mod bitmap_fonts;
 pub mod buffer_service;
 pub mod clipboard;
 pub mod commands;

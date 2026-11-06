@@ -13,7 +13,7 @@ cargo run --release --bin texted -- path/to/file.txt
 cargo run --release --bin texted
 ```
 
-The current GUI uses macOS fonts and `pbcopy`/`pbpaste`. Running without a path opens an empty document. Open and Save As use native macOS dialogs. Opening another file, creating a document or quitting prompts to save unsaved edits. Files can also be dropped onto the window or opened through Finder's Open With menu; Texted edits one document at a time.
+The current GUI uses bundled bitmap fonts and macOS `pbcopy`/`pbpaste`. Running without a path opens an empty document. Open and Save As use native macOS dialogs. Opening another file, creating a document or quitting prompts to save unsaved edits. Files can also be dropped onto the window or opened through Finder's Open With menu; Texted edits one document at a time.
 
 ## Implementation
 
@@ -58,9 +58,9 @@ Available in `main` development builds; the published v0.2.0 preview predates th
 
 Appearance offers Modern Dark/Light, VGA, EGA, Atari, Commander, C64, ZX Spectrum, Amber and Green CRT palettes. The theme applies to the document, selection/search highlights, gutter, status, search and appearance panels. Palettes and editor fonts are independent.
 
-Open **Style** in the status bar or press **Cmd+,**. Click a field to open its dropdown list, or use Tab/Shift+Tab to focus a field and Enter/Space to open it. Up/Down selects a list item; Enter applies it. Escape or an outside click dismisses the list without changing the value; a second Escape closes Style. Long lists support wheel scrolling, Page Up/Down and Home/End. Choosing a value applies it immediately; Done closes the panel. Choose Courier New, Menlo, Monaco or Pixel 8x8, an 8–40 px editor size and 100–180% line height. The Pixel font uses integer 8 px steps and a nearest-neighbor bitmap; Ukrainian and other non-bitmap characters use a pixel-rasterized system-font fallback. UI labels use a separate font: 18 px in Native mode and an 8 px bitmap inside framebuffers. Settings do not edit the document or its undo history.
+Open **Style** in the status bar or press **Cmd+,**. Click a field to open its dropdown list, or use Tab/Shift+Tab to focus a field and Enter/Space to open it. Up/Down selects a list item; Enter applies it. Escape or an outside click dismisses the list without changing the value; a second Escape closes Style. Long lists support wheel scrolling, Page Up/Down and Home/End. Choosing a value applies it immediately; Done closes the panel. Choose IBM BIOS 8×8, IBM EGA 8×14, IBM VGA 8×16, Spleen 6×12 or Spleen 8×16. Every face includes the complete Ukrainian alphabet. Sizes are whole multiples of the native cell height, up to 64 px, with 100–180% line height. Text uses exact one-bit bitmap masks with nearest-texel sampling, including UI labels (VGA 8×16 in Native mode; BIOS 8×8 inside framebuffers). Unsupported characters show an explicit missing-glyph box. See the [font review and glyph sheets](docs/bitmap-font-review.md). Settings do not edit the document or its undo history.
 
-Style also offers a **Screen / Resolution** row. **Auto (theme)** renders retro palettes into a real limited-resolution framebuffer: VGA 640×480, EGA 640×350, Atari/C64 320×200, Commander 720×400, ZX Spectrum 256×192, and monochrome 720×350. Modern themes stay native. Choose **Native** for a full-resolution palette, or select an explicit raster independently of the theme. The complete in-app scene scales to the largest size that fits the window, preserving the source aspect ratio with letterboxing and nearest-texel sampling. Fractional upscale factors are supported. Compact Style/search/status controls remain usable at 256×192. Native and framebuffer typography are saved separately; framebuffers start with Pixel 8x8 at 8 px. See [framebuffer behavior and reference platforms](docs/framebuffer.md).
+Style also offers a **Screen / Resolution** row. **Auto (theme)** renders retro palettes into a real limited-resolution framebuffer: VGA 640×480, EGA 640×350, Atari/C64 320×200, Commander 720×400, ZX Spectrum 256×192, and monochrome 720×350. Modern themes stay native. Choose **Native** for a full-resolution palette, or select an explicit raster independently of the theme. The complete in-app scene scales to the largest size that fits the window, preserving the source aspect ratio with letterboxing and nearest-texel sampling. Fractional upscale factors are supported. Compact Style/search/status controls remain usable at 256×192. Native and framebuffer typography are saved separately; framebuffers start with IBM BIOS 8×8 at 8 px. See [framebuffer behavior and reference platforms](docs/framebuffer.md).
 
 Preferences save atomically in the background to `~/Library/Application Support/Texted/appearance.json`. The latest accepted settings are flushed on normal exit. An invalid or newer-version file is left intact; the app uses session-only defaults and reports the load error. `TEXTED_SETTINGS_PATH` selects an alternate file for isolated previews.
 
@@ -71,13 +71,13 @@ For custom colors, edit that file while Texted is closed; for example:
   "version": 1,
   "theme": "c64",
   "framebuffer": "auto",
-  "pixel_typography": { "family": "pixel", "size_px": 8, "line_spacing": 100 },
-  "typography": { "family": "menlo", "size_px": 18, "line_spacing": 120 },
+  "pixel_typography": { "family": "bios_8x8", "size_px": 8, "line_spacing": 100 },
+  "typography": { "family": "spleen_8x16", "size_px": 16, "line_spacing": 120 },
   "colors": { "text": "#E8DCFF", "selection": "#6454A0" }
 }
 ```
 
-Optional `colors` keys are `bg`, `text`, `caret`, `selection`, `block_selection`, `search_match`, `search_active`, `gutter_bg`, `gutter_border`, `gutter_text`, `panel_bg`, `panel_border`, `input_bg`, `input_border`, `input_active`, `button_bg`, `button_border`, `status_bg`, `status_border`, `status_text`, and `status_accent`. Values must be `#RRGGBB`; unknown keys are rejected. Selecting another palette clears color overrides; typography changes retain them. Reset defaults restores the built-in appearance. Unavailable font families fall back to an available face. Fixed framebuffers use a nearest-texel presentation pass. CRT effects remain a separate future change.
+Optional `colors` keys are `bg`, `text`, `caret`, `selection`, `block_selection`, `search_match`, `search_active`, `gutter_bg`, `gutter_border`, `gutter_text`, `panel_bg`, `panel_border`, `input_bg`, `input_border`, `input_active`, `button_bg`, `button_border`, `status_bg`, `status_border`, `status_text`, and `status_accent`. Values must be `#RRGGBB`; unknown keys are rejected. Selecting another palette clears color overrides; typography changes retain them. Reset defaults restores the built-in appearance. All five faces are embedded in the executable. Older `courier`, `menlo`, `monaco` and `pixel` preferences migrate to bitmap faces with valid native sizes. Fixed framebuffers use a nearest-texel presentation pass. CRT effects remain a separate future change.
 
 ## Validation
 

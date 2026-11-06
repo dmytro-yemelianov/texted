@@ -24,8 +24,6 @@ winit = "0.29"
 wgpu = { version = "27.0.1", default-features = false, features = ["std", "metal", "wgsl"] }
 pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
-font8x8 = "0.3"
-ab_glyph = "0.2"
 ropey = { version = "1.6", default-features = false, features = ["simd"] }
 rfd = { version = "0.17.2", default-features = false }
 

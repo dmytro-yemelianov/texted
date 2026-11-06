@@ -704,7 +704,7 @@ mod tests {
     }
     #[test]
     #[ignore = "Requires a real Metal GPU; run explicitly on a Mac"]
-    fn metal_renders_clipping_alpha_and_paint_order() {
+    fn metal_renders_clipping_binary_masks_and_paint_order() {
         pollster::block_on(async {
             let adapter = instance()
                 .request_adapter(&wgpu::RequestAdapterOptions::default())
@@ -791,10 +791,14 @@ mod tests {
                 }
             }
             assert!(
-                pixels
-                    .chunks_exact(4)
-                    .any(|p| p[0] == 255 && p[1] > 0 && p[1] < 255 && p[1] == p[2]),
-                "antialiased glyphs blend over the red background"
+                pixels.chunks_exact(4).any(|p| p == [255, 255, 255, 255]),
+                "native bitmap glyphs render opaque white pixels"
+            );
+            assert!(
+                pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]
+                    || p == [0, 255, 0, 255]
+                    || p == [255, 255, 255, 255]),
+                "binary masks must never introduce antialiased edge colors"
             );
             // Simulate a full cache: a live frame must never have its atlas coordinates evicted.
             let retained_key = list

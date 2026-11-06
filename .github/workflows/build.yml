@@ -35,7 +35,7 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Rust regression tests
         run: cargo test --locked --workspace
-      - name: Packaging regression tests
+      - name: Font asset and packaging regression tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Build and smoke-test native executable
         run: |
