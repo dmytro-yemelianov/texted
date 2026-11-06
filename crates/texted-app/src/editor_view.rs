@@ -19,6 +19,7 @@ pub(crate) struct ViewModel<'a> {
     pub config: &'a ViewportConfig,
     pub selection: &'a SelectionState,
     pub search_state: &'a SearchState,
+    pub compact: bool,
     pub width: usize,
     pub height: usize,
     pub text_height: usize,
@@ -74,7 +75,7 @@ fn paint_gutter(buffer: &mut DrawList, model: &ViewModel<'_>) {
             0,
             0,
             gutter_width_int,
-            height.saturating_sub(28),
+            height.saturating_sub(if model.compact { 14 } else { 28 }),
             model.palette.gutter_bg,
         );
         draw_rect(
@@ -84,7 +85,7 @@ fn paint_gutter(buffer: &mut DrawList, model: &ViewModel<'_>) {
             gutter_width_int.saturating_sub(1),
             0,
             1,
-            height.saturating_sub(28),
+            height.saturating_sub(if model.compact { 14 } else { 28 }),
             model.palette.gutter_border,
         );
     }
@@ -340,7 +341,7 @@ fn input_box(
     );
     font_engine.draw_string(
         buffer,
-        model.width,
+        model.width.min(x + w.saturating_sub(3)),
         model.height,
         x + 5,
         y + 3,
@@ -396,6 +397,10 @@ fn button(
     );
 }
 fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewModel<'_>) {
+    if model.compact {
+        paint_compact_search(buffer, font_engine, model);
+        return;
+    }
     let ViewModel {
         width,
         height,
@@ -507,7 +512,189 @@ fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: 
     }
 }
 
+fn paint_compact_search(buffer: &mut DrawList, font: &mut FontEngine, model: &ViewModel<'_>) {
+    use crate::search_ui::CompactBar;
+    let mode = model.search_state.mode;
+    if mode == SearchBarMode::Closed {
+        return;
+    }
+    let g = CompactBar::new(mode, model.width);
+    let c = model.palette;
+    draw_box(
+        buffer,
+        model.width,
+        model.height,
+        g.panel.x,
+        g.panel.y,
+        g.panel.w,
+        g.panel.h,
+        c.panel_bg,
+        c.panel_border,
+    );
+    for (r, text, active) in [
+        (
+            g.find,
+            model.search_state.find_query.as_str(),
+            model.search_state.active_field == 0,
+        ),
+        (
+            g.replacement,
+            model.search_state.replace_query.as_str(),
+            model.search_state.active_field == 1,
+        ),
+    ] {
+        if r.y == 40 && mode != SearchBarMode::Replace {
+            continue;
+        }
+        draw_box(
+            buffer,
+            model.width,
+            model.height,
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            c.input_bg,
+            if active {
+                c.input_active
+            } else {
+                c.input_border
+            },
+        );
+        font.draw_string(
+            buffer,
+            (r.x + r.w).saturating_sub(2),
+            model.height,
+            r.x + 2,
+            r.y + 3,
+            text,
+            c.text,
+        );
+        if active && model.caret_visible {
+            let count = text.chars().take(r.w / 8).count();
+            let x = r.x + 2 + count * 8;
+            if x + 1 < r.x + r.w {
+                draw_rect(
+                    buffer,
+                    model.width,
+                    model.height,
+                    x,
+                    r.y + 2,
+                    1,
+                    10,
+                    c.caret,
+                );
+            }
+        }
+    }
+    font.draw_string(
+        buffer,
+        model.width,
+        model.height,
+        g.panel.x + 2,
+        10,
+        "Find",
+        c.text,
+    );
+    font.draw_string(
+        buffer,
+        g.panel.x + g.panel.w - 4,
+        model.height,
+        g.panel.x + 4,
+        25,
+        &model.search_state.label(),
+        c.status_text,
+    );
+    for (r, text) in [
+        (g.previous, "<"),
+        (g.next, ">"),
+        (g.close, "X"),
+        (g.one, "One"),
+        (g.all, "All"),
+    ] {
+        if r.y == 40 && mode != SearchBarMode::Replace {
+            continue;
+        }
+        draw_box(
+            buffer,
+            model.width,
+            model.height,
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            c.button_bg,
+            c.button_border,
+        );
+        font.draw_string(
+            buffer,
+            r.x + r.w,
+            model.height,
+            r.x + 2,
+            r.y + 3,
+            text,
+            c.text,
+        );
+    }
+    if mode == SearchBarMode::Replace {
+        font.draw_string(
+            buffer,
+            model.width,
+            model.height,
+            g.panel.x + 2,
+            43,
+            "Repl",
+            c.text,
+        );
+    }
+}
+
 fn paint_status(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewModel<'_>) {
+    if model.compact {
+        let y = model.height.saturating_sub(14);
+        draw_rect(
+            buffer,
+            model.width,
+            model.height,
+            0,
+            y,
+            model.width,
+            14,
+            model.palette.status_bg,
+        );
+        let text = format!(
+            "L{} C{} {} {}x{}",
+            model.cur_line + 1,
+            model.cur_col + 1,
+            if model.selection.mode == SelectionMode::Block {
+                "B"
+            } else if model.word_wrap {
+                "W"
+            } else {
+                "-"
+            },
+            model.width,
+            model.height
+        );
+        font_engine.draw_string(
+            buffer,
+            model.width.saturating_sub(50),
+            model.height,
+            2,
+            y + 3,
+            &text,
+            model.palette.status_text,
+        );
+        crate::appearance_ui::paint_status_button(
+            buffer,
+            font_engine,
+            model.width,
+            model.height,
+            model.palette,
+            true,
+        );
+        return;
+    }
     let ViewModel {
         snap,
         selection,
@@ -522,7 +709,7 @@ fn paint_status(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &Vie
         ..
     } = *model;
     // 10. Render Status Bar
-    let status_y = height.saturating_sub(28);
+    let status_y = height.saturating_sub(if model.compact { 14 } else { 28 });
     draw_rect(
         buffer,
         width,
@@ -595,7 +782,14 @@ fn paint_status(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &Vie
         &status_text,
         status_color,
     );
-    crate::appearance_ui::paint_status_button(buffer, font_engine, width, height, model.palette);
+    crate::appearance_ui::paint_status_button(
+        buffer,
+        font_engine,
+        width,
+        height,
+        model.palette,
+        false,
+    );
 }
 
 fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewModel<'_>) {

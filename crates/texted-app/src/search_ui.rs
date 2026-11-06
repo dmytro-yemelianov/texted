@@ -105,6 +105,101 @@ impl SearchUi {
         Some(Ok(()))
     }
 }
+#[derive(Clone, Copy)]
+pub(crate) struct CompactBar {
+    pub panel: crate::appearance_ui::Rect,
+    pub find: crate::appearance_ui::Rect,
+    pub replacement: crate::appearance_ui::Rect,
+    pub previous: crate::appearance_ui::Rect,
+    pub next: crate::appearance_ui::Rect,
+    pub close: crate::appearance_ui::Rect,
+    pub one: crate::appearance_ui::Rect,
+    pub all: crate::appearance_ui::Rect,
+}
+impl CompactBar {
+    pub fn new(mode: SearchBarMode, width: usize) -> Self {
+        use crate::appearance_ui::Rect;
+        let w = width.saturating_sub(8).min(640);
+        let x = width.saturating_sub(w) / 2;
+        let field = w.saturating_sub(100);
+        Self {
+            panel: Rect {
+                x,
+                y: 4,
+                w,
+                h: if mode == SearchBarMode::Replace {
+                    56
+                } else {
+                    34
+                },
+            },
+            find: Rect {
+                x: x + 40,
+                y: 7,
+                w: field,
+                h: 14,
+            },
+            replacement: Rect {
+                x: x + 40,
+                y: 40,
+                w: w.saturating_sub(112),
+                h: 14,
+            },
+            previous: Rect {
+                x: x + w.saturating_sub(56),
+                y: 7,
+                w: 16,
+                h: 14,
+            },
+            next: Rect {
+                x: x + w.saturating_sub(38),
+                y: 7,
+                w: 16,
+                h: 14,
+            },
+            close: Rect {
+                x: x + w.saturating_sub(18),
+                y: 7,
+                w: 14,
+                h: 14,
+            },
+            one: Rect {
+                x: x + w.saturating_sub(66),
+                y: 40,
+                w: 28,
+                h: 14,
+            },
+            all: Rect {
+                x: x + w.saturating_sub(34),
+                y: 40,
+                w: 30,
+                h: 14,
+            },
+        }
+    }
+    fn hit(self, mode: SearchBarMode, x: f32, y: f32) -> Option<BarHit> {
+        if !self.panel.contains(x, y) {
+            return None;
+        }
+        Some(if self.close.contains(x, y) {
+            BarHit::Close
+        } else if self.previous.contains(x, y) {
+            BarHit::Previous
+        } else if self.next.contains(x, y) {
+            BarHit::Next
+        } else if mode == SearchBarMode::Replace && y >= 40.0 {
+            if self.one.contains(x, y) {
+                BarHit::Replace(false)
+            } else if self.all.contains(x, y) {
+                BarHit::Replace(true)
+            } else {
+                BarHit::Focus(1)
+            }
+        } else {
+            BarHit::Focus(0)
+        })
+    }
+}
 pub(crate) const PANEL_WIDTH: usize = 640;
 pub(crate) const PREVIOUS_X: usize = 445;
 pub(crate) const NEXT_X: usize = 503;
@@ -117,9 +212,18 @@ pub(crate) enum BarHit {
     Replace(bool),
     Close,
 }
-pub(crate) fn hit(mode: SearchBarMode, width: f32, x: f32, y: f32) -> Option<BarHit> {
+pub(crate) fn hit(
+    mode: SearchBarMode,
+    width: f32,
+    x: f32,
+    y: f32,
+    compact: bool,
+) -> Option<BarHit> {
     if mode == SearchBarMode::Closed {
         return None;
+    }
+    if compact {
+        return CompactBar::new(mode, width as usize).hit(mode, x, y);
     }
     let left = (width - (PANEL_WIDTH + 16) as f32).max(0.0);
     let x = x - left;
@@ -156,6 +260,32 @@ pub(crate) fn hit(mode: SearchBarMode, width: f32, x: f32, y: f32) -> Option<Bar
 mod tests {
     use super::*;
     #[test]
+    fn compact_find_replace_actions_remain_reachable_at_256_pixels() {
+        let g = CompactBar::new(SearchBarMode::Replace, 256);
+        for (r, expected) in [
+            (g.find, BarHit::Focus(0)),
+            (g.replacement, BarHit::Focus(1)),
+            (g.previous, BarHit::Previous),
+            (g.next, BarHit::Next),
+            (g.close, BarHit::Close),
+            (g.one, BarHit::Replace(false)),
+            (g.all, BarHit::Replace(true)),
+        ] {
+            assert!(r.x + r.w <= 256 && r.y + r.h <= 192);
+            assert_eq!(
+                hit(
+                    SearchBarMode::Replace,
+                    256.0,
+                    (r.x + 2) as f32,
+                    (r.y + 2) as f32,
+                    true
+                ),
+                Some(expected)
+            );
+        }
+        assert!(hit(SearchBarMode::Closed, 256.0, 10.0, 10.0, true).is_none());
+    }
+    #[test]
     fn buttons_share_their_painted_geometry_even_with_long_counts() {
         let left = 980.0 - (PANEL_WIDTH + 16) as f32;
         assert_eq!(
@@ -163,7 +293,8 @@ mod tests {
                 SearchBarMode::Find,
                 980.0,
                 left + PREVIOUS_X as f32 + 20.0,
-                25.0
+                25.0,
+                false
             ),
             Some(BarHit::Previous)
         );
@@ -172,14 +303,15 @@ mod tests {
                 SearchBarMode::Find,
                 980.0,
                 left + NEXT_X as f32 + 20.0,
-                25.0
+                25.0,
+                false
             ),
             Some(BarHit::Next)
         );
         assert_eq!(
-            hit(SearchBarMode::Replace, 980.0, left + 330.0, 60.0),
+            hit(SearchBarMode::Replace, 980.0, left + 330.0, 60.0, false),
             Some(BarHit::Replace(true))
         );
-        assert_eq!(hit(SearchBarMode::Closed, 980.0, left, 25.0), None);
+        assert_eq!(hit(SearchBarMode::Closed, 980.0, left, 25.0, false), None);
     }
 }

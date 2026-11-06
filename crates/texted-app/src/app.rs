@@ -19,9 +19,10 @@ use std::{
     time::{Duration, Instant},
 };
 use texted_app::{
-    appearance::Appearance,
+    appearance::{Appearance, FontFamily, Typography},
     buffer_service::{BufferService, Command},
     commands::EditorCommand,
+    framebuffer::ScreenMapping,
     input::{self, Intent, KeyInput, SearchContext},
     preferences::{self, Preferences},
     search::SearchBarMode,
@@ -53,6 +54,8 @@ pub(crate) struct App {
     snap_after: Option<u64>,
     menus: NativeMenus,
     context: Option<ContextRequest>,
+    display: ScreenMapping,
+    pointer_physical: (f32, f32),
 }
 impl App {
     pub fn new(
@@ -86,13 +89,17 @@ impl App {
             appearance.save_status = "Session only: preferences could not be loaded".into();
             None
         };
-        let font = FontEngine::with_typography(appearance.settings.typography);
+        let font = FontEngine::with_typography(appearance.settings.editor_typography());
+        let ui_font = Self::chrome_font(appearance.settings.resolution().is_some());
+        let size = window.inner_size();
+        let display =
+            ScreenMapping::new((size.width, size.height), appearance.settings.resolution());
         Self {
             window,
             renderer,
             failed: false,
             font,
-            ui_font: FontEngine::new(18.0),
+            ui_font,
             appearance,
             preferences,
             draws: DrawList::default(),
@@ -108,6 +115,19 @@ impl App {
             snap_after: None,
             menus,
             context: None,
+            display,
+            pointer_physical: (0.0, 0.0),
+        }
+    }
+    fn chrome_font(pixelated: bool) -> FontEngine {
+        if pixelated {
+            FontEngine::with_typography(Typography {
+                family: FontFamily::Pixel,
+                size_px: 8,
+                line_spacing: 100,
+            })
+        } else {
+            FontEngine::new(18.0)
         }
     }
     fn report(&mut self, result: Result<(), String>) {
@@ -180,7 +200,10 @@ impl App {
                         f64::from(x) * f64::from(self.font.char_width_px) * 3.0,
                         f64::from(y) * f64::from(self.font.line_height_px) * 2.5,
                     ),
-                    MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let (sx, sy) = self.display.scale();
+                        (p.x / f64::from(sx), p.y / f64::from(sy))
+                    }
                 };
                 self.viewport.wheel(
                     dx,
@@ -246,11 +269,19 @@ impl App {
     }
     fn appearance_changed(&mut self, before: Appearance) {
         if before != self.appearance.settings {
-            if before.typography != self.appearance.settings.typography {
-                let typography = self.appearance.settings.typography;
-                if before.typography.family != typography.family
-                    || before.typography.size_px != typography.size_px
-                {
+            let previous = before.editor_typography();
+            let typography = self.appearance.settings.editor_typography();
+            let resolution_changed = before.resolution() != self.appearance.settings.resolution();
+            if before.resolution().is_some() != self.appearance.settings.resolution().is_some() {
+                self.ui_font = Self::chrome_font(self.appearance.settings.resolution().is_some());
+            }
+            if resolution_changed {
+                self.context = None;
+                self.mouse.dragging = false;
+                self.viewport.horizontal.end_drag();
+            }
+            if previous != typography || resolution_changed {
+                if previous.family != typography.family || previous.size_px != typography.size_px {
                     self.font = FontEngine::with_typography(typography);
                 } else {
                     self.font.set_line_spacing(typography.line_spacing);
@@ -420,7 +451,7 @@ impl App {
         let p = self.buffer.client.latest();
         let _ = self.search.handle(&Intent::SearchClose, p.snapshot.clone());
         self.context = Some(ContextRequest {
-            position: (x, y),
+            position: self.display.to_window((x, y)),
             point: (0, 0),
             document: p.document,
             after: self.buffer.client.barrier(),
@@ -433,6 +464,7 @@ impl App {
         let (x, y) = self.mouse.position;
         if self.locked()
             || self.transfers.busy()
+            || self.display.to_source(self.pointer_physical).is_none()
             || self
                 .viewport
                 .current
@@ -441,9 +473,10 @@ impl App {
             || self.viewport.bar.is_some_and(|bar| bar.contains(x, y))
             || search_ui::hit(
                 self.search.state.mode,
-                self.window.inner_size().width as f32,
+                self.display.source.0 as f32,
                 x,
                 y,
+                self.display.pixelated,
             )
             .is_some()
         {
@@ -457,7 +490,7 @@ impl App {
             self.buffer.client.latest().snapshot.clone(),
         );
         self.context = Some(ContextRequest {
-            position: (x, y),
+            position: self.pointer_physical,
             point: self.viewport.point(x, y),
             document: self.buffer.client.latest().document,
             after: self.buffer.client.barrier(),
@@ -486,7 +519,9 @@ impl App {
         }
     }
     fn pointer_move(&mut self, x: f32, y: f32) {
-        self.mouse.position = (x, y);
+        self.pointer_physical = (x, y);
+        self.mouse.position = self.display.to_source_clamped((x, y));
+        let (x, y) = self.mouse.position;
         if self.locked() {
             return;
         }
@@ -507,15 +542,25 @@ impl App {
             return;
         }
         let (x, y) = self.mouse.position;
-        let size = self.window.inner_size();
+        if self.display.to_source(self.pointer_physical).is_none() {
+            return;
+        }
+        let (width, height) = self.display.source;
         if self.appearance.open {
             let before = self.appearance.settings.clone();
-            self.appearance
-                .click(size.width as usize, size.height as usize, x, y);
+            self.appearance.click(
+                width as usize,
+                height as usize,
+                x,
+                y,
+                self.display.pixelated,
+            );
             self.appearance_changed(before);
             return;
         }
-        if appearance_ui::status_button(size.width as usize, size.height as usize).contains(x, y) {
+        if appearance_ui::status_button(width as usize, height as usize, self.display.pixelated)
+            .contains(x, y)
+        {
             self.intent(Intent::ToggleAppearance);
             return;
         }
@@ -524,9 +569,10 @@ impl App {
         }
         if let Some(hit) = search_ui::hit(
             self.search.state.mode,
-            self.window.inner_size().width as f32,
+            self.display.source.0 as f32,
             x,
             y,
+            self.display.pixelated,
         ) {
             match hit {
                 BarHit::Focus(field) => self.search.focus(field),
@@ -681,13 +727,19 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return;
         }
+        let display = ScreenMapping::new(
+            (size.width, size.height),
+            self.appearance.settings.resolution(),
+        );
+        let (width, height) = display.source;
         let start = Instant::now();
         let p = self.buffer.client.latest();
         let frame = self.viewport.prepare(
             &p.snapshot,
             &self.font,
-            size.width as usize,
-            size.height as usize,
+            width as usize,
+            height as usize,
+            display.pixelated,
         );
         self.search.state.set_view(&p.snapshot, &frame.layout);
         editor_view::paint(
@@ -695,14 +747,15 @@ impl App {
             &mut self.font,
             &mut self.ui_font,
             &ViewModel {
+                compact: display.pixelated,
                 palette: &self.appearance.palette,
                 snap: &p.snapshot,
                 layout: &frame.layout,
                 config: &frame.config,
                 selection: &p.selection,
                 search_state: &self.search.state,
-                width: size.width as usize,
-                height: size.height as usize,
+                width: width as usize,
+                height: height as usize,
                 text_height: frame.text_height,
                 gutter_w: frame.gutter_w,
                 line_digits: frame.line_digits,
@@ -724,14 +777,25 @@ impl App {
         self.appearance.paint(
             &mut self.draws,
             &mut self.ui_font,
-            size.width as usize,
-            size.height as usize,
+            width as usize,
+            height as usize,
+            display.pixelated,
         );
-        self.viewport.current = Some(frame);
-        if let Err(error) = self.renderer.render(&self.draws, size.width, size.height) {
-            self.failed = true;
-            let _=self.files.enqueue(Action::ReportError(format!("GPU rendering failed: {error}. Texted will close; you can save unsaved changes before closing.")));
-            let _ = self.files.enqueue(Action::Close);
+        match self
+            .renderer
+            .render(&self.draws, size.width, size.height, display)
+        {
+            Ok(true) => {
+                self.viewport.current = Some(frame);
+                self.display = display;
+                self.mouse.position = self.display.to_source_clamped(self.pointer_physical);
+            }
+            Ok(false) => self.window.request_redraw(),
+            Err(error) => {
+                self.failed = true;
+                let _=self.files.enqueue(Action::ReportError(format!("GPU rendering failed: {error}. Texted will close; you can save unsaved changes before closing.")));
+                let _ = self.files.enqueue(Action::Close);
+            }
         }
     }
 }
