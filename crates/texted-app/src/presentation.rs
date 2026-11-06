@@ -113,7 +113,7 @@ impl PixelPresenter {
         mapping: ScreenMapping,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("integer pixel presentation"),
+            label: Some("aspect-fit pixel presentation"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: output,
                 depth_slice: None,

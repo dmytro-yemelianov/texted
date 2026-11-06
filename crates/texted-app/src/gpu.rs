@@ -617,11 +617,14 @@ mod tests {
             let mut painter = Painter::new(device.clone(), queue, format);
             let mut presenter = crate::presentation::PixelPresenter::new(&device, format);
             let mut list = DrawList::default();
-            list.reset(0xff0000);
-            crate::graphics::draw_rect(&mut list, 2, 2, 1, 0, 1, 1, 0x00ff00);
-            crate::graphics::draw_rect(&mut list, 2, 2, 0, 1, 1, 1, 0x0000ff);
-            crate::graphics::draw_rect(&mut list, 2, 2, 1, 1, 1, 1, 0xffffff);
-            painter.prepare(&list, 2, 2).unwrap();
+            list.reset(0);
+            for y in 0..3 {
+                for x in 0..3 {
+                    let color = (((20 + 80 * x) as u32) << 16) | (((20 + 80 * y) as u32) << 8) | 70;
+                    crate::graphics::draw_rect(&mut list, 3, 3, x, y, 1, 1, color);
+                }
+            }
+            painter.prepare(&list, 3, 3).unwrap();
             let target = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("presentation readback"),
                 size: wgpu::Extent3d {
@@ -643,12 +646,12 @@ mod tests {
                 mapped_at_creation: false,
             });
             let mut encoder = device.create_command_encoder(&Default::default());
-            let source = presenter.source(&device, (2, 2));
+            let source = presenter.source(&device, (3, 3));
             painter.encode(&mut encoder, source, list.clear);
             presenter.encode(
                 &mut encoder,
                 &target.create_view(&Default::default()),
-                ScreenMapping::new((64, 32), Some((2, 2))),
+                ScreenMapping::new((64, 32), Some((3, 3))),
             );
             encoder.copy_texture_to_buffer(
                 target.as_image_copy(),
@@ -679,12 +682,10 @@ mod tests {
                     let expected = if !(16..48).contains(&x) {
                         [0, 0, 0, 255]
                     } else {
-                        match (x >= 32, y >= 16) {
-                            (false, false) => [255, 0, 0, 255],
-                            (true, false) => [0, 255, 0, 255],
-                            (false, true) => [0, 0, 255, 255],
-                            (true, true) => [255, 255, 255, 255],
-                        }
+                        // Pixel centers map to exact texels even at the non-integer 32/3 scale.
+                        let sx = ((x - 16) * 2 + 1) * 3 / 64;
+                        let sy = (y * 2 + 1) * 3 / 64;
+                        [(20 + 80 * sx) as u8, (20 + 80 * sy) as u8, 70, 255]
                     };
                     let at = (y * 64 + x) * 4;
                     assert_eq!(

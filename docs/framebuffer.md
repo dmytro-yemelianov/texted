@@ -17,7 +17,7 @@ The raster dimensions follow the original [IBM adapter references](https://bitsa
 
 ## Presentation and interaction
 
-The scene is laid out and drawn at the selected canvas size. A second GPU pass reads exact source texels with `textureLoad`. Presentation uses the largest whole-number scale fitting the physical window and centers the image on black letterboxing. Windows smaller than the canvas fit the complete image using nearest texels. Resizing the window changes presentation, while document layout stays at the selected resolution.
+The scene is laid out and drawn at the selected canvas size. A second GPU pass reads exact source texels with `textureLoad`. Presentation fills one physical window dimension and centers the image on black letterboxing, preserving the source aspect ratio to physical-pixel precision. Both fractional upscaling and downscaling use nearest texels; no whole-number scale step leaves extra margins. Resizing the window changes presentation, while document layout stays at the selected resolution.
 
 One shared `ScreenMapping` handles presentation, pointer/drag coordinates, pixel-wheel deltas and native context-menu positioning. Clicks on letterboxing do not select text or activate controls. The last successfully presented mapping remains authoritative until the next successful frame. Changing resolution cancels pending popups and drag gestures, then recomputes viewport/search geometry.
 
@@ -43,7 +43,7 @@ Accepted framebuffer values: `auto`, `native`, `vga`, `ega`, `atari_st`, `dos_te
 
 `framebuffer.rs` owns presets and pure transforms. `presentation.rs` owns a single cached color target and the presentation pipeline. The largest preset is 640×480: 1,228,800 bytes of RGBA/BGRA texels (driver allocation overhead excluded). Target storage changes only when source dimensions change and is released in Native mode. Production presentation does not read pixels back to the CPU.
 
-Tests cover preset limits, legacy settings and separate typography, integer/fractional presentation/input transforms, letterbox rejection, compact controls and shader validation. The explicit Metal test renders a four-color 2×2 source into a letterboxed 64×32 target and checks every output pixel for its exact expected texel, then changes/releases source targets. Native verification covered C64 and ZX canvases, compact Style/search, Native bypass, transformed context-menu input, persistence after restart and byte-for-byte unchanged UTF-8 save output.
+Tests cover preset limits, legacy settings and separate typography, aspect-fit presentation/input transforms, letterbox rejection, compact controls and shader validation. The explicit Metal test renders a nine-color 3×3 source into a letterboxed 64×32 target and checks every output pixel for its exact expected texel at the non-integer 32/3 scale, then changes/releases source targets. Native verification covered C64 and ZX canvases, compact Style/search, Native bypass, transformed context-menu input, persistence after restart and byte-for-byte unchanged UTF-8 save output.
 
 ```sh
 cargo test --locked --workspace
