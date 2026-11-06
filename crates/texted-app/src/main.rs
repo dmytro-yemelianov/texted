@@ -1,12 +1,14 @@
 //! Texted's native entry point. Editing, workers, file lifecycle and painting have separate owners.
 mod app;
 mod appearance_ui;
+mod context_menu;
 mod documents;
 mod editor_view;
 mod file_flow;
 mod gpu;
 mod graphics;
 mod horizontal_scroll;
+mod menus;
 mod mouse;
 mod native_macos;
 mod search_ui;
@@ -16,7 +18,10 @@ use documents::Action;
 use std::{path::PathBuf, sync::Arc};
 use winit::{event_loop::EventLoopBuilder, window::WindowBuilder};
 #[derive(Debug, Clone)]
-pub struct AppEvent(Action);
+pub enum AppEvent {
+    Document(Action),
+    Menu(menus::MenuCommand),
+}
 fn main() {
     let argument = std::env::args().nth(1);
     match argument.as_deref() {
@@ -30,9 +35,19 @@ fn main() {
         }
         _ => {}
     }
-    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event()
-        .build()
-        .expect("Failed to initialize event loop");
+    let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event();
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
+        // Our native menu owns shortcuts; winit's launch-time default must not replace it.
+        event_loop.with_default_menu(false);
+    }
+    let event_loop = event_loop.build().expect("Failed to initialize event loop");
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::EventLoopWindowTargetExtMacOS;
+        event_loop.set_allows_automatic_window_tabbing(false);
+    }
     native_macos::install(event_loop.create_proxy())
         .expect("Could not install native document callbacks");
     let window = Arc::new(
@@ -54,6 +69,7 @@ fn main() {
             return;
         }
     };
-    let mut app = app::App::new(window, renderer, argument.map(PathBuf::from));
+    let menus = menus::NativeMenus::new(event_loop.create_proxy()).expect("Could not create menus");
+    let mut app = app::App::new(window, renderer, argument.map(PathBuf::from), menus);
     let _ = event_loop.run(move |event, target| app.event(event, target));
 }

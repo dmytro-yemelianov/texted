@@ -22,6 +22,7 @@ pub enum Intent {
     SearchBackspace,
     SearchTab,
     SearchClose,
+    ContextMenu,
     ToggleAppearance,
     Zoom(i32),
     ResetFontSize,
@@ -147,6 +148,11 @@ pub fn decode(input: &KeyInput<'_>, search: SearchContext) -> Option<Intent> {
     let meta = input.modifiers.control_key() || input.modifiers.super_key();
     let alt = input.modifiers.alt_key();
     let shift = input.modifiers.shift_key();
+    if *input.logical == Key::Named(NamedKey::ContextMenu)
+        || (shift && *input.logical == Key::Named(NamedKey::F10))
+    {
+        return Some(Intent::ContextMenu);
+    }
     if meta {
         if let Some(intent) = shortcut(input) {
             return Some(intent);

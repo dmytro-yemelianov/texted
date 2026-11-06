@@ -27,6 +27,8 @@ Snapshots do not flatten the document. Search streams across rope chunks. Text c
 
 ## Controls
 
+Development builds include native **Texted / File / Edit / Search / View / Window** menus. Right-click the document, or press **Shift+F10**, for editing and Style actions. Right-clicking inside a selection preserves it; clicking outside positions the caret first. Unavailable actions are disabled, and View options reflect the current editor state. Native Window actions include minimize, zoom and fullscreen. The published v0.2.0 preview predates these menus.
+
 | Action | Shortcut |
 |---|---|
 | Copy / cut / paste | Cmd+C / Cmd+X / Cmd+V |
@@ -42,6 +44,7 @@ Snapshots do not flatten the document. Search streams across rope chunks. Text c
 | Block selection | Option+drag or Cmd+B |
 | Toggle line numbers | Cmd+L |
 | Appearance / styles | Cmd+, or the Style button |
+| Context menu | Right-click / Shift+F10 |
 | Editor font size | Cmd++ / Cmd+- / Cmd+0 (reset size) |
 | Diagnostics | F3 |
 

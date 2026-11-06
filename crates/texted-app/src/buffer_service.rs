@@ -26,6 +26,8 @@ pub struct Published {
     pub document: u64,
     pub completed_through: u64,
     pub busy: Option<u64>,
+    pub can_undo: bool,
+    pub can_redo: bool,
 }
 impl Published {
     pub fn context(&self) -> EditContext {
@@ -164,6 +166,8 @@ impl BufferService {
             document: 0,
             completed_through: 0,
             busy: None,
+            can_undo: false,
+            can_redo: false,
         };
         let shared = Arc::new(Shared {
             published: Mutex::new(Arc::new(published)),
@@ -263,6 +267,8 @@ impl Actor {
             document: self.document,
             completed_through: self.watermark,
             busy: self.active.as_ref().map(|a| a.sequence),
+            can_undo: self.model.buffer.can_undo(),
+            can_redo: self.model.buffer.can_redo(),
         });
         self.shared.changed.notify_all();
         (self.shared.wake)();
@@ -506,6 +512,33 @@ mod tests {
             assert!(!timeout.timed_out());
         }
         published.clone()
+    }
+    #[test]
+    fn published_history_tracks_undo_redo_new_edits_and_document_loads() {
+        let service = BufferService::new(|| {});
+        let c = &service.client;
+        let initial = c.latest();
+        assert!(!initial.can_undo && !initial.can_redo);
+        let inserted = wait(
+            c,
+            submit(c, Command::Edit(EditorCommand::Insert("abc".into()))),
+        );
+        assert!(inserted.can_undo && !inserted.can_redo);
+        let undone = wait(c, submit(c, Command::Edit(EditorCommand::Undo)));
+        assert!(!undone.can_undo && undone.can_redo);
+        let redone = wait(c, submit(c, Command::Edit(EditorCommand::Redo)));
+        assert!(redone.can_undo && !redone.can_redo);
+        wait(c, submit(c, Command::Edit(EditorCommand::Undo)));
+        let edited = wait(
+            c,
+            submit(c, Command::Edit(EditorCommand::Insert("new".into()))),
+        );
+        assert!(edited.can_undo && !edited.can_redo);
+        let loaded = wait(c, submit(c, Command::Load(ropey::Rope::from_str("loaded"))));
+        assert!(!loaded.can_undo && !loaded.can_redo);
+        // Old immutable publications keep their own availability, just like their text roots.
+        assert!(undone.can_redo);
+        assert!(!initial.can_undo);
     }
     #[test]
     fn a_ten_thousand_row_worker_commits_once_and_undo_restores_the_root() {

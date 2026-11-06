@@ -12,11 +12,16 @@ A0–A11 are implemented. The [results](docs/performance-hardening-results.md) r
 
 [PR #7](https://github.com/dmytro-yemelianov/texted/pull/7) is merged into `main` and adds static theme palettes and editor typography only. `appearance.rs` owns versioned, validated values and optional color overrides; `appearance_ui.rs` owns the modal Style panel; `preferences.rs` coalesces atomic writes off the UI thread. `graphics.rs` loads selectable system faces once at startup and uses a separate fixed UI face. Every font/size/spacing change updates the shared viewport metrics; pixel mode uses integer cells with a Unicode fallback. The default settings file is under Application Support/Texted; use `TEXTED_SETTINGS_PATH` for isolated UI tests. The final feature commit is `549d312`; the merge commit is `bcd3a77`, with the same source tree. ARM/Intel CI, universal packaging, 95 tests and review passed. Native checks confirmed corrected Ukrainian pixel glyphs, punctuation, Style/zoom controls and persistence across restart without changing document bytes. No shader effects were added. These changes are in development builds; the existing `v0.2.0` preview predates PR #7. See README for controls and config.
 
+## Native menus
+
+The `feat/native-menus` branch adds macOS application menus (Texted, File, Edit, Search, View, Window) and a document context menu (right-click / Shift+F10). `menus.rs` owns native items and their enable/check state; callbacks send `AppEvent::Menu` into the existing typed intent path. `context_menu.rs` owns selection hit rules and the pending invocation value. The shell waits for accepted commands before testing the selection or positioning the caret, and cancels a popup request if newer input, document identity or modal state makes it obsolete. Published snapshots now include undo/redo availability. Clipboard and file barriers remain authoritative. winit's default menu and automatic window tabbing are disabled because this is a single-document editor. Local validation: 99 Rust tests, Clippy, formatting, two packaging tests and the explicit Metal test passed. Native checks covered both popup entry points, selection preservation, context deletion and undo, history enablement, Style, single-dispatch Cmd+L and saving an exact UTF-8 fixture. These changes are development-only; no release tag was created.
+
 ## Component map
 
 | Component | Owner / invariant |
 |---|---|
 | `main.rs`, `app.rs` | Bootstrap and native adaptation/scheduling; no editing algorithms or blocking buffer replies |
+| `menus.rs`, `context_menu.rs` | Native actions/state and selection-aware popup invocation; shared intent dispatch |
 | `input.rs`, `commands.rs` | Physical-key shortcuts and typed intents, windowless |
 | `editing.rs`, `selection.rs`, `mouse.rs` | Canonical editor/drag transitions and selection values; shell mouse state tracks only gestures |
 | `buffer_service.rs` | Sole live-buffer owner; bounded admission, completion watermark, published snapshots and fenced bulk commits |
