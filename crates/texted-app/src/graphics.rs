@@ -218,17 +218,32 @@ impl FontEngine {
             // Keep non-bitmap Unicode (including Ukrainian) in the same 8x8 cell, using the system face.
             let mut bits = [0u8; 8];
             if let Some(font) = self.font.as_ref().filter(|font| font.glyph_id(ch).0 != 0) {
-                let scaled = font.as_scaled(PxScale::from(8.0));
+                // Match the bitmap face's cap/x-height, rather than fitting the font's padded em box.
+                let scaled = font.as_scaled(PxScale::from(13.0));
                 if let Some(outline) = font.outline_glyph(scaled.scaled_glyph(ch)) {
                     let bounds = outline.px_bounds();
-                    let dx = (8.0 - scaled.h_advance(scaled.glyph_id(ch))) / 2.0;
+                    let sx = (8.0 / bounds.width().max(1.0)).min(1.0);
+                    let sy = (8.0 / bounds.height().max(1.0)).min(1.0);
+                    let dx = ((8.0 - bounds.width() * sx) / 2.0).floor();
+                    let dy = (7.0 + bounds.min.y).clamp(0.0, (8.0 - bounds.height() * sy).max(0.0));
+                    let mut coverage = [0f32; 64];
                     outline.draw(|x, y, a| {
-                        let x = x as i32 + (bounds.min.x + dx).round() as i32;
-                        let y = y as i32 + (bounds.min.y + scaled.ascent()).round() as i32;
-                        if a >= 0.35 && (0..8).contains(&x) && (0..8).contains(&y) {
-                            bits[y as usize] |= 1 << x;
+                        let x = (x as f32 * sx + dx).floor() as i32;
+                        let y = (y as f32 * sy + dy).floor() as i32;
+                        if (0..8).contains(&x) && (0..8).contains(&y) {
+                            let cell = &mut coverage[y as usize * 8 + x as usize];
+                            *cell = cell.max(a);
                         }
                     });
+                    let peak = coverage.iter().copied().fold(0.0, f32::max);
+                    if peak > 0.0 {
+                        let threshold = 0.35f32.min(peak * 0.65);
+                        for (i, a) in coverage.into_iter().enumerate() {
+                            if a >= threshold {
+                                bits[i / 8] |= 1 << (i % 8);
+                            }
+                        }
+                    }
                 }
             } else {
                 bits = bitmap('?').unwrap();
@@ -377,6 +392,39 @@ pub(crate) fn draw_box(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pixel_fallback_keeps_thin_punctuation_visible() {
+        let mut font = FontEngine::with_typography(Typography {
+            family: FontFamily::Pixel,
+            size_px: 8,
+            ..Default::default()
+        });
+        for ch in "—’".chars() {
+            assert!(font.glyph(ch).coverage.contains(&255), "missing {ch}");
+        }
+    }
+    #[test]
+    fn pixel_ukrainian_capitals_match_bitmap_letter_height() {
+        let mut font = FontEngine::with_typography(Typography {
+            family: FontFamily::Pixel,
+            size_px: 8,
+            ..Default::default()
+        });
+        for ch in "ПҐЇЄ".chars() {
+            let glyph = font.glyph(ch);
+            let rows: Vec<_> = glyph
+                .coverage
+                .chunks(8)
+                .enumerate()
+                .filter(|(_, row)| row.contains(&255))
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                rows.last().unwrap() - rows.first().unwrap() + 1 >= 6,
+                "{ch}: {rows:?}"
+            );
+        }
+    }
     #[test]
     fn line_spacing_changes_reuse_the_same_cached_glyphs() {
         let mut font = FontEngine::new(18.0);

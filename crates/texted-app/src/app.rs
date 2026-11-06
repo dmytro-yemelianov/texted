@@ -235,7 +235,7 @@ impl App {
                 } else {
                     self.font.set_line_spacing(typography.line_spacing);
                 }
-                self.viewport.current = None;
+                // Hit-test the last painted frame until redraw installs the new font geometry.
                 self.viewport.horizontal.reset();
                 self.viewport.bar = None;
                 self.viewport.top_wrap_row = 0;

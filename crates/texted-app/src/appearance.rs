@@ -278,7 +278,7 @@ impl Appearance {
         for (key, color) in &self.colors {
             let digits = color
                 .strip_prefix('#')
-                .filter(|s| s.len() == 6)
+                .filter(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_hexdigit()))
                 .ok_or_else(|| format!("Color {key} must be #RRGGBB"))?;
             let rgb = u32::from_str_radix(digits, 16)
                 .map_err(|_| format!("Color {key} must be #RRGGBB"))?;
@@ -319,6 +319,8 @@ mod tests {
         assert!(a.normalize().is_err());
         a.version = 1;
         a.colors.insert("bg".into(), "#GG0000".into());
+        assert!(a.normalize().is_err());
+        a.colors.insert("bg".into(), "#+12345".into());
         assert!(a.normalize().is_err());
         a.colors.clear();
         a.colors.insert("unknown".into(), "#ffffff".into());
