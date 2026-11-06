@@ -191,6 +191,23 @@ impl App {
                 self.keyboard(event);
             }
 
+            WindowEvent::MouseWheel { delta, .. } if self.appearance.open => {
+                let rows = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -f64::from(y),
+                    MouseScrollDelta::PixelDelta(p) => {
+                        -p.y / f64::from(self.display.scale().1)
+                            / if self.display.pixelated { 14.0 } else { 26.0 }
+                    }
+                };
+                if self.appearance.wheel(
+                    rows,
+                    self.display.source.0 as usize,
+                    self.display.source.1 as usize,
+                    self.display.pixelated,
+                ) {
+                    self.window.request_redraw();
+                }
+            }
             WindowEvent::MouseWheel { delta, .. }
                 if !self.files.locked() && !self.appearance.open =>
             {
@@ -259,7 +276,12 @@ impl App {
             )
         {
             let before = self.appearance.settings.clone();
-            self.appearance.key(&input);
+            self.appearance.key(
+                &input,
+                self.display.source.0 as usize,
+                self.display.source.1 as usize,
+                self.display.pixelated,
+            );
             self.appearance_changed(before);
             return;
         }
@@ -334,7 +356,7 @@ impl App {
             let before = self.appearance.settings.clone();
             match intent {
                 Intent::ToggleAppearance => {
-                    self.appearance.open = !self.appearance.open;
+                    self.appearance.set_open(!self.appearance.open);
                     self.mouse.dragging = false;
                     self.viewport.horizontal.end_drag();
                 }
@@ -347,7 +369,7 @@ impl App {
         }
         // Lifecycle intents are queued even while clipboard capture or another file action is pending.
         if let Some(result) = self.files.route(&intent) {
-            self.appearance.open = false;
+            self.appearance.set_open(false);
             self.report(result);
             return;
         }
@@ -522,6 +544,20 @@ impl App {
         self.pointer_physical = (x, y);
         self.mouse.position = self.display.to_source_clamped((x, y));
         let (x, y) = self.mouse.position;
+        if self.appearance.open {
+            if self.display.to_source(self.pointer_physical).is_some()
+                && self.appearance.hover(
+                    self.display.source.0 as usize,
+                    self.display.source.1 as usize,
+                    x,
+                    y,
+                    self.display.pixelated,
+                )
+            {
+                self.window.request_redraw();
+            }
+            return;
+        }
         if self.locked() {
             return;
         }
@@ -543,6 +579,9 @@ impl App {
         }
         let (x, y) = self.mouse.position;
         if self.display.to_source(self.pointer_physical).is_none() {
+            if self.appearance.dismiss_dropdown() {
+                self.window.request_redraw();
+            }
             return;
         }
         let (width, height) = self.display.source;

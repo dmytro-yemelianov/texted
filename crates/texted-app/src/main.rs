@@ -3,6 +3,7 @@ mod app;
 mod appearance_ui;
 mod context_menu;
 mod documents;
+mod dropdown;
 mod editor_view;
 mod file_flow;
 mod gpu;
