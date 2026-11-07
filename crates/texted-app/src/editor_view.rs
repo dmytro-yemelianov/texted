@@ -13,6 +13,9 @@ use texted_buffer::BufferSnapshot;
 use texted_io::LineEnding;
 use texted_layout::{ViewportConfig, ViewportLayout};
 pub(crate) struct ViewModel<'a> {
+    pub footer: &'a crate::status_ui::Footer,
+    pub words: Option<usize>,
+    pub zoom_percent: u16,
     pub palette: &'a texted_app::appearance::Palette,
     pub snap: &'a BufferSnapshot,
     pub layout: &'a ViewportLayout,
@@ -649,147 +652,8 @@ fn paint_compact_search(buffer: &mut DrawList, font: &mut FontEngine, model: &Vi
     }
 }
 
-fn paint_status(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewModel<'_>) {
-    if model.compact {
-        let y = model.height.saturating_sub(14);
-        draw_rect(
-            buffer,
-            model.width,
-            model.height,
-            0,
-            y,
-            model.width,
-            14,
-            model.palette.status_bg,
-        );
-        let text = format!(
-            "L{} C{} {} {}x{}",
-            model.cur_line + 1,
-            model.cur_col + 1,
-            if model.selection.mode == SelectionMode::Block {
-                "B"
-            } else if model.word_wrap {
-                "W"
-            } else {
-                "-"
-            },
-            model.width,
-            model.height
-        );
-        font_engine.draw_string(
-            buffer,
-            model.width.saturating_sub(50),
-            model.height,
-            2,
-            y + 3,
-            &text,
-            model.palette.status_text,
-        );
-        crate::appearance_ui::paint_status_button(
-            buffer,
-            font_engine,
-            model.width,
-            model.height,
-            model.palette,
-            true,
-        );
-        return;
-    }
-    let ViewModel {
-        snap,
-        selection,
-        search_state,
-        width,
-        height,
-        cur_line,
-        cur_col,
-        word_wrap,
-        bom,
-        ending,
-        ..
-    } = *model;
-    // 10. Render Status Bar
-    let status_y = height.saturating_sub(if model.compact { 14 } else { 28 });
-    draw_rect(
-        buffer,
-        width,
-        height,
-        0,
-        status_y,
-        width,
-        1,
-        model.palette.status_border,
-    );
-    draw_rect(
-        buffer,
-        width,
-        height,
-        0,
-        status_y + 1,
-        width,
-        27,
-        model.palette.status_bg,
-    );
-
-    let status_mode = match selection.mode {
-        SelectionMode::Block => {
-            let min_l = selection.anchor_line.min(selection.active_line) + 1;
-            let max_l = selection.anchor_line.max(selection.active_line) + 1;
-            let min_c = selection.anchor_col.min(selection.active_col) + 1;
-            let max_c = selection.anchor_col.max(selection.active_col) + 1;
-            format!("[BLOCK SELECT: R{min_l}-R{max_l}, C{min_c}-C{max_c}]")
-        }
-        SelectionMode::Stream => "[SELECT]".to_string(),
-        SelectionMode::None => {
-            if search_state.mode != SearchBarMode::Closed {
-                "[SEARCH]".to_string()
-            } else {
-                "[NORMAL]".to_string()
-            }
-        }
-    };
-
-    let wrap_text = if word_wrap { "Wrap: ON" } else { "Wrap: OFF" };
-
-    let status_text = format!(
-        "  Ln {}, Col {}    {}    {}    {} chars / {} B    {}    {}",
-        cur_line + 1,
-        cur_col + 1,
-        status_mode,
-        wrap_text,
-        snap.content.len_chars(),
-        snap.total_bytes,
-        if bom { "UTF-8 BOM" } else { "UTF-8" },
-        if ending == LineEnding::Crlf {
-            "CRLF"
-        } else {
-            "LF"
-        }
-    );
-
-    let status_color = if selection.mode == SelectionMode::Block {
-        model.palette.status_accent
-    } else {
-        model.palette.status_text
-    };
-
-    font_engine.draw_string(
-        buffer,
-        width.saturating_sub(100),
-        height,
-        8,
-        status_y + 5,
-        &status_text,
-        status_color,
-    );
-    crate::appearance_ui::paint_status_button(
-        buffer,
-        font_engine,
-        width,
-        height,
-        model.palette,
-        false,
-    );
+fn paint_status(buffer: &mut DrawList, font: &mut FontEngine, model: &ViewModel<'_>) {
+    model.footer.paint(buffer, font, model);
 }
 
 fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewModel<'_>) {

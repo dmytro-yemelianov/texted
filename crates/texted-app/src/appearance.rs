@@ -188,20 +188,15 @@ impl Palette {
         Ok(())
     }
 }
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FontFamily {
     #[default]
-    #[serde(rename = "vga_8x16", alias = "courier")]
     Vga,
-    #[serde(rename = "bios_8x8", alias = "pixel")]
     Bios,
-    #[serde(rename = "ega_8x14")]
     Ega,
-    #[serde(rename = "spleen_6x12", alias = "monaco")]
     SpleenSmall,
-    #[serde(rename = "spleen_8x16", alias = "menlo")]
     Spleen,
+    Local(u16),
 }
 impl FontFamily {
     pub const ALL: [Self; 5] = [
@@ -218,7 +213,19 @@ impl FontFamily {
             Self::Vga => "IBM VGA 8x16",
             Self::SpleenSmall => "Spleen 6x12",
             Self::Spleen => "Spleen 8x16",
+            Self::Local(index) => {
+                crate::font_library::get(index).map_or("Unavailable font", |f| f.name.as_str())
+            }
         }
+    }
+    pub fn maximum_size(self) -> u16 {
+        let (width, height) = self.cell();
+        let scale = (64 / height)
+            .max(1)
+            .min(1022 / width)
+            .min(1022 / height)
+            .max(1);
+        height * scale
     }
     pub fn cell(self) -> (u16, u16) {
         match self {
@@ -226,15 +233,56 @@ impl FontFamily {
             Self::Ega => (8, 14),
             Self::Vga | Self::Spleen => (8, 16),
             Self::SpleenSmall => (6, 12),
+            Self::Local(index) => crate::font_library::get(index)
+                .filter(|f| f.enabled())
+                .map_or((8, 16), |f| (f.width, f.height)),
         }
     }
 }
+impl Serialize for FontFamily {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let id = match *self {
+            Self::Vga => "vga_8x16",
+            Self::Bios => "bios_8x8",
+            Self::Ega => "ega_8x14",
+            Self::SpleenSmall => "spleen_6x12",
+            Self::Spleen => "spleen_8x16",
+            Self::Local(index) => {
+                return serializer.serialize_str(&format!(
+                    "verba:{}",
+                    crate::font_library::get(index)
+                        .ok_or_else(|| serde::ser::Error::custom("Unknown local font"))?
+                        .id
+                ))
+            }
+        };
+        serializer.serialize_str(id)
+    }
+}
+impl<'de> Deserialize<'de> for FontFamily {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = String::deserialize(deserializer)?;
+        Ok(match id.as_str() {
+            "vga_8x16" | "courier" => Self::Vga,
+            "bios_8x8" | "pixel" => Self::Bios,
+            "ega_8x14" => Self::Ega,
+            "spleen_6x12" | "monaco" => Self::SpleenSmall,
+            "spleen_8x16" | "menlo" => Self::Spleen,
+            name if name.starts_with("verba:") => crate::font_library::find(&name[6..])
+                .map(Self::Local)
+                .unwrap_or(Self::Vga),
+            _ => return Err(serde::de::Error::custom("Unknown bitmap font family")),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Typography {
     pub family: FontFamily,
     pub size_px: u16,
     pub line_spacing: u16,
+    pub zoom_percent: u16,
 }
 impl Default for Typography {
     fn default() -> Self {
@@ -242,20 +290,46 @@ impl Default for Typography {
             family: FontFamily::Vga,
             size_px: 16,
             line_spacing: 100,
+            zoom_percent: 100,
         }
     }
 }
 impl Typography {
     pub fn normalize(&mut self) {
         let height = self.family.cell().1;
-        self.size_px = ((self.size_px.clamp(height, 64) + height / 2) / height * height)
-            .clamp(height, 64 / height * height);
+        let maximum = self.family.maximum_size();
+        self.size_px = ((self.size_px.clamp(height, maximum) + height / 2) / height * height)
+            .clamp(height, maximum);
         self.line_spacing = self.line_spacing.clamp(100, 180);
+        self.zoom_percent = self.zoom_percent.clamp(10, 800);
+    }
+    pub fn scale_percent(self) -> u16 {
+        ((u32::from(self.size_px) * u32::from(self.zoom_percent)) / u32::from(self.family.cell().1))
+            .min(800) as u16
     }
     pub fn resize(&mut self, delta: i32) {
-        let height = i32::from(self.family.cell().1);
-        self.size_px = (i32::from(self.size_px) + delta * height).clamp(height, 64) as u16;
+        let scale = (i32::from(self.scale_percent()) + delta * 10).clamp(10, 800);
+        self.size_px = self.family.cell().1;
+        self.zoom_percent = scale as u16;
         self.normalize();
+    }
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseCursor {
+    #[default]
+    System,
+    Pixel,
+    LargePixel,
+}
+impl MouseCursor {
+    pub const ALL: [Self; 3] = [Self::System, Self::Pixel, Self::LargePixel];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Pixel => "Pixel",
+            Self::LargePixel => "Large pixel",
+        }
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +337,7 @@ impl Typography {
 pub struct Appearance {
     pub version: u32,
     pub theme: Theme,
+    pub mouse_cursor: MouseCursor,
     pub typography: Typography,
     pub framebuffer: Framebuffer,
     pub pixel_typography: Typography,
@@ -274,12 +349,14 @@ impl Default for Appearance {
         Self {
             version: 1,
             theme: Theme::default(),
+            mouse_cursor: MouseCursor::System,
             typography: Typography::default(),
             framebuffer: Framebuffer::default(),
             pixel_typography: Typography {
                 family: FontFamily::Bios,
                 size_px: 8,
                 line_spacing: 100,
+                zoom_percent: 100,
             },
             colors: BTreeMap::new(),
         }
@@ -331,6 +408,27 @@ impl Appearance {
 mod tests {
     use super::*;
     #[test]
+    fn zoom_changes_by_ten_percent_without_changing_native_masks() {
+        for family in FontFamily::ALL {
+            let mut t = Typography {
+                family,
+                size_px: family.cell().1,
+                ..Default::default()
+            };
+            for expected in [110, 120, 130] {
+                t.resize(1);
+                assert_eq!(t.scale_percent(), expected);
+                assert_eq!(t.size_px, family.cell().1);
+            }
+            t.resize(-1);
+            assert_eq!(t.scale_percent(), 120);
+            t.resize(-1000);
+            assert_eq!(t.scale_percent(), 10);
+            t.resize(1000);
+            assert_eq!(t.scale_percent(), 800);
+        }
+    }
+    #[test]
     fn legacy_outline_preferences_migrate_to_bundled_faces_and_valid_native_sizes() {
         for (old, family) in [
             ("courier", FontFamily::Vga),
@@ -351,6 +449,7 @@ mod tests {
                     family,
                     size_px,
                     line_spacing: 100,
+                    zoom_percent: 100,
                 };
                 t.normalize();
                 assert!((family.cell().1..=64).contains(&t.size_px));
@@ -376,7 +475,7 @@ mod tests {
         a.framebuffer = Framebuffer::Native;
         assert_eq!(a.editor_typography(), native);
         a.framebuffer = Framebuffer::Auto;
-        assert_eq!(a.editor_typography().size_px, 16);
+        assert_eq!(a.editor_typography().scale_percent(), 110);
         let copy: Appearance = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
         assert_eq!(copy, a);
         assert!(serde_json::from_str::<Appearance>(r#"{"framebuffer":"4k"}"#).is_err());

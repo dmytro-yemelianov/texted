@@ -1,7 +1,9 @@
 //! Texted's native entry point. Editing, workers, file lifecycle and painting have separate owners.
 mod app;
 mod appearance_ui;
+mod chrome;
 mod context_menu;
+mod cursor_ui;
 mod documents;
 mod dropdown;
 mod editor_view;
@@ -14,6 +16,8 @@ mod mouse;
 mod native_macos;
 mod presentation;
 mod search_ui;
+mod session;
+mod status_ui;
 mod transfers;
 mod viewport;
 use documents::Action;
@@ -23,19 +27,49 @@ use winit::{event_loop::EventLoopBuilder, window::WindowBuilder};
 pub enum AppEvent {
     Document(Action),
     Menu(menus::MenuCommand),
+    Quit,
 }
 fn main() {
-    let argument = std::env::args().nth(1);
-    match argument.as_deref() {
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    let argument = arguments.first();
+    match argument.map(String::as_str) {
         Some("--version" | "-V") => {
             println!("Texted {}", env!("CARGO_PKG_VERSION"));
             return;
         }
+        Some("--list-fonts") => {
+            for family in texted_app::appearance::FontFamily::ALL {
+                println!(
+                    "{} · {}x{} · bundled",
+                    family.name(),
+                    family.cell().0,
+                    family.cell().1
+                );
+            }
+            for font in &texted_app::font_library::catalog().fonts {
+                println!(
+                    "{} · {} · {}x{} · UA {}/66 · {}",
+                    font.id,
+                    font.name,
+                    font.width,
+                    font.height,
+                    font.ukrainian,
+                    font.disabled_reason.as_deref().unwrap_or("ready")
+                );
+            }
+            for warning in &texted_app::font_library::catalog().warnings {
+                eprintln!("Font catalog: {warning}");
+            }
+            return;
+        }
         Some("--help" | "-h") => {
-            println!("Texted {}\nUsage: texted [FILE]\n       texted --version\n\nOpen FILE as plain UTF-8 text. Without FILE, open an empty document.",env!("CARGO_PKG_VERSION"));
+            println!("Texted {}\nUsage: texted [FILE ...]\n       texted --version\n       texted --list-fonts\n\nOpen files as plain UTF-8 text in separate tabs. Without FILE, open an empty document.",env!("CARGO_PKG_VERSION"));
             return;
         }
         _ => {}
+    }
+    for warning in &texted_app::font_library::catalog().warnings {
+        eprintln!("Font catalog: {warning}");
     }
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event();
     #[cfg(target_os = "macos")]
@@ -72,6 +106,11 @@ fn main() {
         }
     };
     let menus = menus::NativeMenus::new(event_loop.create_proxy()).expect("Could not create menus");
-    let mut app = app::App::new(window, renderer, argument.map(PathBuf::from), menus);
+    let mut app = app::App::new(
+        window,
+        renderer,
+        arguments.into_iter().map(PathBuf::from).collect(),
+        menus,
+    );
     let _ = event_loop.run(move |event, target| app.event(event, target));
 }

@@ -8,8 +8,23 @@ pub struct BitmapFace {
     data: &'static [u8],
 }
 impl BitmapFace {
+    /// Construct a checked native strike from sorted Unicode records and packed rows.
+    pub fn from_records(width: u16, height: u16, data: &'static [u8]) -> Result<Self, String> {
+        if !(1..=1022).contains(&width)
+            || !(1..=1022).contains(&height)
+            || u32::from(width) * u32::from(height) > 262144
+        {
+            return Err("Native cell dimensions are unsupported".into());
+        }
+        crate::font_library::validate_records(data, width, height)?;
+        Ok(Self {
+            width,
+            height,
+            data,
+        })
+    }
     pub fn glyph(self, ch: char) -> Option<&'static [u8]> {
-        let stride = 4 + usize::from(self.height);
+        let stride = 4 + usize::from(self.height) * usize::from(self.width.div_ceil(8));
         let mut low = 0;
         let mut high = self.data.len() / stride;
         while low < high {
@@ -33,6 +48,12 @@ pub fn face(family: FontFamily) -> BitmapFace {
         FontFamily::Vga => include_bytes!("../../../assets/fonts/vga_8x16.bin"),
         FontFamily::SpleenSmall => include_bytes!("../../../assets/fonts/spleen_6x12.bin"),
         FontFamily::Spleen => include_bytes!("../../../assets/fonts/spleen_8x16.bin"),
+        FontFamily::Local(index) => crate::font_library::get(index)
+            .filter(|f| f.enabled())
+            .map_or(
+                include_bytes!("../../../assets/fonts/vga_8x16.bin").as_slice(),
+                |f| f.data.as_slice(),
+            ),
     };
     BitmapFace {
         width,

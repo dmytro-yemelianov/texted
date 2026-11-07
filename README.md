@@ -13,7 +13,7 @@ cargo run --release --bin texted -- path/to/file.txt
 cargo run --release --bin texted
 ```
 
-The current GUI uses bundled bitmap fonts and macOS `pbcopy`/`pbpaste`. Running without a path opens an empty document. Open and Save As use native macOS dialogs. Opening another file, creating a document or quitting prompts to save unsaved edits. Files can also be dropped onto the window or opened through Finder's Open With menu; Texted edits one document at a time.
+The current GUI uses bundled bitmap fonts and macOS `pbcopy`/`pbpaste`. Running without a path opens an empty document. Open and Save As use native macOS dialogs. New and Open create tabs. Files can also be dropped onto the window, passed together on the command line, or opened together through Finder. Each tab retains its own buffer, undo/redo, selection, search and scroll position. Closing a changed tab prompts to save it; quitting checks each remaining tab and Cancel stops the sequence.
 
 ## Implementation
 
@@ -23,7 +23,7 @@ The current GUI uses bundled bitmap fonts and macOS `pbcopy`/`pbpaste`. Running 
 - `texted-io`: streaming UTF-8 loading, internal LF normalization, BOM/newline metadata, and buffered atomic saves through a unique sibling file. Saves flush and sync the file and, on Unix, its parent directory. Existing permissions are preserved.
 - `texted-app`: winit/wgpu shell using Metal on macOS. `graphics.rs` builds ordered drawing commands; `gpu.rs` draws instanced rectangles and glyphs from a bounded texture atlas. Search has one active job, one latest pending job and a bounded result mailbox; it counts matches without storing every offset. Bulk edits and replacements prepare snapshot plans outside the buffer owner and commit only against the same document, revision, cursor and selection. Native dialogs are asynchronous; file loading and saving run in background workers. The saved rope root tracks unsaved edits, including undo back to the saved state.
 
-Snapshots do not flatten the document. Search streams across rope chunks. Text compositing, backgrounds, selection and the caret render on the GPU. Font outlines are rasterized on the CPU on cache misses and uploaded once per atlas entry. Atlas coverage is limited to eight 1 MiB pages, with eviction between frames; instance buffers are reused. There is no full-window CPU pixel buffer. A Metal-capable Mac is required; startup reports an error if GPU initialization fails.
+Snapshots do not flatten the document. Search streams across rope chunks. Text compositing, backgrounds, selection and the caret render on the GPU. Native one-bit glyph masks are unpacked on CPU cache misses and uploaded once per atlas entry. Atlas coverage is limited to eight 1 MiB pages, with eviction between frames; instance buffers are reused. There is no full-window CPU pixel buffer. A Metal-capable Mac is required; startup reports an error if GPU initialization fails.
 
 ## Controls
 
@@ -43,14 +43,19 @@ Development builds include native **Texted / File / Edit / Search / View / Windo
 | Horizontal scrolling (wrap off) | Trackpad / Shift+wheel / scrollbar |
 | Block selection | Option+drag or Cmd+B |
 | Toggle line numbers | Cmd+L |
-| Appearance / styles | Cmd+, or the Style button |
+| Appearance / styles | Cmd+, or Appearance in the footer |
 | Context menu | Right-click / Shift+F10 |
-| Editor font size | Cmd++ / Cmd+- / Cmd+0 (reset size) |
-| Diagnostics | F3 |
+| Text scale, steps of 10% | Cmd++ / Cmd+- / Cmd+0 (100%) |
+| Previous / next tab | Ctrl+Shift+Tab / Ctrl+Tab; Cmd+Shift+[ / ] |
+| Document details | Cmd+Shift+I |
+| Show / hide F-key panel | F1; View → Function Key Commands |
+| Diagnostics | View → Diagnostics |
 
 Physical letter keys keep shortcuts working with Ukrainian keyboard layouts. Wrapping currently breaks at character-cell boundaries. Text uses character columns rather than grapheme clusters or shaped display cells; complex-script shaping and IME composition remain future work. No-wrap mode supports the trackpad horizontal axis, Shift+wheel, scrollbar dragging and page clicks. Navigation and typing keep the caret visible; manual scrolling leaves its document position unchanged.
 
-In Native mode, the status bar counts Unicode scalar values and reports UTF-8 buffer bytes. The byte count excludes the BOM and uses normalized LF, so it can differ from the saved file's size. Encoding and line-ending labels describe the save format.
+The footer shows a word or selected-character count, text scale and Appearance. Click the count for document details: Unicode character count, normalized UTF-8 bytes, cursor position, save encoding/newlines and a wrapping switch. Hover over actions for help. Word counts run on a cancellable background snapshot scan. UTF-8 bytes exclude the BOM and use internal LF, so they can differ from the saved file size.
+
+The clickable F-key panel occupies one line and can be hidden with F1. Its keys work while hidden: **F2 Save · F3 Find · F4 Replace · F5 Open · F6 New · F7 Previous tab · F8 Next tab · F9 Appearance · F10 Close tab · F11 Wrap · F12 Details**. Shift+F10 still opens the context menu. The panel shows the commands relevant to the editor, search or Appearance; narrow framebuffers show a prioritized subset. Hold **Cmd / Option / Control / Shift** on the keyboard to switch F-command labels and actions. The panel displays only commands. Shift offers Save As, previous match and Replace All; Cmd exposes undo/redo and quit; Option exposes clipboard/selection actions; Control exposes 10% zoom. On keyboards that reserve F-keys for media controls, use Fn or click the commands.
 
 ## Themes and typography
 
@@ -58,7 +63,13 @@ Available in `main` development builds; the published v0.2.0 preview predates th
 
 Appearance offers Modern Dark/Light, VGA, EGA, Atari, Commander, C64, ZX Spectrum, Amber and Green CRT palettes. The theme applies to the document, selection/search highlights, gutter, status, search and appearance panels. Palettes and editor fonts are independent.
 
-Open **Style** in the status bar or press **Cmd+,**. Click a field to open its dropdown list, or use Tab/Shift+Tab to focus a field and Enter/Space to open it. Up/Down selects a list item; Enter applies it. Escape or an outside click dismisses the list without changing the value; a second Escape closes Style. Long lists support wheel scrolling, Page Up/Down and Home/End. Choosing a value applies it immediately; Done closes the panel. Choose IBM BIOS 8×8, IBM EGA 8×14, IBM VGA 8×16, Spleen 6×12 or Spleen 8×16. Every face includes the complete Ukrainian alphabet. Sizes are whole multiples of the native cell height, up to 64 px, with 100–180% line height. Text uses exact one-bit bitmap masks with nearest-texel sampling, including UI labels (VGA 8×16 in Native mode; BIOS 8×8 inside framebuffers). Unsupported characters show an explicit missing-glyph box. See the [font review and glyph sheets](docs/bitmap-font-review.md). Settings do not edit the document or its undo history.
+Open **Appearance** in the footer or press **Cmd+,**. Drag its title to move it. Click a field to open its list, or use Tab/Shift+Tab then Enter/Space. Up/Down, Home/End and Page Up/Down preview the highlighted value immediately; Enter or a click keeps it, and Escape/outside clicks restore the previous value. Preview settings are not written to disk. Done keeps the preview and closes the panel. Font lists contain actual bitmap specimens and accept typed name searches; wheel scrolling browses long lists.
+
+Five embedded faces include the complete Ukrainian alphabet: IBM BIOS 8×8, EGA 8×14, VGA 8×16, Spleen 6×12 and 8×16. The optional [Verba library bridge](docs/verba-font-library.md) adds the complete local catalog and saved glyph edits with actual coverage, disabled reasons and source metadata. It currently exposes 2,266 entries, of which 1,993 have unambiguous Unicode bitmap glyphs. The font selector does not invent Unicode mappings for raw-code fonts.
+
+Text scale changes by **10%**, from 10–800%; 110%, 120%, etc. scale the original masks through nearest-texel sampling. The native glyph pixels stay one-bit. Legacy integer `size_px` settings still load. Line height is independently adjustable from 100–180%. UI labels use fixed bitmap faces. Unsupported characters display a missing-glyph box. See the [bundled font review](docs/bitmap-font-review.md). Appearance settings do not edit document text or undo history.
+
+The Mouse cursor selector offers **System**, **Pixel** and **Large pixel**. Pointer shapes follow the hovered control: text, buttons and draggable headers. Pixel cursors render within the app; the system cursor returns outside the client scene, on focus loss and during file dialogs.
 
 Style also offers a **Screen / Resolution** row. **Auto (theme)** renders retro palettes into a real limited-resolution framebuffer: VGA 640×480, EGA 640×350, Atari/C64 320×200, Commander 720×400, ZX Spectrum 256×192, and monochrome 720×350. Modern themes stay native. Choose **Native** for a full-resolution palette, or select an explicit raster independently of the theme. The complete in-app scene scales to the largest size that fits the window, preserving the source aspect ratio with letterboxing and nearest-texel sampling. Fractional upscale factors are supported. Compact Style/search/status controls remain usable at 256×192. Native and framebuffer typography are saved separately; framebuffers start with IBM BIOS 8×8 at 8 px. See [framebuffer behavior and reference platforms](docs/framebuffer.md).
 
@@ -91,7 +102,7 @@ cargo run --release --bin bench
 cargo run --release --bin bench -- --hardening
 ```
 
-The benchmark reports CPU operation times and percentiles, never keyboard-to-pixel latency. F3 reports UI command preparation time, layout time, document bytes, snapshot storage type and the active GPU/backend. These CPU times exclude GPU execution, submission and display scanout; the HUD does not report display FPS or RAM usage.
+The benchmark reports CPU operation times and percentiles, never keyboard-to-pixel latency. View → Diagnostics reports UI command preparation time, layout time, document bytes, snapshot storage type and the active GPU/backend. These CPU times exclude GPU execution, submission and display scanout; the HUD does not report display FPS or RAM usage.
 
 See [performance notes](docs/performance.md) for the audit, measurements and remaining limits. [The original design](docs/design-spec.md) is historical planning material.
 

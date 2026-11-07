@@ -24,12 +24,16 @@ pub enum MenuCommand {
     Next,
     Previous,
     Style,
+    DocumentInfo,
     ZoomIn,
     ZoomOut,
     ResetSize,
     Wrap,
     Lines,
     Diagnostics,
+    Commands,
+    PreviousTab,
+    NextTab,
 }
 impl MenuCommand {
     pub fn intent(self) -> Intent {
@@ -40,7 +44,8 @@ impl MenuCommand {
             Save | SaveAs => Intent::File(FileIntent::Save {
                 as_new: self == SaveAs,
             }),
-            Close | Quit => Intent::File(FileIntent::Close),
+            Close => Intent::File(FileIntent::Close),
+            Quit => Intent::File(FileIntent::Quit),
             Undo => Intent::Edit(EditorCommand::Undo),
             Redo => Intent::Edit(EditorCommand::Redo),
             Cut | Copy => Intent::Copy { cut: self == Cut },
@@ -57,11 +62,16 @@ impl MenuCommand {
                 forward: self == Next,
             },
             Style => Intent::ToggleAppearance,
+            DocumentInfo => Intent::DocumentInfo,
             ZoomIn | ZoomOut => Intent::Zoom(if self == ZoomIn { 1 } else { -1 }),
             ResetSize => Intent::ResetFontSize,
             Wrap => Intent::ToggleWrap,
             Lines => Intent::ToggleLineNumbers,
             Diagnostics => Intent::ToggleDiagnostics,
+            Commands => Intent::ToggleCommands,
+            PreviousTab | NextTab => Intent::NextTab {
+                forward: self == NextTab,
+            },
         }
     }
 }
@@ -78,12 +88,13 @@ pub(crate) struct MenuState {
     pub lines: bool,
     pub diagnostics: bool,
     pub block: bool,
+    pub commands: bool,
 }
 impl MenuState {
     pub fn enabled(self, command: MenuCommand) -> bool {
         use MenuCommand::*;
         match command {
-            New | Open | Save | SaveAs | Close | Quit => true, // FileFlow owns lifecycle barriers.
+            New | Open | Save | SaveAs | Close | Quit | DocumentInfo => true, // FileFlow owns lifecycle barriers.
             Style | ZoomIn | ZoomOut | ResetSize => self.style_available,
             Undo => self.editable && self.can_undo,
             Redo => self.editable && self.can_redo,
@@ -100,6 +111,7 @@ impl MenuState {
             MenuCommand::Lines => Some(self.lines),
             MenuCommand::Diagnostics => Some(self.diagnostics),
             MenuCommand::Block => Some(self.block),
+            MenuCommand::Commands => Some(self.commands),
             _ => None,
         }
     }
@@ -236,6 +248,13 @@ mod mac {
             )?;
             // Style also appears in View and at the end of the editor context menu.
             view.append(native(&style)).map_err(|e| e.to_string())?;
+            add(
+                &view,
+                DocumentInfo,
+                "Document Details…",
+                Some((shift, Code::KeyI)),
+                false,
+            )?;
             context.append(&sep()).map_err(|e| e.to_string())?;
             context.append(native(&style)).map_err(|e| e.to_string())?;
             add(
@@ -268,11 +287,26 @@ mod mac {
                 false,
             )?;
             add(&view, Lines, "Line Numbers", Some((cmd, Code::KeyL)), false)?;
+            add(&view, Diagnostics, "Diagnostics", None, false)?;
             add(
                 &view,
-                Diagnostics,
-                "Diagnostics",
-                Some((Modifiers::empty(), Code::F3)),
+                Commands,
+                "Function Key Commands",
+                Some((Modifiers::empty(), Code::F1)),
+                false,
+            )?;
+            add(
+                &window,
+                PreviousTab,
+                "Previous Tab",
+                Some((shift, Code::BracketLeft)),
+                false,
+            )?;
+            add(
+                &window,
+                NextTab,
+                "Next Tab",
+                Some((shift, Code::BracketRight)),
                 false,
             )?;
             window

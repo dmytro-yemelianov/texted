@@ -31,10 +31,10 @@ mod mac {
         application: *mut AnyObject,
         files: *mut AnyObject,
     ) {
-        // AppKit supplies NSArray<NSString *> containing filesystem paths; the editor is single-document.
+        // AppKit supplies NSArray<NSString *>; open every path in its own tab.
         let count: usize = unsafe { msg_send![files, count] };
-        if count > 0 {
-            let path: *mut AnyObject = unsafe { msg_send![files,objectAtIndex:0usize] };
+        for index in 0..count {
+            let path: *mut AnyObject = unsafe { msg_send![files,objectAtIndex:index] };
             let utf8: *const c_char = unsafe { msg_send![path, UTF8String] };
             if !utf8.is_null() {
                 let path = PathBuf::from(
@@ -60,7 +60,7 @@ mod mac {
     ) -> usize {
         PROXY.with(|p| {
             if let Some(proxy) = p.get() {
-                let _ = proxy.send_event(AppEvent::Document(Action::Close));
+                let _ = proxy.send_event(AppEvent::Quit);
             }
         });
         0 // NSTerminateCancel: Rust's guarded close will exit the event loop after the user decides.
