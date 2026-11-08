@@ -39,15 +39,16 @@ struct Panel {
 impl Panel {
     fn new(width: usize, height: usize, compact: bool) -> Self {
         let (limit, h, margin, input, row_top, step, row_h, pad) = if compact {
-            (400, 168, 8, 72, 28, 16, 14, 8)
+            (400, 168, 8, 72, 32, 16, 16, 8)
         } else {
-            (700, 356, 24, 148, 64, 36, 28, 16)
+            (704, 352, 16, 152, 64, 32, 32, 16)
         };
-        let w = width.saturating_sub(margin).min(limit);
+        let w = width.saturating_sub(margin).min(limit) / 8 * 8;
         Self {
             rect: Rect {
-                x: width.saturating_sub(w) / 2,
-                y: height.saturating_sub(h) / 2,
+                x: width.saturating_sub(w) / 2 / 8 * 8,
+                y: height.saturating_sub(h) / 2 / if compact { 8 } else { 16 }
+                    * if compact { 8 } else { 16 },
                 w,
                 h,
             },
@@ -56,14 +57,16 @@ impl Panel {
             step,
             row_h,
             pad,
-            buttons: row_top + ROWS * step + 4,
+            buttons: row_top + ROWS * step + if compact { 0 } else { 16 },
         }
     }
     fn placed(width: usize, height: usize, compact: bool, position: Option<(f32, f32)>) -> Self {
         let mut p = Self::new(width, height, compact);
         if let Some((x, y)) = position {
-            p.rect.x = x.max(0.0).min(width.saturating_sub(p.rect.w) as f32) as usize;
-            p.rect.y = y.max(0.0).min(height.saturating_sub(p.rect.h) as f32) as usize;
+            p.rect.x = x.max(0.0).min(width.saturating_sub(p.rect.w) as f32) as usize / 8 * 8;
+            p.rect.y = y.max(0.0).min(height.saturating_sub(p.rect.h) as f32) as usize
+                / if compact { 8 } else { 16 }
+                * if compact { 8 } else { 16 };
         }
         p
     }
@@ -87,7 +90,7 @@ impl Panel {
         Rect {
             x: self.rect.x + self.pad,
             y: self.rect.y + self.buttons,
-            w: if self.pad == 8 { 96 } else { 170 },
+            w: if self.pad == 8 { 96 } else { 168 },
             h: self.row_h,
         }
     }
@@ -150,6 +153,7 @@ pub(crate) struct AppearanceUi {
     pub settings: Appearance,
     pub palette: Palette,
     pub open: bool,
+    cell_backend: bool,
     pub save_status: String,
     focus: usize,
     dropdown: Option<Dropdown>,
@@ -173,6 +177,7 @@ impl AppearanceUi {
             settings,
             palette,
             open: false,
+            cell_backend: false,
             save_status: "Changes save automatically".into(),
             focus: 0,
             dropdown: None,
@@ -184,6 +189,14 @@ impl AppearanceUi {
             previews: Vec::new(),
             preview_clock: 0,
             font_choices: RefCell::new(None),
+        }
+    }
+    pub fn set_cell_backend(&mut self, enabled: bool) {
+        self.cell_backend = enabled;
+        if enabled {
+            self.settings.framebuffer = Framebuffer::Native;
+            self.settings.typography = Default::default();
+            self.settings.pixel_typography = Default::default();
         }
     }
     pub fn set_open(&mut self, open: bool) {
@@ -217,7 +230,9 @@ impl AppearanceUi {
     pub fn reset_defaults(&mut self) {
         let open = self.open;
         let status = self.save_status.clone();
+        let cell_backend = self.cell_backend;
         *self = Self::new(Appearance::default());
+        self.set_cell_backend(cell_backend);
         self.open = open;
         self.save_status = status;
     }
@@ -300,6 +315,13 @@ impl AppearanceUi {
         }
     }
     fn choices(&self, row: usize) -> Arc<Vec<Choice>> {
+        if self.cell_backend && row != 0 {
+            return Arc::new(vec![Choice {
+                label: "Managed by the terminal emulator".into(),
+                value: self.selected(row),
+                enabled: false,
+            }]);
+        }
         if row == 2 {
             if let Some((query, choices)) = &*self.font_choices.borrow() {
                 if query == &self.font_query {
@@ -703,6 +725,9 @@ impl AppearanceUi {
         if !self.open {
             return;
         }
+        draws
+            .cells
+            .push(texted_app::cell_grid::CellCommand::HideCursor);
         let p = self.panel(width, height, compact);
         let r = p.rect;
         let c = self.palette;
@@ -717,7 +742,7 @@ impl AppearanceUi {
             c.panel_bg,
             c.panel_border,
         );
-        let top = if compact { 4 } else { 14 };
+        let top = if compact { 4 } else { 16 };
         label(
             draws,
             font,
@@ -740,7 +765,7 @@ impl AppearanceUi {
             draws,
             font,
             (width, height),
-            (r.x + p.pad, r.y + if compact { 18 } else { 40 }),
+            (r.x + p.pad, r.y + if compact { 20 } else { 48 }),
             &if self.dropdown.is_some_and(|d| d.field == 2) {
                 format!(
                     "Find font: {}",
@@ -766,7 +791,7 @@ impl AppearanceUi {
         } else {
             self.settings.framebuffer.name().into()
         };
-        let values = [
+        let mut values = [
             self.settings.theme.name().to_owned(),
             screen,
             t.family.name().into(),
@@ -774,6 +799,11 @@ impl AppearanceUi {
             format!("{}%", t.line_spacing),
             self.settings.mouse_cursor.name().into(),
         ];
+        if self.cell_backend {
+            for value in &mut values[1..] {
+                *value = "Terminal setting".into();
+            }
+        }
         let titles = if compact {
             ["Theme", "Screen", "Font", "Size", "Spacing", "Cursor"]
         } else {
@@ -1140,7 +1170,7 @@ mod tests {
         ui.end_drag();
         let moved = ui.panel(980, 700, false);
         assert_eq!(moved.rect.x, p.rect.x + 80);
-        assert_eq!(moved.rect.y, p.rect.y + 60);
+        assert_eq!(moved.rect.y, (p.rect.y + 60) / 16 * 16);
         let row = moved.row(2);
         ui.click(980, 700, (row.x + 3) as f32, (row.y + 3) as f32, false);
         assert_eq!(ui.dropdown.unwrap().field, 2);

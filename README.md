@@ -11,9 +11,12 @@ A minimal Rust plain-text editor with a GPU-rendered GUI and a buffer owned by a
 ```sh
 cargo run --release --bin texted -- path/to/file.txt
 cargo run --release --bin texted
+cargo run --release --bin texted-tui -- path/to/file.txt
+# Or use the same executable:
+cargo run --release --bin texted -- --terminal path/to/file.txt
 ```
 
-The current GUI uses bundled bitmap fonts and macOS `pbcopy`/`pbpaste`. Running without a path opens an empty document. Open and Save As use native macOS dialogs. New and Open create tabs. Files can also be dropped onto the window, passed together on the command line, or opened together through Finder. Each tab retains its own buffer, undo/redo, selection, search and scroll position. Closing a changed tab prompts to save it; quitting checks each remaining tab and Cancel stops the sequence.
+The current GUI uses bundled bitmap fonts and macOS `pbcopy`/`pbpaste`. Running without a path opens an empty document. Open, Save As, overwrite and save-before-close use shared in-app dialogs in both the window and terminal modes. New and Open create tabs. Files can also be dropped onto the window, passed together on the command line, or opened together through Finder. Each tab retains its own buffer, undo/redo, selection, search and scroll position. Closing a changed tab prompts to save it; quitting checks each remaining tab and Cancel stops the sequence.
 
 ## Implementation
 
@@ -21,9 +24,9 @@ The current GUI uses bundled bitmap fonts and macOS `pbcopy`/`pbpaste`. Running 
 - `texted-kernel`: reusable typed request/reply and notification primitives, retained for their tests and benchmarks. The GUI uses the bounded asynchronous `buffer_service` instead of blocking RPC.
 - `texted-layout`: reads only visible rope slices; wrapping, caret placement, hit-testing, and highlight clipping share the same visual-row geometry. The viewport stores a physical top line and a wrapped subrow, so scrolling does not reflow preceding document lines.
 - `texted-io`: streaming UTF-8 loading, internal LF normalization, BOM/newline metadata, and buffered atomic saves through a unique sibling file. Saves flush and sync the file and, on Unix, its parent directory. Existing permissions are preserved.
-- `texted-app`: winit/wgpu shell using Metal on macOS. `graphics.rs` builds ordered drawing commands; `gpu.rs` draws instanced rectangles and glyphs from a bounded texture atlas. Search has one active job, one latest pending job and a bounded result mailbox; it counts matches without storing every offset. Bulk edits and replacements prepare snapshot plans outside the buffer owner and commit only against the same document, revision, cursor and selection. Native dialogs are asynchronous; file loading and saving run in background workers. The saved rope root tracks unsaved edits, including undo back to the saved state.
+- `texted-app`: winit/wgpu shell using Metal on macOS. `graphics.rs` builds ordered drawing commands; `gpu.rs` draws instanced rectangles and glyphs from a bounded texture atlas. Search has one active job, one latest pending job and a bounded result mailbox; it counts matches without storing every offset. Bulk edits and replacements prepare snapshot plans outside the buffer owner and commit only against the same document, revision, cursor and selection. Shared dialogs return asynchronous tickets; file loading and saving run in background workers. The saved rope root tracks unsaved edits, including undo back to the saved state.
 
-Snapshots do not flatten the document. Search streams across rope chunks. Text compositing, backgrounds, selection and the caret render on the GPU. Native one-bit glyph masks are unpacked on CPU cache misses and uploaded once per atlas entry. Atlas coverage is limited to eight 1 MiB pages, with eviction between frames; instance buffers are reused. There is no full-window CPU pixel buffer. A Metal-capable Mac is required; startup reports an error if GPU initialization fails.
+Snapshots do not flatten the document. Search streams across rope chunks. Text compositing, backgrounds, selection and the caret render on the GPU. Native one-bit glyph masks are unpacked on CPU cache misses and uploaded once per atlas entry. Atlas coverage is limited to eight 1 MiB pages, with eviction between frames; instance buffers are reused. There is no full-window CPU pixel buffer. The window backend requires a Metal-capable Mac; the terminal backend creates no window or GPU. See [shared cell-grid transport and terminal controls](docs/terminal-cell-grid.md).
 
 ## Controls
 

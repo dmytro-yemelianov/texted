@@ -12,7 +12,7 @@ pub(crate) struct Session {
     pub snap_after: Option<u64>,
 }
 impl Session {
-    pub fn new(wake: crate::Wake, id: u64) -> Self {
+    pub fn new(wake: crate::Wake, id: u64, dialogs: crate::dialog_ui::Client) -> Self {
         let w = wake.clone();
         let buffer = BufferService::new(move || w());
         let w = wake.clone();
@@ -21,7 +21,11 @@ impl Session {
         let transfers = Transfers::new(move || w());
         let w = wake.clone();
         let viewport = Viewport::new(move || w());
-        let files = FileFlow::new(buffer.client.latest().snapshot.content.clone(), wake);
+        let files = FileFlow::new(
+            buffer.client.latest().snapshot.content.clone(),
+            wake,
+            dialogs,
+        );
         Self {
             id,
             buffer,
@@ -97,7 +101,7 @@ mod tests {
         });
         let (finished, completion) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let session = Session::new(wake.clone(), 1);
+            let session = Session::new(wake.clone(), 1, crate::dialog_ui::channel(wake.clone()).0);
             session
                 .buffer
                 .client

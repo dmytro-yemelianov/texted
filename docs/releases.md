@@ -28,8 +28,8 @@ Reference measurements and their limits are in the [hardening acceptance report]
 
 [Build and deliver](https://github.com/dmytro-yemelianov/texted/actions/workflows/build.yml) runs for pull requests, pushes to `main`, version tags and manual dispatches.
 
-1. Apple Silicon and Intel runners check formatting, deny Clippy warnings, run Rust and packaging tests, and smoke-test native `--version` and `--help` commands.
-2. The packaging job builds both macOS targets with Rust 1.88.0 and `Cargo.lock`, assembles a universal executable with `lipo`, creates the app icon and app bundle, and produces a ZIP and compressed DMG.
+1. Apple Silicon and Intel runners check formatting, deny Clippy warnings, run Rust and packaging tests, smoke-test GUI/terminal entry points and cell-grid JSON, and exercise editing, save/cancel, resize and clean terminal restoration through a real PTY.
+2. The packaging job builds both macOS targets with Rust 1.88.0 and `Cargo.lock`, assembles a universal GUI and terminal executables with `lipo`, creates the app icon and app bundle, and produces a ZIP and compressed DMG.
 3. Packaging validates bundle metadata, both architectures, icon presence, the local signature, native startup/version, system-library load commands and ZIP round-trip integrity. The DMG is verified and delivery checksums are generated.
 4. Workflow artifacts retain the delivery files for 30 days. A tag matching the Cargo version also publishes a GitHub Release with those files. Early `0.x` versions are marked as prereleases.
 
@@ -59,3 +59,13 @@ git push origin v0.2.0
 ```
 
 The tagged source is tested and packaged again before publication. A mismatched tag fails before delivery. Rerunning the tag workflow updates the existing release assets.
+
+## Terminal executable in development packages
+
+Packages built from `feat/terminal-cell-grid` include `Contents/MacOS/texted-tui` as a universal executable, verified after ZIP restoration. The GUI executable also accepts `--terminal`. The published v0.2.0 assets predate this work. To run a locally installed development build:
+
+```sh
+/Applications/Texted.app/Contents/MacOS/texted-tui path/to/file.txt
+```
+
+Both modes share the application controller, cell scene, tab state, command panel and in-app dialogs. See [terminal delivery](terminal-cell-grid.md) for controls and the JSON format.

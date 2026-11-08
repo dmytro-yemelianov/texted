@@ -45,6 +45,11 @@ pub(crate) fn paint(
     paint_selection(buffer, font_engine, model);
     paint_text(buffer, font_engine, model);
     paint_caret(buffer, font_engine, model);
+    if model.search_state.mode != SearchBarMode::Closed {
+        buffer
+            .cells
+            .push(texted_app::cell_grid::CellCommand::HideCursor);
+    }
     paint_search_bar(buffer, ui_font, model);
     if model.show_perf_hud {
         paint_hud(buffer, ui_font, model);
@@ -271,6 +276,11 @@ fn paint_caret(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &View
         let cy = layout.caret_rect.y as usize + 2;
 
         if cy + (font_engine.line_height_px as usize) <= text_height {
+            buffer
+                .cells
+                .push(texted_app::cell_grid::CellCommand::Cursor {
+                    at: [cx as f32, cy as f32],
+                });
             draw_rect(
                 buffer,
                 width,
@@ -346,6 +356,11 @@ fn input_box(
         let chars = text.chars().take(max_chars + 1).count();
         let caret = x + 5 + (chars as f32 * font_engine.char_width_px).round() as usize;
         if caret < x + w - 4 {
+            buffer
+                .cells
+                .push(texted_app::cell_grid::CellCommand::Cursor {
+                    at: [caret as f32, (y + 4) as f32],
+                });
             draw_rect(
                 buffer,
                 model.width,
@@ -390,7 +405,7 @@ fn button(
     );
 }
 fn paint_search_bar(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewModel<'_>) {
-    if model.compact {
+    if model.compact || model.width < PANEL_WIDTH + 16 {
         paint_compact_search(buffer, font_engine, model);
         return;
     }
@@ -567,6 +582,11 @@ fn paint_compact_search(buffer: &mut DrawList, font: &mut FontEngine, model: &Vi
             let count = text.chars().take(r.w / 8).count();
             let x = r.x + 2 + count * 8;
             if x + 1 < r.x + r.w {
+                buffer
+                    .cells
+                    .push(texted_app::cell_grid::CellCommand::Cursor {
+                        at: [x as f32, (r.y + 2) as f32],
+                    });
                 draw_rect(
                     buffer,
                     model.width,

@@ -122,17 +122,12 @@ mod mac {
     use crate::AppEvent;
     use muda::{
         accelerator::{Accelerator, Code, Modifiers},
-        AboutMetadata, CheckMenuItem, ContextMenu, IsMenuItem, Menu, MenuEvent, MenuItem,
-        MenuItemKind, PredefinedMenuItem, Submenu,
+        AboutMetadata, CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, MenuItemKind,
+        PredefinedMenuItem, Submenu,
     };
-    use winit::{
-        event_loop::EventLoopProxy,
-        raw_window_handle::{HasWindowHandle, RawWindowHandle},
-        window::Window,
-    };
+    use winit::event_loop::EventLoopProxy;
     pub(crate) struct NativeMenus {
         _bar: Menu,
-        context: Menu,
         items: Vec<(MenuCommand, MenuItemKind)>,
         state: Option<MenuState>,
     }
@@ -146,7 +141,6 @@ mod mac {
     impl NativeMenus {
         pub fn new(proxy: EventLoopProxy<AppEvent>) -> Result<Self, String> {
             let bar = Menu::new();
-            let context = Menu::new();
             let mut items = Vec::new();
             let app = Submenu::new("Texted", true);
             let file = Submenu::new("File", true);
@@ -168,8 +162,7 @@ mod mac {
             let mut add = |menu: &Submenu,
                            command,
                            label,
-                           shortcut: Option<(Modifiers, Code)>,
-                           popup: bool|
+                           shortcut: Option<(Modifiers, Code)>|
              -> Result<MenuItemKind, String> {
                 let accelerator = shortcut.map(|(mods, code)| Accelerator::new(Some(mods), code));
                 let item = if MenuState::default().checked(command).is_some() {
@@ -178,16 +171,13 @@ mod mac {
                     MenuItem::new(label, false, accelerator).kind()
                 };
                 menu.append(native(&item)).map_err(|e| e.to_string())?;
-                if popup {
-                    context.append(native(&item)).map_err(|e| e.to_string())?;
-                }
                 items.push((command, item.clone()));
                 Ok(item)
             };
             use MenuCommand::*;
             let cmd = Modifiers::SUPER;
             let shift = cmd | Modifiers::SHIFT;
-            let style = add(&app, Style, "Style…", Some((cmd, Code::Comma)), false)?;
+            let style = add(&app, Style, "Style…", Some((cmd, Code::Comma)))?;
             app.append_items(&[
                 &sep(),
                 &PredefinedMenuItem::services(None),
@@ -198,53 +188,37 @@ mod mac {
                 &sep(),
             ])
             .map_err(|e| e.to_string())?;
-            add(&app, Quit, "Quit Texted", Some((cmd, Code::KeyQ)), false)?;
-            add(&file, New, "New", Some((cmd, Code::KeyN)), false)?;
-            add(&file, Open, "Open…", Some((cmd, Code::KeyO)), false)?;
+            add(&app, Quit, "Quit Texted", Some((cmd, Code::KeyQ)))?;
+            add(&file, New, "New", Some((cmd, Code::KeyN)))?;
+            add(&file, Open, "Open…", Some((cmd, Code::KeyO)))?;
             file.append(&sep()).map_err(|e| e.to_string())?;
-            add(&file, Save, "Save", Some((cmd, Code::KeyS)), false)?;
-            add(&file, SaveAs, "Save As…", Some((shift, Code::KeyS)), false)?;
+            add(&file, Save, "Save", Some((cmd, Code::KeyS)))?;
+            add(&file, SaveAs, "Save As…", Some((shift, Code::KeyS)))?;
             file.append(&sep()).map_err(|e| e.to_string())?;
-            add(&file, Close, "Close", Some((cmd, Code::KeyW)), false)?;
-            add(&edit, Undo, "Undo", Some((cmd, Code::KeyZ)), true)?;
-            add(&edit, Redo, "Redo", Some((shift, Code::KeyZ)), true)?;
+            add(&file, Close, "Close", Some((cmd, Code::KeyW)))?;
+            add(&edit, Undo, "Undo", Some((cmd, Code::KeyZ)))?;
+            add(&edit, Redo, "Redo", Some((shift, Code::KeyZ)))?;
             edit.append(&sep()).map_err(|e| e.to_string())?;
-            context.append(&sep()).map_err(|e| e.to_string())?;
             for (command, label, code) in [
                 (Cut, "Cut", Code::KeyX),
                 (Copy, "Copy", Code::KeyC),
                 (Paste, "Paste", Code::KeyV),
             ] {
-                add(&edit, command, label, Some((cmd, code)), true)?;
+                add(&edit, command, label, Some((cmd, code)))?;
             }
-            add(&edit, Delete, "Delete Selection", None, true)?;
+            add(&edit, Delete, "Delete Selection", None)?;
             edit.append(&sep()).map_err(|e| e.to_string())?;
-            context.append(&sep()).map_err(|e| e.to_string())?;
-            add(
-                &edit,
-                SelectAll,
-                "Select All",
-                Some((cmd, Code::KeyA)),
-                true,
-            )?;
-            add(
-                &edit,
-                Block,
-                "Column Selection",
-                Some((cmd, Code::KeyB)),
-                false,
-            )?;
-            context.append(&sep()).map_err(|e| e.to_string())?;
-            add(&search, Find, "Find…", Some((cmd, Code::KeyF)), true)?;
-            add(&search, Replace, "Replace…", Some((cmd, Code::KeyR)), true)?;
+            add(&edit, SelectAll, "Select All", Some((cmd, Code::KeyA)))?;
+            add(&edit, Block, "Column Selection", Some((cmd, Code::KeyB)))?;
+            add(&search, Find, "Find…", Some((cmd, Code::KeyF)))?;
+            add(&search, Replace, "Replace…", Some((cmd, Code::KeyR)))?;
             search.append(&sep()).map_err(|e| e.to_string())?;
-            add(&search, Next, "Find Next", Some((cmd, Code::KeyG)), false)?;
+            add(&search, Next, "Find Next", Some((cmd, Code::KeyG)))?;
             add(
                 &search,
                 Previous,
                 "Find Previous",
                 Some((shift, Code::KeyG)),
-                false,
             )?;
             // Style also appears in View and at the end of the editor context menu.
             view.append(native(&style)).map_err(|e| e.to_string())?;
@@ -253,61 +227,46 @@ mod mac {
                 DocumentInfo,
                 "Document Details…",
                 Some((shift, Code::KeyI)),
-                false,
             )?;
-            context.append(&sep()).map_err(|e| e.to_string())?;
-            context.append(native(&style)).map_err(|e| e.to_string())?;
             add(
                 &view,
                 ZoomIn,
                 "Increase Font Size",
                 Some((cmd, Code::Equal)),
-                false,
             )?;
             add(
                 &view,
                 ZoomOut,
                 "Decrease Font Size",
                 Some((cmd, Code::Minus)),
-                false,
             )?;
             add(
                 &view,
                 ResetSize,
                 "Reset Font Size",
                 Some((cmd, Code::Digit0)),
-                false,
             )?;
             view.append(&sep()).map_err(|e| e.to_string())?;
-            add(
-                &view,
-                Wrap,
-                "Word Wrap",
-                Some((Modifiers::ALT, Code::KeyZ)),
-                false,
-            )?;
-            add(&view, Lines, "Line Numbers", Some((cmd, Code::KeyL)), false)?;
-            add(&view, Diagnostics, "Diagnostics", None, false)?;
+            add(&view, Wrap, "Word Wrap", Some((Modifiers::ALT, Code::KeyZ)))?;
+            add(&view, Lines, "Line Numbers", Some((cmd, Code::KeyL)))?;
+            add(&view, Diagnostics, "Diagnostics", None)?;
             add(
                 &view,
                 Commands,
                 "Function Key Commands",
                 Some((Modifiers::empty(), Code::F1)),
-                false,
             )?;
             add(
                 &window,
                 PreviousTab,
                 "Previous Tab",
                 Some((shift, Code::BracketLeft)),
-                false,
             )?;
             add(
                 &window,
                 NextTab,
                 "Next Tab",
                 Some((shift, Code::BracketRight)),
-                false,
             )?;
             window
                 .append_items(&[
@@ -337,7 +296,6 @@ mod mac {
             window.set_as_windows_menu_for_nsapp();
             Ok(Self {
                 _bar: bar,
-                context,
                 items,
                 state: None,
             })
@@ -363,22 +321,6 @@ mod mac {
             // Native check items toggle before the queued intent is validated.
             self.state = None;
         }
-        pub fn show_context(&self, window: &Window, (x, y): (f32, f32)) {
-            if let Ok(handle) = window.window_handle() {
-                if let RawWindowHandle::AppKit(handle) = handle.as_raw() {
-                    // Main thread; the live Window owns the NSView throughout native menu tracking.
-                    // muda converts physical client coordinates using this NSView's backing scale.
-                    unsafe {
-                        self.context.show_context_menu_for_nsview(
-                            handle.ns_view.as_ptr(),
-                            Some(
-                                muda::dpi::PhysicalPosition::new(f64::from(x), f64::from(y)).into(),
-                            ),
-                        );
-                    }
-                }
-            }
-        }
     }
 }
 #[cfg(target_os = "macos")]
@@ -392,7 +334,6 @@ impl NativeMenus {
     }
     pub fn update(&mut self, _: MenuState) {}
     pub fn invalidate(&mut self) {}
-    pub fn show_context(&self, _: &winit::window::Window, _: (f32, f32)) {}
 }
 #[cfg(test)]
 mod tests {

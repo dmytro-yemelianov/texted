@@ -72,6 +72,167 @@ pub(crate) fn contains_selection(p: &Published, (line, col): (usize, usize)) -> 
         }
     }
 }
+/// The same context menu is painted and hit-tested in both presentation backends.
+pub(crate) struct Popup {
+    at: (f32, f32),
+    selected: usize,
+    first: usize,
+}
+const ITEMS: &[(crate::menus::MenuCommand, &str)] = &[
+    (crate::menus::MenuCommand::Undo, "Undo"),
+    (crate::menus::MenuCommand::Redo, "Redo"),
+    (crate::menus::MenuCommand::Cut, "Cut"),
+    (crate::menus::MenuCommand::Copy, "Copy"),
+    (crate::menus::MenuCommand::Paste, "Paste"),
+    (crate::menus::MenuCommand::Delete, "Delete selection"),
+    (crate::menus::MenuCommand::SelectAll, "Select all"),
+    (crate::menus::MenuCommand::Block, "Column selection"),
+    (crate::menus::MenuCommand::Find, "Find..."),
+    (crate::menus::MenuCommand::Replace, "Replace..."),
+    (crate::menus::MenuCommand::Style, "Appearance..."),
+    (crate::menus::MenuCommand::DocumentInfo, "Document details"),
+];
+impl Popup {
+    pub fn new(at: (f32, f32), state: crate::menus::MenuState) -> Self {
+        Self {
+            at,
+            selected: ITEMS
+                .iter()
+                .position(|(c, _)| state.enabled(*c))
+                .unwrap_or(0),
+            first: 0,
+        }
+    }
+    fn layout(
+        &self,
+        size: (usize, usize),
+        compact: bool,
+    ) -> (crate::appearance_ui::Rect, usize, usize) {
+        let ch = if compact { 8 } else { 16 };
+        let visible = (size.1 / ch).saturating_sub(2).clamp(1, ITEMS.len());
+        let w = 184.min(size.0);
+        let h = ((visible + 2) * ch).min(size.1);
+        (
+            crate::appearance_ui::Rect {
+                x: (self.at.0.max(0.) as usize).min(size.0.saturating_sub(w)) / 8 * 8,
+                y: (self.at.1.max(0.) as usize).min(size.1.saturating_sub(h)) / ch * ch,
+                w,
+                h,
+            },
+            ch,
+            visible,
+        )
+    }
+    pub fn navigate(&mut self, forward: bool, state: crate::menus::MenuState) {
+        for _ in 0..ITEMS.len() {
+            self.selected = if forward {
+                (self.selected + 1) % ITEMS.len()
+            } else {
+                (self.selected + ITEMS.len() - 1) % ITEMS.len()
+            };
+            if state.enabled(ITEMS[self.selected].0) {
+                break;
+            }
+        }
+    }
+    pub fn selected(&self, state: crate::menus::MenuState) -> Option<crate::menus::MenuCommand> {
+        let c = ITEMS[self.selected].0;
+        state.enabled(c).then_some(c)
+    }
+    pub fn hover(
+        &mut self,
+        size: (usize, usize),
+        compact: bool,
+        x: f32,
+        y: f32,
+        state: crate::menus::MenuState,
+    ) {
+        let (r, ch, visible) = self.layout(size, compact);
+        if r.contains(x, y) && y >= (r.y + ch) as f32 {
+            let i = self.first + (y as usize - r.y - ch) / ch;
+            if i < ITEMS.len() && i < self.first + visible && state.enabled(ITEMS[i].0) {
+                self.selected = i;
+            }
+        }
+    }
+    pub fn click(
+        &mut self,
+        size: (usize, usize),
+        compact: bool,
+        x: f32,
+        y: f32,
+        state: crate::menus::MenuState,
+    ) -> Option<crate::menus::MenuCommand> {
+        self.hover(size, compact, x, y, state);
+        let (r, ch, visible) = self.layout(size, compact);
+        if r.contains(x, y) && y >= (r.y + ch) as f32 && y < (r.y + (visible + 1) * ch) as f32 {
+            let i = self.first + (y as usize - r.y - ch) / ch;
+            ITEMS
+                .get(i)
+                .and_then(|(c, _)| state.enabled(*c).then_some(*c))
+        } else {
+            None
+        }
+    }
+    pub fn paint(
+        &mut self,
+        draws: &mut crate::graphics::DrawList,
+        font: &mut crate::graphics::FontEngine,
+        size: (usize, usize),
+        compact: bool,
+        state: crate::menus::MenuState,
+        p: crate::appearance::Palette,
+    ) {
+        draws.cells.push(crate::cell_grid::CellCommand::HideCursor);
+        let (r, ch, visible) = self.layout(size, compact);
+        if self.selected < self.first {
+            self.first = self.selected;
+        }
+        if self.selected >= self.first + visible {
+            self.first = self.selected + 1 - visible;
+        }
+        crate::graphics::draw_box(
+            draws,
+            size.0,
+            size.1,
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            p.panel_bg,
+            p.panel_border,
+        );
+        for (row, (command, label)) in ITEMS.iter().skip(self.first).take(visible).enumerate() {
+            let y = r.y + (row + 1) * ch;
+            if self.first + row == self.selected {
+                crate::graphics::draw_rect(
+                    draws,
+                    size.0,
+                    size.1,
+                    r.x + 8,
+                    y,
+                    r.w.saturating_sub(16),
+                    ch,
+                    p.selection,
+                );
+            }
+            font.draw_string(
+                draws,
+                (r.x + r.w).saturating_sub(8),
+                size.1,
+                r.x + 8,
+                y,
+                label,
+                if state.enabled(*command) {
+                    p.text
+                } else {
+                    p.gutter_text
+                },
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

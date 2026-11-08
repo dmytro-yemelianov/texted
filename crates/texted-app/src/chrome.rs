@@ -24,12 +24,15 @@ pub(crate) enum Hit {
 pub(crate) struct Context {
     pub search: texted_app::input::SearchContext,
     pub appearance: bool,
+    pub dialog: bool,
+    pub dialog_accept: &'static str,
     pub multiple_tabs: bool,
     pub selected: bool,
     pub can_undo: bool,
     pub can_redo: bool,
     pub editable: bool,
     pub has_query: bool,
+    pub scalable: bool,
     pub zoom_percent: u16,
     pub statistics: String,
     pub statistics_short: String,
@@ -42,6 +45,16 @@ pub(crate) fn command(
     modifiers: winit::keyboard::ModifiersState,
 ) -> Option<texted_app::input::Intent> {
     use texted_app::input::Intent as I;
+    if context.dialog {
+        return Some(match index {
+            0 => I::ToggleCommands,
+            1 => I::AcceptDialog,
+            2 => I::NavigateDialog { forward: false },
+            3 => I::NavigateDialog { forward: true },
+            9 => I::CancelDialog,
+            _ => return None,
+        });
+    }
     if context.appearance
         && !(modifiers.control_key() && !modifiers.super_key() && !modifiers.alt_key())
     {
@@ -55,7 +68,12 @@ pub(crate) fn command(
             _ => return None,
         });
     }
-    texted_app::input::function_key_for(index, modifiers, context.search)
+    let intent = texted_app::input::function_key_for(index, modifiers, context.search)?;
+    if !context.scalable && matches!(intent, I::Zoom(_) | I::ResetFontSize) {
+        None
+    } else {
+        Some(intent)
+    }
 }
 pub(crate) struct Commands {
     pub items: Vec<(usize, Cow<'static, str>)>,
@@ -174,6 +192,9 @@ impl Commands {
                 I::ResetFontSize => ("100%", true),
                 I::SearchClose | I::Cancel => ("Back", true),
                 I::ContextMenu => ("Menu", context.editable),
+                I::AcceptDialog => (context.dialog_accept, true),
+                I::CancelDialog => ("Back", true),
+                I::NavigateDialog { forward } => (if forward { "Next" } else { "Prev" }, true),
                 I::AcceptAppearance => ("Keep", true),
                 I::ResetAppearance => ("Rst", true),
                 I::BrowseAppearance { forward } => (if forward { "Next" } else { "Prev" }, true),
@@ -217,7 +238,7 @@ impl Geometry {
             if compact {
                 16
             } else {
-                28
+                32
             }
         } else {
             0
@@ -435,12 +456,15 @@ mod tests {
         Context {
             search: Default::default(),
             appearance: false,
+            dialog: false,
+            dialog_accept: "OK",
             multiple_tabs: true,
             selected: false,
             can_undo: true,
             can_redo: false,
             editable: true,
             has_query: true,
+            scalable: true,
             zoom_percent: 120,
             statistics: "42 words".into(),
             statistics_short: "42w".into(),
@@ -583,7 +607,7 @@ mod tests {
                             (controls + slot * w.saturating_sub(controls) / g.columns + 2) as f32;
                         assert_eq!(g.hit(x, (h - 2) as f32, 0, 2), Some(Hit::Command(slot)));
                     }
-                    assert_eq!(g.bottom, if compact { 16 } else { 28 });
+                    assert_eq!(g.bottom, if compact { 16 } else { 32 });
                 }
                 let mut first = 0;
                 g.reveal(&mut first, 19, 20);
