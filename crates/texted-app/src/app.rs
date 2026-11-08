@@ -504,6 +504,19 @@ impl App {
             self.display.pixelated,
             self.commands,
         )
+        .with_inset(self.chrome_insets().1)
+    }
+    /// ShaderWallpaper's panel inset around the document text, in scene pixels; terminals have none.
+    fn chrome_insets(&self) -> (f32, usize) {
+        if self.window.is_terminal() {
+            return (0.0, 0);
+        }
+        let visuals = self.appearance.settings.visuals();
+        let pixel = self.font.pixel_px();
+        (
+            f32::from(visuals.inset_x) * pixel,
+            (f32::from(visuals.inset_y) * pixel).round() as usize,
+        )
     }
     fn document_size(&self) -> (u32, u32) {
         (
@@ -1830,12 +1843,15 @@ impl App {
             self.resolution(),
         ));
         let (width, scene_height) = display.source;
+        let (text_inset, document_inset) = self.chrome_insets();
         let geometry = crate::chrome::Geometry::new(
             width as usize,
             scene_height as usize,
             display.pixelated,
             self.commands,
-        );
+        )
+        .with_inset(document_inset);
+        self.session.viewport.text_inset = text_inset;
         let height = geometry.document_height() as u32;
         let start = Instant::now();
         let p = self.session.buffer.client.latest();
@@ -1852,12 +1868,21 @@ impl App {
             .state
             .set_view(&p.snapshot, &frame.layout);
         let visuals = self.appearance.settings.visuals();
-        self.draws.shadow =
-            (visuals.shadow && !self.window.is_terminal()).then_some(crate::graphics::TextShadow {
-                x: visuals.shadow_x,
-                y: visuals.shadow_y,
-                color: self.appearance.palette.shadow,
-            });
+        let window = !self.window.is_terminal();
+        self.draws.shadow = (visuals.shadow && window).then_some(crate::graphics::TextShadow {
+            x: visuals.shadow_x,
+            y: visuals.shadow_y,
+            color: self.appearance.palette.shadow,
+        });
+        // Tiles use the interface font's pixel, as the wallpaper draws them from its font.
+        self.draws.frame = match visuals.border {
+            texted_app::visuals::Border::Lines => None,
+            border => window.then_some(crate::graphics::Frame {
+                double: border == texted_app::visuals::Border::Double,
+                pixel: self.ui_font.pixel_px(),
+                corner_inset: visuals.corner_inset,
+            }),
+        };
         editor_view::paint(
             &mut self.draws,
             &mut self.font,
@@ -1888,7 +1913,7 @@ impl App {
                 layout_time: frame.layout_time,
             },
         );
-        self.draws.translate(0.0, geometry.top as f32);
+        self.draws.translate(0.0, geometry.document_top() as f32);
         let labels: Vec<_> = self
             .tabs
             .iter()

@@ -282,8 +282,30 @@ impl Machine {
                 flicker,
                 scanlines,
             },
+            // WallpaperChromeEffectRegistry defaults: shadow 1,1, single tiles, inset 2,0.
             shadow: true,
+            border: Border::Single,
+            inset_x: 2,
             ..Visuals::default()
+        }
+    }
+}
+/// How panels are framed: Texted's thin lines, or ShaderWallpaper's single or double tiles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Border {
+    #[default]
+    Lines,
+    Single,
+    Double,
+}
+impl Border {
+    pub const ALL: [Self; 3] = [Self::Lines, Self::Single, Self::Double];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lines => "Lines",
+            Self::Single => "Single ─│",
+            Self::Double => "Double ═║",
         }
     }
 }
@@ -300,6 +322,12 @@ pub struct Visuals {
     pub shadow: bool,
     pub shadow_x: u8,
     pub shadow_y: u8,
+    /// Chrome border: the frame style, and how far edge tiles start from corners (0 to 32).
+    pub border: Border,
+    pub corner_inset: u8,
+    /// Chrome panel inset: room around the document text in font pixels (0 to 8).
+    pub inset_x: u8,
+    pub inset_y: u8,
 }
 impl Default for Visuals {
     fn default() -> Self {
@@ -310,6 +338,10 @@ impl Default for Visuals {
             shadow: false,
             shadow_x: 1,
             shadow_y: 1,
+            border: Border::Lines,
+            corner_inset: 16,
+            inset_x: 0,
+            inset_y: 0,
         }
     }
 }
@@ -329,6 +361,9 @@ impl Visuals {
             effects: self.effects.normalized(),
             shadow_x: self.shadow_x.min(4),
             shadow_y: self.shadow_y.min(4),
+            corner_inset: self.corner_inset.min(32),
+            inset_x: self.inset_x.min(8),
+            inset_y: self.inset_y.min(8),
             ..self
         }
     }
@@ -474,6 +509,30 @@ mod tests {
         }
         .normalized();
         assert_eq!((far.shadow_x, far.shadow_y), (4, 4));
+    }
+    #[test]
+    fn machines_frame_panels_with_single_tiles_and_inset_the_text() {
+        for machine in Machine::ALL {
+            let v = machine.visuals();
+            assert_eq!(
+                (v.border, v.corner_inset, v.inset_x, v.inset_y),
+                (Border::Single, 16, 2, 0),
+                "{machine:?}"
+            );
+        }
+        let plain = Visuals::for_theme(Theme::ModernDark);
+        assert_eq!(
+            (plain.border, plain.inset_x, plain.inset_y),
+            (Border::Lines, 0, 0)
+        );
+        let wide = Visuals {
+            corner_inset: 99,
+            inset_x: 20,
+            inset_y: 9,
+            ..Visuals::default()
+        }
+        .normalized();
+        assert_eq!((wide.corner_inset, wide.inset_x, wide.inset_y), (32, 8, 8));
     }
     #[test]
     fn stored_values_are_pulled_into_range() {

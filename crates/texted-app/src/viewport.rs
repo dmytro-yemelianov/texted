@@ -23,6 +23,8 @@ pub(crate) struct Viewport {
     pub top_wrap_row: usize,
     pub wrap: bool,
     pub line_numbers: bool,
+    /// Room before the text in pixels, from the Visuals panel inset.
+    pub text_inset: f32,
     pub current: Option<Frame>,
     pub bar: Option<Scrollbar>,
     pub caret: bool,
@@ -38,6 +40,7 @@ impl Viewport {
             top_wrap_row: 0,
             wrap: true,
             line_numbers: true,
+            text_inset: 0.0,
             current: None,
             bar: None,
             caret: true,
@@ -147,6 +150,7 @@ impl Viewport {
             word_wrap: self.wrap,
             show_line_numbers: self.line_numbers,
             line_number_gutter_width_px: gutter_w,
+            text_inset_px: self.text_inset,
         };
         config.top_line = config.top_line.min(snap.total_lines - 1);
         if !self.wrap {

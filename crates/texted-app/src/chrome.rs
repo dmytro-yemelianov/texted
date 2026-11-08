@@ -10,6 +10,8 @@ pub(crate) struct Geometry {
     pub bottom: usize,
     pub columns: usize,
     pub compact: bool,
+    /// Room above and below the document text, in pixels.
+    pub inset: usize,
 }
 #[derive(Debug, PartialEq)]
 pub(crate) enum Hit {
@@ -278,6 +280,7 @@ impl Geometry {
             bottom,
             columns,
             compact,
+            inset: 0,
         }
     }
     pub fn command_slot(self, x: f32, y: f32) -> Option<usize> {
@@ -302,14 +305,26 @@ impl Geometry {
     pub fn above_commands(self) -> usize {
         self.height.saturating_sub(self.bottom)
     }
+    /// Room above and below the document, in pixels (the Visuals vertical panel inset).
+    pub fn with_inset(mut self, inset: usize) -> Self {
+        self.inset = inset;
+        self
+    }
+    /// Where the first document row is drawn.
+    pub fn document_top(self) -> usize {
+        self.top + self.inset
+    }
     pub fn document_height(self) -> usize {
-        self.height.saturating_sub(self.top + self.bottom).max(1)
+        self.height
+            .saturating_sub(self.top + self.bottom + 2 * self.inset)
+            .max(1)
     }
     pub fn document_point(self, (x, y): (f32, f32)) -> (f32, f32) {
-        (x, y - self.top as f32)
+        (x, y - self.document_top() as f32)
     }
     pub fn in_document(self, y: f32) -> bool {
-        y >= self.top as f32 && y < self.height.saturating_sub(self.bottom) as f32
+        y >= self.document_top() as f32
+            && y < self.height.saturating_sub(self.bottom + self.inset) as f32
     }
     pub fn tab_capacity(self) -> usize {
         (self.width.saturating_sub(84) / if self.compact { 88 } else { 176 }).max(1)
@@ -531,6 +546,16 @@ mod tests {
             command(4, &c, M::empty()),
             Some(I::File(texted_app::input::FileIntent::Open))
         ));
+    }
+    #[test]
+    fn a_vertical_inset_moves_the_document_and_its_pointer_mapping() {
+        let flat = Geometry::new(980, 700, false, true);
+        let inset = flat.with_inset(10);
+        assert_eq!(inset.document_height(), flat.document_height() - 20);
+        let y = (flat.top + 10 + 5) as f32;
+        assert_eq!(inset.document_point((4.0, y)).1, 5.0);
+        assert!(!inset.in_document((flat.top + 5) as f32));
+        assert!(inset.in_document(y));
     }
     #[test]
     fn command_labels_follow_search_appearance_and_modifier_layers() {

@@ -38,7 +38,12 @@ const FIRST_EFFECT: usize = STYLE_FIELDS + 3;
 const SHADOW: usize = FIRST_EFFECT + Effect::ALL.len();
 const SHADOW_X: usize = SHADOW + 1;
 const SHADOW_Y: usize = SHADOW + 2;
-const FIELDS: usize = SHADOW + 3;
+/// Chrome: ShaderWallpaper's border tiles and panel inset.
+const BORDER: usize = SHADOW + 3;
+const CORNER: usize = BORDER + 1;
+const INSET_X: usize = BORDER + 2;
+const INSET_Y: usize = BORDER + 3;
+const FIELDS: usize = BORDER + 4;
 /// Rows shown at once; the Visuals page scrolls through its fields.
 const ROWS: usize = 7;
 struct Panel {
@@ -53,9 +58,9 @@ struct Panel {
 impl Panel {
     fn new(width: usize, height: usize, compact: bool) -> Self {
         let (limit, h, margin, input, row_top, step, row_h, pad) = if compact {
-            (400, 168, 8, 72, 32, 16, 16, 8)
+            (400, 176, 8, 72, 32, 16, 16, 8)
         } else {
-            (704, 352, 16, 152, 64, 32, 32, 16)
+            (704, 368, 16, 152, 64, 32, 32, 16)
         };
         let w = width.saturating_sub(margin).min(limit) / 8 * 8;
         Self {
@@ -178,6 +183,10 @@ enum Value {
     Shadow(bool),
     /// A shadow offset in font pixels; `true` is horizontal.
     Offset(bool, u8),
+    Border(texted_app::visuals::Border),
+    Corner(u8),
+    /// A panel inset in font pixels; `true` is horizontal.
+    Inset(bool, u8),
 }
 struct Choice {
     label: String,
@@ -426,6 +435,10 @@ impl AppearanceUi {
             SHADOW => Value::Shadow(self.settings.visuals().shadow),
             SHADOW_X => Value::Offset(true, self.settings.visuals().shadow_x),
             SHADOW_Y => Value::Offset(false, self.settings.visuals().shadow_y),
+            BORDER => Value::Border(self.settings.visuals().border),
+            CORNER => Value::Corner(self.settings.visuals().corner_inset),
+            INSET_X => Value::Inset(true, self.settings.visuals().inset_x),
+            INSET_Y => Value::Inset(false, self.settings.visuals().inset_y),
             field => {
                 let index = field - FIRST_EFFECT;
                 let effect = Effect::ALL[index];
@@ -474,7 +487,10 @@ impl AppearanceUi {
                 effect.label(effect.get(&v.effects))
             }
             Value::Shadow(on) => if on { "On" } else { "Off" }.into(),
-            Value::Offset(_, pixels) => pixels.to_string(),
+            Value::Offset(_, pixels) | Value::Inset(_, pixels) | Value::Corner(pixels) => {
+                pixels.to_string()
+            }
+            Value::Border(border) => border.name().into(),
             _ => String::new(),
         }
     }
@@ -570,6 +586,16 @@ impl AppearanceUi {
                 .into_iter()
                 .map(|on| Choice::new(if on { "On" } else { "Off" }.into(), Value::Shadow(on)))
                 .collect(),
+            BORDER => texted_app::visuals::Border::ALL
+                .into_iter()
+                .map(|b| Choice::new(b.name().into(), Value::Border(b)))
+                .collect(),
+            CORNER => (0..=32)
+                .map(|n| Choice::new(n.to_string(), Value::Corner(n)))
+                .collect(),
+            INSET_X | INSET_Y => (0..=8)
+                .map(|n| Choice::new(n.to_string(), Value::Inset(row == INSET_X, n)))
+                .collect(),
             SHADOW_X | SHADOW_Y => (0..=4)
                 .map(|n| Choice::new(n.to_string(), Value::Offset(row == SHADOW_X, n)))
                 .collect(),
@@ -656,6 +682,10 @@ impl AppearanceUi {
             Value::Shadow(on) => self.visuals_mut().shadow = on,
             Value::Offset(true, n) => self.visuals_mut().shadow_x = n,
             Value::Offset(false, n) => self.visuals_mut().shadow_y = n,
+            Value::Border(border) => self.visuals_mut().border = border,
+            Value::Corner(n) => self.visuals_mut().corner_inset = n,
+            Value::Inset(true, n) => self.visuals_mut().inset_x = n,
+            Value::Inset(false, n) => self.visuals_mut().inset_y = n,
             Value::Font(font) => {
                 let t = self.settings.editor_typography_mut();
                 let zoom = t.scale_percent();
@@ -1299,6 +1329,7 @@ fn field_title(field: usize, compact: bool) -> &'static str {
     const COMPACT: [&str; FIELDS] = [
         "Theme", "Screen", "Font", "Size", "Spacing", "Cursor", "Preset", "FPS", "Time", "Bright",
         "Curve", "Aberr", "Glow", "Noise", "Flicker", "Scan", "Shadow", "Shad X", "Shad Y",
+        "Border", "Corner", "Inset X", "Inset Y",
     ];
     const FULL: [&str; FIELDS] = [
         "Theme",
@@ -1320,6 +1351,10 @@ fn field_title(field: usize, compact: bool) -> &'static str {
         "Shadow",
         "Shadow X",
         "Shadow Y",
+        "Border",
+        "Corner inset",
+        "Inset X",
+        "Inset Y",
     ];
     if compact {
         COMPACT[field]
@@ -1647,6 +1682,22 @@ mod tests {
         assert_eq!(ui.field_text(SHADOW_X), "2");
     }
     #[test]
+    fn border_and_inset_rows_set_the_chrome() {
+        use texted_app::visuals::Border;
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        pick(&mut ui, BORDER, Border::Double.name());
+        pick(&mut ui, CORNER, "24");
+        pick(&mut ui, INSET_X, "3");
+        pick(&mut ui, INSET_Y, "1");
+        let v = ui.settings.visuals();
+        assert_eq!(
+            (v.border, v.corner_inset, v.inset_x, v.inset_y),
+            (Border::Double, 24, 3, 1)
+        );
+        assert_eq!(ui.field_text(BORDER), "Double ═║");
+    }
+    #[test]
     fn terminals_show_visuals_as_window_only() {
         let mut ui = AppearanceUi::new(Appearance::default());
         ui.set_cell_backend(true);
@@ -1688,6 +1739,15 @@ mod tests {
         press(&mut ui, NamedKey::Enter, true);
         assert_eq!(ui.settings.pixel_typography.scale_percent(), 800);
         assert!(ui.dropdown.is_none());
+    }
+    #[test]
+    fn the_status_line_stays_inside_the_panel_below_seven_rows() {
+        for (w, h, compact, text_h) in [(256, 176, true, 8), (980, 700, false, 16)] {
+            let p = Panel::new(w, h, compact);
+            let status_bottom = p.buttons + p.row_h + 4 + text_h;
+            assert!(status_bottom <= p.rect.h, "{status_bottom} > {}", p.rect.h);
+            assert!(p.rect.y + p.rect.h <= h);
+        }
     }
     #[test]
     fn compact_panel_controls_fit_the_smallest_canvas_and_share_hit_geometry() {

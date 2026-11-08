@@ -84,6 +84,8 @@ pub struct ViewportConfig {
     pub word_wrap: bool,
     pub show_line_numbers: bool,
     pub line_number_gutter_width_px: f32,
+    /// Extra room before the text, in pixels (ShaderWallpaper's horizontal panel inset).
+    pub text_inset_px: f32,
 }
 impl Default for ViewportConfig {
     fn default() -> Self {
@@ -98,16 +100,18 @@ impl Default for ViewportConfig {
             word_wrap: false,
             show_line_numbers: true,
             line_number_gutter_width_px: 50.0,
+            text_inset_px: 0.0,
         }
     }
 }
 impl ViewportConfig {
     pub fn text_x(&self) -> f32 {
-        if self.show_line_numbers {
-            self.line_number_gutter_width_px + 8.0
-        } else {
-            10.0
-        }
+        self.text_inset_px
+            + if self.show_line_numbers {
+                self.line_number_gutter_width_px + 8.0
+            } else {
+                10.0
+            }
     }
     pub fn columns(&self) -> usize {
         ((self.width_px - self.text_x() - 8.0).max(self.char_width_px) / self.char_width_px)
@@ -413,6 +417,23 @@ mod tests {
         };
         assert_eq!(config.columns(), columns);
         (snap, config)
+    }
+    #[test]
+    fn a_text_inset_moves_text_caret_and_clicks_together() {
+        let mut snap = TextBuffer::from_string("abcdef".into()).create_snapshot();
+        snap.cursor_offset = 2;
+        let flat = ViewportConfig::default();
+        let inset = ViewportConfig {
+            text_inset_px: 18.0,
+            ..flat
+        };
+        assert_eq!(inset.text_x(), flat.text_x() + 18.0);
+        let a = LayoutEngine::compute_layout(&snap, &flat, None);
+        let b = LayoutEngine::compute_layout(&snap, &inset, None);
+        assert_eq!(b.caret_rect.x, a.caret_rect.x + 18.0);
+        let x = flat.text_x() + 3.0 * flat.char_width_px;
+        assert_eq!(a.screen_to_line_col(&flat, x, 1.0), (0, 3));
+        assert_eq!(b.screen_to_line_col(&inset, x + 18.0, 1.0), (0, 3));
     }
     #[test]
     fn word_wrap_breaks_after_spaces_and_splits_only_words_longer_than_a_row() {
