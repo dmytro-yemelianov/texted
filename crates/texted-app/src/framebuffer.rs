@@ -82,11 +82,19 @@ impl ScreenMapping {
                 pixelated: false,
             };
         };
-        let fit = (width as f64 / w as f64).min(height as f64 / h as f64);
-        // Whole physical pixels whenever possible. Tiny windows fit the entire canvas with nearest sampling.
-        let scale = if fit >= 1.0 { fit.floor() } else { fit };
-        let dw = (w as f64 * scale).floor().max(1.0) as u32;
-        let dh = (h as f64 * scale).floor().max(1.0) as u32;
+        // Fill one window dimension, preserving the source aspect to physical-pixel precision.
+        // Integer cross-products avoid a floating-point roundoff leaving a gap on the fitted edge.
+        let (dw, dh) = if u64::from(width) * u64::from(h) <= u64::from(height) * u64::from(w) {
+            (
+                width,
+                (u64::from(width) * u64::from(h) / u64::from(w)).max(1) as u32,
+            )
+        } else {
+            (
+                (u64::from(height) * u64::from(w) / u64::from(h)).max(1) as u32,
+                height,
+            )
+        };
         Self {
             source: (w, h),
             destination: ((width - dw) / 2, (height - dh) / 2, dw, dh),
@@ -144,7 +152,7 @@ mod tests {
         assert_eq!(Framebuffer::Auto.resolve(Theme::C64), Some((320, 200)));
     }
     #[test]
-    fn presentation_and_input_share_integer_scale_letterboxing_and_small_window_fallback() {
+    fn presentation_and_input_share_aspect_fit_scaling_and_letterbox_rejection() {
         for window in [(1960, 1400), (980, 700), (256, 192), (100, 70), (1, 1)] {
             let m = ScreenMapping::new(window, Some((256, 192)));
             let (x, y, w, h) = m.destination;
@@ -156,9 +164,36 @@ mod tests {
             if x > 0 {
                 assert!(m.to_source((x as f32 - 1.0, y as f32)).is_none());
             }
-            if window.0 >= 256 && window.1 >= 192 {
-                assert_eq!(m.scale().0.fract(), 0.0);
+            assert!(w == window.0 || h == window.1);
+            // The non-fitted edge differs from the exact aspect ratio by less than one physical pixel.
+            if w == window.0 {
+                assert!((f64::from(w) * 192.0 / 256.0 - f64::from(h)).abs() < 1.0);
+            } else {
+                assert!((f64::from(h) * 256.0 / 192.0 - f64::from(w)).abs() < 1.0);
             }
         }
+    }
+    #[test]
+    fn low_resolution_canvases_use_the_full_available_window_without_whole_number_steps() {
+        assert_eq!(
+            ScreenMapping::new((980, 700), Some((640, 480))).destination,
+            (23, 0, 933, 700)
+        );
+        assert_eq!(
+            ScreenMapping::new((980, 700), Some((256, 192))).destination,
+            (23, 0, 933, 700)
+        );
+        assert_eq!(
+            ScreenMapping::new((980, 700), Some((320, 200))).destination,
+            (0, 44, 980, 612)
+        );
+        assert_eq!(
+            ScreenMapping::new((1920, 1080), Some((320, 200))).destination,
+            (96, 0, 1728, 1080)
+        );
+        assert_eq!(
+            ScreenMapping::new((980, 700), None).destination,
+            (0, 0, 980, 700)
+        );
     }
 }
