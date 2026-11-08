@@ -1190,6 +1190,10 @@ impl App {
         let snap = self.session.buffer.client.latest().snapshot.clone();
         if let Some(result) = self.session.search.handle(&intent, snap) {
             self.report(result);
+            if let Some((line, col)) = self.session.search.jump.take() {
+                let caret = texted_app::selection::SelectionState::caret(line, col);
+                self.edit(EditorCommand::SetSelection(caret), true);
+            }
             return;
         }
         match intent {

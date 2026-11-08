@@ -650,6 +650,30 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn cmd_j_jumps_to_a_typed_line() {
+        let dir = std::env::temp_dir().join(format!("texted-goto-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lines.txt");
+        let text: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&path, text).unwrap();
+        let (_, mut app) = application(100, 30, vec![path], None, None);
+        settle(&mut app);
+        let jump = Key::Character("j".into());
+        app.key(&KeyInput {
+            physical: PhysicalKey::Code(KeyCode::KeyJ),
+            logical: &jump,
+            text: None,
+            modifiers: ModifiersState::SUPER,
+        });
+        app.paste_text("12".into());
+        wait_for_text(&mut app, "Enter: line 12");
+        press(&mut app, NamedKey::Enter);
+        settle(&mut app);
+        press(&mut app, NamedKey::F12);
+        wait_for_text(&mut app, "Line 12");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn quitting_keeps_unsaved_tabs_and_the_next_start_restores_them() {
         let dir = std::env::temp_dir().join(format!("texted-hot-exit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

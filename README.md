@@ -34,7 +34,7 @@ Snapshots do not flatten the document. Search streams across rope chunks. Text c
 
 ## Controls
 
-Development builds include native **Texted / File / Edit / Search / View / Window** menus. Right-click the document, or press **Shift+F10**, for editing and Style actions. Right-clicking inside a selection preserves it; clicking outside positions the caret first. Unavailable actions are disabled, and View options reflect the current editor state. Native Window actions include minimize, zoom and fullscreen. The published v0.2.0 preview predates these menus.
+Development builds include native **Texted / File / Edit / Search / View / Window** menus. Right-click the document, or press **Shift+F10**, for editing and Style actions, including Duplicate line, Trim trailing spaces (spaces and tabs only; a raw `\r` is kept) and Go to line. Right-clicking inside a selection preserves it; clicking outside positions the caret first. Unavailable actions are disabled, and View options reflect the current editor state. Native Window actions include minimize, zoom and fullscreen. The published v0.2.0 preview predates these menus.
 
 | Action | Shortcut |
 |---|---|
@@ -50,6 +50,9 @@ Development builds include native **Texted / File / Edit / Search / View / Windo
 | Horizontal scrolling (wrap off) | Trackpad / Shift+wheel / scrollbar |
 | Block selection | Option+drag or Cmd+B |
 | Toggle line numbers | Cmd+L |
+| Duplicate line(s) | Cmd+Shift+D |
+| Move line(s) up / down | Cmd+Option+Up / Down |
+| Go to line (`:line` or `:line:column`, Enter) | Cmd+J |
 | Appearance / styles | Cmd+, or F9 |
 | Context menu | Right-click / Shift+F10 |
 | Text scale, steps of 10% | Cmd++ / Cmd+- / Cmd+0 (100%) |

@@ -12,6 +12,8 @@ pub enum FileIntent {
 #[derive(Debug, Clone)]
 pub enum Intent {
     Edit(EditorCommand),
+    /// Opens the find field as `:line[:column]`; Enter jumps there.
+    GoToLine,
     File(FileIntent),
     Copy {
         cut: bool,
@@ -107,6 +109,7 @@ fn shortcut(input: &KeyInput<'_>) -> Option<Intent> {
         (KeyCode::KeyG, 'g', Intent::NextMatch { forward: !shift }),
         (KeyCode::KeyB, 'b', Intent::Edit(EditorCommand::ToggleBlock)),
         (KeyCode::KeyL, 'l', Intent::ToggleLineNumbers),
+        (KeyCode::KeyJ, 'j', Intent::GoToLine),
         (KeyCode::KeyN, 'n', Intent::File(FileIntent::New)),
         (KeyCode::KeyO, 'o', Intent::File(FileIntent::Open)),
         (
@@ -272,6 +275,20 @@ pub fn decode(input: &KeyInput<'_>, search: SearchContext) -> Option<Intent> {
     if meta && shift && is(input, KeyCode::KeyI, 'i') {
         return Some(Intent::DocumentInfo);
     }
+    if meta && shift && is(input, KeyCode::KeyD, 'd') {
+        return Some(Intent::Edit(EditorCommand::DuplicateLines));
+    }
+    if meta && alt {
+        match input.logical {
+            Key::Named(NamedKey::ArrowUp) => {
+                return Some(Intent::Edit(EditorCommand::MoveLines { up: true }))
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                return Some(Intent::Edit(EditorCommand::MoveLines { up: false }))
+            }
+            _ => {}
+        }
+    }
     if meta {
         if let Some(intent) = shortcut(input) {
             return Some(intent);
@@ -410,6 +427,40 @@ mod tests {
             decode(&input, SearchContext::default()),
             Some(Intent::File(FileIntent::Quit))
         ));
+    }
+    fn decode_with(code: KeyCode, logical: Key, modifiers: ModifiersState) -> Option<Intent> {
+        let input = KeyInput {
+            physical: PhysicalKey::Code(code),
+            logical: &logical,
+            text: None,
+            modifiers,
+        };
+        decode(&input, SearchContext::default())
+    }
+    #[test]
+    fn line_shortcuts_work_with_ukrainian_layouts() {
+        let cmd = ModifiersState::SUPER;
+        assert!(matches!(
+            decode_with(
+                KeyCode::KeyD,
+                Key::Character("В".into()),
+                cmd | ModifiersState::SHIFT
+            ),
+            Some(Intent::Edit(EditorCommand::DuplicateLines))
+        ));
+        assert!(matches!(
+            decode_with(KeyCode::KeyJ, Key::Character("о".into()), cmd),
+            Some(Intent::GoToLine)
+        ));
+        for (code, key, up) in [
+            (KeyCode::ArrowUp, NamedKey::ArrowUp, true),
+            (KeyCode::ArrowDown, NamedKey::ArrowDown, false),
+        ] {
+            assert!(matches!(
+                decode_with(code, Key::Named(key), cmd | ModifiersState::ALT),
+                Some(Intent::Edit(EditorCommand::MoveLines { up: u })) if u == up
+            ));
+        }
     }
     #[test]
     fn document_details_shortcut_is_independent_of_keyboard_language() {

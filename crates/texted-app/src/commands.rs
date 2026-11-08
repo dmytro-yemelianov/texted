@@ -60,4 +60,12 @@ pub enum EditorCommand {
         end: usize,
     },
     SetSelection(SelectionState),
+    /// Copies the caret's or selection's whole lines below them; the selection follows.
+    DuplicateLines,
+    /// Swaps the caret's or selection's whole lines with the line above or below.
+    MoveLines {
+        up: bool,
+    },
+    /// Removes spaces and tabs at the end of every line.
+    TrimTrailingWhitespace,
 }

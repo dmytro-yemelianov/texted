@@ -295,6 +295,8 @@ pub struct SearchState {
     pub find_query: String,
     /// Case and whole-word rules shared by highlighting, navigation and Replace.
     pub options: SearchOptions,
+    /// The find field holds `:line[:column]` for Go to Line instead of a query.
+    pub goto: bool,
     pub replace_query: String,
     pub active_field: usize,
     pub pending: bool,
@@ -345,6 +347,7 @@ impl SearchState {
             mode: SearchBarMode::Closed,
             find_query: String::new(),
             options: SearchOptions::default(),
+            goto: false,
             replace_query: String::new(),
             active_field: 0,
             pending: false,
@@ -378,7 +381,21 @@ impl SearchState {
         self.latest = None;
         self.shared.ready.notify_all();
     }
+    /// The zero-based line and column typed as `:line[:column]` in Go to Line.
+    pub fn line_target(&self) -> Option<(usize, usize)> {
+        if !self.goto {
+            return None;
+        }
+        let mut parts = self.find_query.strip_prefix(':')?.splitn(2, ':');
+        let line: usize = parts.next()?.parse().ok()?;
+        let column: usize = match parts.next() {
+            Some(column) => column.parse().ok()?,
+            None => 1,
+        };
+        Some((line.max(1) - 1, column.max(1) - 1))
+    }
     pub fn close(&mut self) {
+        self.goto = false;
         self.mode = SearchBarMode::Closed;
         self.invalidate();
         self.submitted = None;
@@ -400,6 +417,13 @@ impl SearchState {
         self.submit(snap);
     }
     pub fn submit(&mut self, snap: BufferSnapshot) {
+        if self.goto {
+            // A line number is not searched for.
+            self.invalidate();
+            self.submitted = None;
+            self.latest = Some(snap);
+            return;
+        }
         if self.find_query.len() > MAX_QUERY_BYTES {
             self.find_query = self
                 .submitted
@@ -567,6 +591,12 @@ impl SearchState {
         plan
     }
     pub fn label(&self) -> String {
+        if self.goto {
+            return self.line_target().map_or_else(
+                || "Type a line number".into(),
+                |(line, _)| format!("Enter: line {}", line + 1),
+            );
+        }
         match self.count {
             None if self.pending => format!("Searching… {}+", self.counted),
             Some(0) => "No matches".into(),
