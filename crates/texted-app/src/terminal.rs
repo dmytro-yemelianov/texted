@@ -567,6 +567,7 @@ pub(crate) fn run(mut arguments: Vec<String>) -> Result<(), String> {
             }
             Event::FocusGained => {
                 app.resized();
+                app.focus_gained();
             }
             Event::FocusLost => {
                 app.set_modifiers(ModifiersState::empty());
@@ -586,6 +587,47 @@ mod tests {
         assert_eq!(physical, PhysicalKey::Code(KeyCode::KeyS));
         assert_eq!(logical, Key::Character("і".into()));
         assert_eq!(text.as_deref(), Some("і"));
+    }
+    fn press(app: &mut App, key: NamedKey) {
+        let logical = Key::Named(key);
+        app.key(&KeyInput {
+            physical: PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+            logical: &logical,
+            text: None,
+            modifiers: ModifiersState::empty(),
+        });
+    }
+    fn settle(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.settled() {
+            app.tick();
+            assert!(Instant::now() < deadline, "app never settled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.tick();
+    }
+    #[test]
+    fn regaining_focus_reloads_a_file_changed_elsewhere_and_keeps_the_caret_line() {
+        let dir = std::env::temp_dir().join(format!("texted-focus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let (_, mut app) = application(100, 30, vec![path.clone()], None, None);
+        settle(&mut app);
+        press(&mut app, NamedKey::ArrowDown);
+        press(&mut app, NamedKey::ArrowDown);
+        settle(&mut app);
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&path, "one\ntwo\nthree, edited elsewhere\nfour\n").unwrap();
+        app.focus_gained();
+        settle(&mut app);
+        press(&mut app, NamedKey::F12);
+        app.tick();
+        app.redraw();
+        let text = app.rendered_grid().unwrap().text();
+        assert!(text.contains("three, edited elsewhere"), "{text}");
+        assert!(text.contains("Line 3"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn details_show_a_legacy_file_encoding_and_offer_a_reread() {

@@ -226,6 +226,11 @@ impl App {
     pub(crate) fn notice(&mut self, message: &str) {
         self.report(Err(message.into()));
     }
+    /// Another program may have changed the file while Texted was in the background.
+    pub(crate) fn focus_gained(&mut self) {
+        self.session.files.check_disk();
+        self.window.request_redraw();
+    }
     pub(crate) fn resized(&mut self) {
         self.renderer.invalidate();
         self.context = None;
@@ -415,6 +420,7 @@ impl App {
         self.tabs[self.active] = Some(old);
         self.active = index;
         self.reset_transient();
+        self.session.files.check_disk();
         true
     }
     fn file_action(&mut self, action: Action) {
@@ -608,6 +614,9 @@ impl App {
                     self.command_hover = None;
                 }
                 self.focused = focused;
+                if focused {
+                    self.focus_gained();
+                }
                 self.update_cursor();
                 self.window.request_redraw();
             }
@@ -1539,6 +1548,9 @@ impl App {
             }
             Err(error) => self.session.message = Some(error),
             _ => {}
+        }
+        if let Some(notice) = self.session.files.notice.take() {
+            self.session.message = Some(notice);
         }
         if self.closing && self.session.files.idle() {
             self.closing = false;

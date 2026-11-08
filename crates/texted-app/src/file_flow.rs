@@ -11,6 +11,8 @@ pub(crate) struct FileFlow {
     queue: VecDeque<Action>,
     install: Option<u64>,
     pub reset: bool,
+    /// A status-line message from file work, taken by the app.
+    pub notice: Option<String>,
 }
 impl FileFlow {
     pub fn new(content: ropey::Rope, wake: crate::Wake, dialogs: crate::dialog_ui::Client) -> Self {
@@ -19,6 +21,7 @@ impl FileFlow {
             queue: VecDeque::new(),
             install: None,
             reset: false,
+            notice: None,
         }
     }
     pub fn idle(&self) -> bool {
@@ -26,6 +29,12 @@ impl FileFlow {
     }
     pub fn locked(&self) -> bool {
         self.install.is_some() || !self.queue.is_empty() || self.documents.locked()
+    }
+    /// Checks the file on disk unless other file work is queued.
+    pub fn check_disk(&mut self) {
+        if self.install.is_none() && self.queue.is_empty() {
+            self.documents.check_disk();
+        }
     }
     pub fn enqueue(&mut self, action: Action) -> Result<(), String> {
         if self.queue.len() >= 16 {
@@ -67,6 +76,19 @@ impl FileFlow {
                 self.documents.installed(&document);
                 self.install = Some(sequence);
             }
+            Effect::Refresh(document) => {
+                let (line, col) = p.snapshot.offset_to_line_col(p.snapshot.cursor_offset);
+                let line = line.min(document.content.len_lines().saturating_sub(1));
+                submit(client, Command::Load(document.content.clone()))?;
+                let caret = texted_app::selection::SelectionState::caret(line, col);
+                let sequence = submit(
+                    client,
+                    Command::Edit(texted_app::commands::EditorCommand::SetSelection(caret)),
+                )?;
+                self.documents.installed(&document);
+                self.install = Some(sequence);
+            }
+            Effect::Notice(message) => self.notice = Some(message),
         }
         Ok(false)
     }

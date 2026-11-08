@@ -185,6 +185,32 @@ pub struct LoadedDocument {
     pub has_bom: bool,
     pub encoding: TextEncoding,
     pub byte_size: usize,
+    /// The file's identity when it was read; `None` for a new document.
+    pub disk: Option<DiskStamp>,
+}
+/// Identifies one version of a file on disk, to notice when another program replaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    // Editors that save atomically replace the file, so its inode changes too.
+    inode: u64,
+}
+impl DiskStamp {
+    pub fn of<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Ok(Self::from_metadata(&fs::metadata(path)?))
+    }
+    fn from_metadata(meta: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(meta);
+        #[cfg(not(unix))]
+        let inode = 0;
+        Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            inode,
+        }
+    }
 }
 pub struct IoManager;
 // Normalize CRLF incrementally, including pairs split across read boundaries.
@@ -306,7 +332,8 @@ impl IoManager {
         normalize: bool,
     ) -> io::Result<LoadedDocument> {
         let file = File::open(path)?;
-        let byte_size = file.metadata()?.len() as usize;
+        let meta = file.metadata()?;
+        let byte_size = meta.len() as usize;
         let mut input = BufReader::new(file);
         let head = input.fill_buf()?;
         let sniffed = [
@@ -354,6 +381,7 @@ impl IoManager {
             has_bom,
             encoding,
             byte_size,
+            disk: Some(DiskStamp::from_metadata(&meta)),
         })
     }
     pub fn save_atomic<P: AsRef<Path>>(
@@ -638,6 +666,19 @@ mod tests {
         let doc = IoManager::open_file_as(&path, Some(TextEncoding::Koi8U)).unwrap();
         assert_eq!(doc.encoding, TextEncoding::Koi8U);
         assert_eq!(doc.content.to_string(), "оПХБЁР, ©ФЮЙС!\n╔ЮМНЙ Ё ╙БЮ\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn disk_stamp_matches_the_opened_file_until_another_program_rewrites_it() {
+        let dir = scratch("stamp");
+        let path = dir.join("doc.txt");
+        fs::write(&path, "first").unwrap();
+        let doc = IoManager::open_file(&path).unwrap();
+        assert_eq!(doc.disk, Some(DiskStamp::of(&path).unwrap()));
+        // Same length, so only the modification time can tell the versions apart.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&path, "fresh").unwrap();
+        assert_ne!(doc.disk, Some(DiskStamp::of(&path).unwrap()));
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

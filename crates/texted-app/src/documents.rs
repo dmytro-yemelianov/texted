@@ -4,7 +4,7 @@ use ropey::Rope;
 use std::{path::PathBuf, sync::mpsc, thread};
 use texted_app::buffer_service::{BufferClient, Command};
 use texted_buffer::BufferSnapshot;
-use texted_io::{IoManager, LineEnding, LoadedDocument, TextEncoding};
+use texted_io::{DiskStamp, IoManager, LineEnding, LoadedDocument, TextEncoding};
 /// A user-requested file operation must not wait on a hidden or minimized sheet.
 pub(crate) fn reveal_for_dialog(window: &Host) {
     window.set_visible(true);
@@ -27,12 +27,25 @@ pub enum Action {
 pub enum Effect {
     None,
     Install(LoadedDocument),
+    /// The same file reread after another program changed it; keep the caret's place.
+    Refresh(LoadedDocument),
+    /// A message for the status line that needs no answer.
+    Notice(String),
     Close,
 }
 struct Saved {
     path: PathBuf,
     text: Rope,
     format: (TextEncoding, bool),
+    disk: Option<DiskStamp>,
+}
+enum SaveFailure {
+    Error(String),
+    /// Another program replaced the file since it was opened or saved.
+    ChangedOnDisk {
+        text: Rope,
+        path: PathBuf,
+    },
 }
 /// Save formats offered in Document details; UTF-16 always carries its byte-order mark.
 const SAVE_FORMATS: [(TextEncoding, bool); 6] = [
@@ -44,8 +57,17 @@ const SAVE_FORMATS: [(TextEncoding, bool); 6] = [
     (TextEncoding::Koi8U, false),
 ];
 enum Job {
-    Save(mpsc::Receiver<Result<Saved, String>>),
-    Load(mpsc::Receiver<Result<LoadedDocument, String>>),
+    Save(mpsc::Receiver<Result<Saved, SaveFailure>>),
+    Load {
+        receive: mpsc::Receiver<Result<LoadedDocument, String>>,
+        refresh: bool,
+    },
+    Check(mpsc::Receiver<std::io::Result<DiskStamp>>),
+    Conflict {
+        ticket: crate::dialog_ui::Ticket,
+        text: Rope,
+        path: PathBuf,
+    },
     ChooseSave {
         ticket: crate::dialog_ui::Ticket,
         snapshot: BufferSnapshot,
@@ -64,6 +86,10 @@ pub struct Documents {
     pub encoding: TextEncoding,
     saved_text: Rope,
     saved_format: (TextEncoding, bool),
+    /// The file version last read or written; `None` when there is no file yet.
+    disk: Option<DiskStamp>,
+    /// The external version already reported, so a focus change does not repeat it.
+    warned: Option<Option<DiskStamp>>,
     wake: crate::Wake,
     dialogs: crate::dialog_ui::Client,
     job: Option<Job>,
@@ -85,6 +111,8 @@ impl Documents {
             encoding: TextEncoding::Utf8,
             saved_text: text,
             saved_format: (TextEncoding::Utf8, bom),
+            disk: None,
+            warned: None,
             wake,
             dialogs,
             job: None,
@@ -124,6 +152,29 @@ impl Documents {
             .map_or(0, |i| (i + 1) % ORDER.len());
         ORDER[next]
     }
+    /// Looks for a newer version of the file on disk without blocking the caller.
+    pub fn check_disk(&mut self) {
+        let (Some(path), Some(_)) = (self.path.clone(), self.disk) else {
+            return;
+        };
+        if !self.is_idle() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.job = Some(Job::Check(rx));
+        let wake = self.wake.clone();
+        thread::spawn(move || {
+            let _ = tx.send(DiskStamp::of(&path));
+            wake();
+        });
+    }
+    fn display_name(&self) -> String {
+        self.path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into())
+    }
     /// Accept external lifecycle actions only after a dialog, worker and its continuation finish.
     pub fn is_idle(&self) -> bool {
         self.job.is_none() && self.next.is_none()
@@ -131,7 +182,7 @@ impl Documents {
     pub fn locked(&self) -> bool {
         self.job
             .as_ref()
-            .is_some_and(|j| !matches!(j, Job::Save(_)))
+            .is_some_and(|j| !matches!(j, Job::Save(_) | Job::Check(_)))
             || self.next.is_some()
     }
     pub fn title(&self, snapshot: &BufferSnapshot) -> String {
@@ -145,7 +196,7 @@ impl Documents {
             "{name}{}{} - Texted",
             if self.dirty(snapshot) { " *" } else { "" },
             match self.job {
-                Some(Job::Load(_)) => " (Opening...)",
+                Some(Job::Load { .. }) => " (Opening...)",
                 Some(Job::Save(_)) => " (Saving...)",
                 _ => "",
             }
@@ -158,6 +209,8 @@ impl Documents {
         self.encoding = document.encoding;
         self.saved_text = document.content.clone();
         self.saved_format = (document.encoding, document.has_bom);
+        self.disk = document.disk;
+        self.warned = None;
     }
     fn error(&mut self, message: &str) {
         self.next = None;
@@ -190,12 +243,7 @@ impl Documents {
             return Effect::None;
         }
         if self.dirty(snapshot) {
-            let name = self
-                .path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Untitled".into());
+            let name = self.display_name();
             match self
                 .dialogs
                 .request(crate::dialog_ui::Kind::ConfirmSave { name })
@@ -217,6 +265,7 @@ impl Documents {
                 line_ending: LineEnding::Lf,
                 encoding: TextEncoding::Utf8,
                 byte_size: 0,
+                disk: None,
             }),
             Action::OpenDialog => {
                 let directory = self
@@ -237,12 +286,12 @@ impl Documents {
                 Effect::None
             }
             Action::OpenPath(path) => {
-                self.open(path, None);
+                self.open(path, None, false);
                 Effect::None
             }
             Action::Reopen(encoding) => {
                 match self.path.clone() {
-                    Some(path) => self.open(path, Some(encoding)),
+                    Some(path) => self.open(path, Some(encoding), false),
                     None => self.error("Save the document before reading it in another encoding"),
                 }
                 Effect::None
@@ -250,9 +299,12 @@ impl Documents {
             Action::Save { .. } | Action::ReportError(_) => unreachable!(),
         }
     }
-    fn open(&mut self, path: PathBuf, encoding: Option<TextEncoding>) {
+    fn open(&mut self, path: PathBuf, encoding: Option<TextEncoding>, refresh: bool) {
         let (tx, rx) = mpsc::channel();
-        self.job = Some(Job::Load(rx));
+        self.job = Some(Job::Load {
+            receive: rx,
+            refresh,
+        });
         let wake = self.wake.clone();
         thread::spawn(move || {
             let result = IoManager::open_file_as(&path, encoding)
@@ -282,35 +334,65 @@ impl Documents {
                 Err(error) => self.error(&error),
             }
         } else {
-            self.write(snapshot, self.path.clone().unwrap());
+            self.write(snapshot.content.clone(), self.path.clone().unwrap(), true);
         }
     }
-    fn write(&mut self, snapshot: &BufferSnapshot, path: PathBuf) {
+    /// With `guard`, a save over the open file first checks that no other program replaced it.
+    fn write(&mut self, content: Rope, path: PathBuf, guard: bool) {
         let (tx, rx) = mpsc::channel();
         self.job = Some(Job::Save(rx));
-        let content = snapshot.content.clone();
+        let expected = self
+            .disk
+            .filter(|_| guard && self.path.as_ref() == Some(&path));
         let bom = self.bom;
         let ending = self.ending;
         let encoding = self.encoding;
         let wake = self.wake.clone();
         thread::spawn(move || {
-            let result = IoManager::save_rope_as(&path, &content, bom, ending, encoding)
-                .map_err(|e| {
-                    let hint = if e.kind() == std::io::ErrorKind::InvalidData {
-                        ". Choose another encoding in Document details (Cmd+Shift+I)"
-                    } else {
-                        ""
-                    };
-                    format!("Could not save {}: {e}{hint}", path.display())
-                })
-                .map(|()| Saved {
-                    path,
+            let replaced =
+                expected.is_some_and(|stamp| DiskStamp::of(&path).is_ok_and(|now| now != stamp));
+            let result = if replaced {
+                Err(SaveFailure::ChangedOnDisk {
                     text: content,
-                    format: (encoding, bom),
-                });
+                    path,
+                })
+            } else {
+                IoManager::save_rope_as(&path, &content, bom, ending, encoding)
+                    .map_err(|e| {
+                        let hint = if e.kind() == std::io::ErrorKind::InvalidData {
+                            ". Choose another encoding in Document details (Cmd+Shift+I)"
+                        } else {
+                            ""
+                        };
+                        SaveFailure::Error(format!("Could not save {}: {e}{hint}", path.display()))
+                    })
+                    .map(|()| Saved {
+                        disk: DiskStamp::of(&path).ok(),
+                        path,
+                        text: content,
+                        format: (encoding, bom),
+                    })
+            };
             let _ = tx.send(result);
             wake();
         });
+    }
+    /// Reports a newer or missing file once; an unchanged document simply rereads it.
+    fn disk_checked(&mut self, now: Option<DiskStamp>, snapshot: &BufferSnapshot) -> Effect {
+        if now == self.disk || self.warned == Some(now) {
+            return Effect::None;
+        }
+        if let (Some(_), Some(path), false) = (now, self.path.clone(), self.dirty(snapshot)) {
+            self.open(path, Some(self.encoding), true);
+            return Effect::None;
+        }
+        self.warned = Some(now);
+        let name = self.display_name();
+        Effect::Notice(if now.is_some() {
+            format!("{name} changed on disk; saving will ask before replacing it")
+        } else {
+            format!("{name} is no longer on disk; saving will recreate it")
+        })
     }
     pub fn poll(&mut self, snapshot: &BufferSnapshot, client: &BufferClient) -> Effect {
         use crate::dialog_ui::Answer;
@@ -321,9 +403,22 @@ impl Documents {
                         self.path = Some(saved.path);
                         self.saved_text = saved.text;
                         self.saved_format = saved.format;
+                        self.disk = saved.disk;
+                        self.warned = None;
                     }
-                    Ok(Err(error)) => {
+                    Ok(Err(SaveFailure::Error(error))) => {
                         self.error(&error);
+                        return Effect::None;
+                    }
+                    Ok(Err(SaveFailure::ChangedOnDisk { text, path })) => {
+                        let name = self.display_name();
+                        match self
+                            .dialogs
+                            .request(crate::dialog_ui::Kind::ConfirmOverwrite { name })
+                        {
+                            Ok(ticket) => self.job = Some(Job::Conflict { ticket, text, path }),
+                            Err(error) => self.error(&error),
+                        }
                         return Effect::None;
                     }
                     Err(mpsc::TryRecvError::Empty) => {
@@ -335,14 +430,15 @@ impl Documents {
                         return Effect::None;
                     }
                 },
-                Job::Load(receive) => match receive.try_recv() {
+                Job::Load { receive, refresh } => match receive.try_recv() {
+                    Ok(Ok(document)) if refresh => return Effect::Refresh(document),
                     Ok(Ok(document)) => return Effect::Install(document),
                     Ok(Err(error)) => {
                         self.error(&error);
                         return Effect::None;
                     }
                     Err(mpsc::TryRecvError::Empty) => {
-                        self.job = Some(Job::Load(receive));
+                        self.job = Some(Job::Load { receive, refresh });
                         return Effect::None;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -355,7 +451,7 @@ impl Documents {
                     snapshot: written,
                 } => match ticket.poll() {
                     Some(Answer::Path(path)) => {
-                        self.write(&written, path);
+                        self.write(written.content, path, true);
                         return Effect::None;
                     }
                     Some(_) => self.next = None,
@@ -369,7 +465,7 @@ impl Documents {
                 },
                 Job::ChooseOpen(ticket) => match ticket.poll() {
                     Some(Answer::Path(path)) => {
-                        self.open(path, None);
+                        self.open(path, None, false);
                         return Effect::None;
                     }
                     Some(_) => {}
@@ -397,6 +493,34 @@ impl Documents {
                         return Effect::None;
                     }
                 }
+                Job::Check(receive) => match receive.try_recv() {
+                    Ok(now) => {
+                        let effect = self.disk_checked(now.ok(), snapshot);
+                        if !matches!(effect, Effect::None) || self.job.is_some() {
+                            return effect;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        self.job = Some(Job::Check(receive));
+                        return Effect::None;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {}
+                },
+                Job::Conflict { ticket, text, path } => match ticket.poll() {
+                    Some(Answer::Save) => {
+                        self.write(text, path, false);
+                        return Effect::None;
+                    }
+                    Some(Answer::Discard) => {
+                        self.open(path, Some(self.encoding), true);
+                        return Effect::None;
+                    }
+                    Some(_) => self.next = None,
+                    None => {
+                        self.job = Some(Job::Conflict { ticket, text, path });
+                        return Effect::None;
+                    }
+                },
             }
         }
         if let Some(action) = self.next.take() {
@@ -518,6 +642,139 @@ mod tests {
         assert_eq!(document.encoding, TextEncoding::Koi8U);
         assert_eq!(document.content.to_string(), "©ФЮЙ\n");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    fn scratch_file(name: &str, text: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("texted-disk-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+    fn snapshot_of(content: Rope) -> BufferSnapshot {
+        BufferSnapshot {
+            total_bytes: content.len_bytes(),
+            total_lines: content.len_lines(),
+            content,
+            cursor_offset: 0,
+            revision: 0,
+        }
+    }
+    fn opened(path: &std::path::Path) -> (Documents, LoadedDocument) {
+        let loaded = IoManager::open_file(path).unwrap();
+        let mut doc = Documents::new(
+            Rope::new(),
+            None,
+            false,
+            LineEnding::Lf,
+            Arc::new(|| {}),
+            dialogs(),
+        );
+        doc.installed(&loaded);
+        (doc, loaded)
+    }
+    /// Another program rewrites the file; the pause keeps modification times apart.
+    fn rewrite(path: &std::path::Path, text: &str) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(path, text).unwrap();
+    }
+    fn effects_until_idle(
+        doc: &mut Documents,
+        snap: &BufferSnapshot,
+        client: &BufferClient,
+    ) -> Vec<Effect> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut effects = vec![];
+        loop {
+            match doc.poll(snap, client) {
+                Effect::None if doc.is_idle() => return effects,
+                Effect::None => {}
+                effect => effects.push(effect),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "file work never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    #[test]
+    fn a_clean_document_changed_on_disk_is_reloaded() {
+        let path = scratch_file("clean", "one\ntwo\n");
+        let service = texted_app::buffer_service::BufferService::new(|| {});
+        let (mut doc, loaded) = opened(&path);
+        let snap = snapshot_of(loaded.content);
+        rewrite(&path, "one\ntwo\nthree\n");
+        doc.check_disk();
+        let effects = effects_until_idle(&mut doc, &snap, &service.client);
+        assert!(
+            matches!(&effects[..], [Effect::Refresh(d)] if d.content == "one\ntwo\nthree\n"),
+            "{} effects",
+            effects.len()
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn a_changed_document_is_kept_and_warned_about_once() {
+        let path = scratch_file("dirty", "one\n");
+        let service = texted_app::buffer_service::BufferService::new(|| {});
+        let (mut doc, _) = opened(&path);
+        let snap = snapshot_of(Rope::from_str("one\nmine\n"));
+        rewrite(&path, "one\ntheirs\n");
+        doc.check_disk();
+        let effects = effects_until_idle(&mut doc, &snap, &service.client);
+        assert!(
+            matches!(&effects[..], [Effect::Notice(m)] if m.contains("notes.txt")),
+            "{} effects",
+            effects.len()
+        );
+        doc.check_disk();
+        assert!(effects_until_idle(&mut doc, &snap, &service.client).is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn saving_over_a_change_on_disk_asks_before_overwriting() {
+        use winit::keyboard::{Key, ModifiersState, NamedKey, NativeKeyCode, PhysicalKey};
+        let path = scratch_file("conflict", "one\n");
+        let service = texted_app::buffer_service::BufferService::new(|| {});
+        let (client, mut ui) = crate::dialog_ui::channel(Arc::new(|| {}));
+        let loaded = IoManager::open_file(&path).unwrap();
+        let mut doc = Documents::new(
+            Rope::new(),
+            None,
+            false,
+            LineEnding::Lf,
+            Arc::new(|| {}),
+            client,
+        );
+        doc.installed(&loaded);
+        let snap = snapshot_of(Rope::from_str("one\nmine\n"));
+        rewrite(&path, "one\ntheirs\n");
+        doc.handle(Action::Save { save_as: false }, &snap, &service.client);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ui.open() {
+            doc.poll(&snap, &service.client);
+            ui.poll();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "saved without asking: {:?}",
+                std::fs::read_to_string(&path)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(ui.title(), "Changed on disk");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntheirs\n");
+        // The first button overwrites with the editor's version.
+        ui.key(&crate::input::KeyInput {
+            physical: PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+            logical: &Key::Named(NamedKey::Enter),
+            text: None,
+            modifiers: ModifiersState::empty(),
+        });
+        effects_until_idle(&mut doc, &snap, &service.client);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\nmine\n");
+        assert!(!doc.dirty(&snap));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     #[test]
     fn saving_old_snapshot_does_not_clean_newer_edits() {
