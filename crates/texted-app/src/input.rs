@@ -7,6 +7,7 @@ pub enum FileIntent {
     Open,
     Save { as_new: bool },
     Close,
+    Quit,
 }
 #[derive(Debug, Clone)]
 pub enum Intent {
@@ -24,11 +25,17 @@ pub enum Intent {
     SearchClose,
     ContextMenu,
     ToggleAppearance,
+    DocumentInfo,
     Zoom(i32),
     ResetFontSize,
     ToggleWrap,
     ToggleLineNumbers,
     ToggleDiagnostics,
+    ToggleCommands,
+    AcceptAppearance,
+    ResetAppearance,
+    BrowseAppearance { forward: bool },
+    NextTab { forward: bool },
     Cancel,
 }
 #[derive(Clone, Copy, Default)]
@@ -87,12 +94,99 @@ fn shortcut(input: &KeyInput<'_>) -> Option<Intent> {
             's',
             Intent::File(FileIntent::Save { as_new: shift }),
         ),
-        (KeyCode::KeyQ, 'q', Intent::File(FileIntent::Close)),
+        (KeyCode::KeyQ, 'q', Intent::File(FileIntent::Quit)),
         (KeyCode::KeyW, 'w', Intent::File(FileIntent::Close)),
     ];
     bindings
         .into_iter()
         .find_map(|(code, letter, intent)| is(input, code, letter).then_some(intent))
+}
+/// Shared by the visible command bar and physical function keys.
+pub fn function_key(index: usize) -> Option<Intent> {
+    Some(match index {
+        0 => Intent::ToggleCommands,
+        1 => Intent::File(FileIntent::Save { as_new: false }),
+        2 => Intent::Find,
+        3 => Intent::Replace,
+        4 => Intent::File(FileIntent::Open),
+        5 => Intent::File(FileIntent::New),
+        6 => Intent::NextTab { forward: false },
+        7 => Intent::NextTab { forward: true },
+        8 => Intent::ToggleAppearance,
+        9 => Intent::File(FileIntent::Close),
+        10 => Intent::ToggleWrap,
+        11 => Intent::DocumentInfo,
+        _ => return None,
+    })
+}
+pub fn function_key_index(key: &Key) -> Option<usize> {
+    Some(match key {
+        Key::Named(NamedKey::F1) => 0,
+        Key::Named(NamedKey::F2) => 1,
+        Key::Named(NamedKey::F3) => 2,
+        Key::Named(NamedKey::F4) => 3,
+        Key::Named(NamedKey::F5) => 4,
+        Key::Named(NamedKey::F6) => 5,
+        Key::Named(NamedKey::F7) => 6,
+        Key::Named(NamedKey::F8) => 7,
+        Key::Named(NamedKey::F9) => 8,
+        Key::Named(NamedKey::F10) => 9,
+        Key::Named(NamedKey::F11) => 10,
+        Key::Named(NamedKey::F12) => 11,
+        _ => return None,
+    })
+}
+/// Modifier layers are shared by keyboard decoding and the clickable panel.
+pub fn function_key_for(
+    index: usize,
+    modifiers: ModifiersState,
+    search: SearchContext,
+) -> Option<Intent> {
+    let shift = modifiers.shift_key();
+    if index == 9 && shift {
+        return Some(Intent::ContextMenu);
+    }
+    if modifiers.super_key() {
+        match index {
+            6 => return Some(Intent::Edit(EditorCommand::Undo)),
+            7 => return Some(Intent::Edit(EditorCommand::Redo)),
+            9 => return Some(Intent::File(FileIntent::Quit)),
+            10 => return Some(Intent::ToggleLineNumbers),
+            11 => return Some(Intent::ToggleDiagnostics),
+            _ => {}
+        }
+    } else if modifiers.alt_key() {
+        return Some(match index {
+            1 => Intent::Copy { cut: false },
+            2 => Intent::Paste,
+            3 => Intent::Copy { cut: true },
+            4 => Intent::Edit(EditorCommand::SelectAll),
+            5 => Intent::Edit(EditorCommand::ToggleBlock),
+            6 => Intent::Zoom(-1),
+            7 => Intent::Zoom(1),
+            8 => Intent::ResetFontSize,
+            9 => Intent::Cancel,
+            10 => Intent::ToggleWrap,
+            11 => Intent::ToggleLineNumbers,
+            _ => return function_key(index),
+        });
+    } else if modifiers.control_key() {
+        match index {
+            6 => return Some(Intent::Zoom(-1)),
+            7 => return Some(Intent::Zoom(1)),
+            8 => return Some(Intent::ResetFontSize),
+            9 | 11 => return Some(Intent::DocumentInfo),
+            10 => return Some(Intent::ToggleWrap),
+            _ => {}
+        }
+    }
+    Some(match index {
+        1 => Intent::File(FileIntent::Save { as_new: shift }),
+        2 if search.open || shift => Intent::NextMatch { forward: !shift },
+        3 if search.replace => Intent::ReplaceMatch { all: shift },
+        9 if search.open => Intent::SearchClose,
+        _ => return function_key(index),
+    })
 }
 fn motion(key: &Key, meta: bool, alt: bool, block: bool) -> Option<Motion> {
     use NamedKey::*;
@@ -153,6 +247,9 @@ pub fn decode(input: &KeyInput<'_>, search: SearchContext) -> Option<Intent> {
     {
         return Some(Intent::ContextMenu);
     }
+    if meta && shift && is(input, KeyCode::KeyI, 'i') {
+        return Some(Intent::DocumentInfo);
+    }
     if meta {
         if let Some(intent) = shortcut(input) {
             return Some(intent);
@@ -161,8 +258,22 @@ pub fn decode(input: &KeyInput<'_>, search: SearchContext) -> Option<Intent> {
     if alt && is(input, KeyCode::KeyZ, 'z') {
         return Some(Intent::ToggleWrap);
     }
-    if *input.logical == Key::Named(NamedKey::F3) {
-        return Some(Intent::ToggleDiagnostics);
+    if input.modifiers.control_key() && *input.logical == Key::Named(NamedKey::Tab) {
+        return Some(Intent::NextTab { forward: !shift });
+    }
+    if meta
+        && shift
+        && matches!(
+            input.physical,
+            PhysicalKey::Code(KeyCode::BracketLeft | KeyCode::BracketRight)
+        )
+    {
+        return Some(Intent::NextTab {
+            forward: input.physical == PhysicalKey::Code(KeyCode::BracketRight),
+        });
+    }
+    if let Some(index) = function_key_index(input.logical) {
+        return function_key_for(index, input.modifiers, search);
     }
     if search.open {
         match input.logical {
@@ -224,6 +335,74 @@ pub fn decode(input: &KeyInput<'_>, search: SearchContext) -> Option<Intent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn function_panel_keys_and_tab_navigation_share_their_intents() {
+        for (i, key) in [
+            NamedKey::F1,
+            NamedKey::F2,
+            NamedKey::F3,
+            NamedKey::F4,
+            NamedKey::F5,
+            NamedKey::F6,
+            NamedKey::F7,
+            NamedKey::F8,
+            NamedKey::F9,
+            NamedKey::F10,
+            NamedKey::F11,
+            NamedKey::F12,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let logical = Key::Named(key);
+            let input = KeyInput {
+                physical: PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified),
+                logical: &logical,
+                text: None,
+                modifiers: ModifiersState::empty(),
+            };
+            assert_eq!(
+                format!("{:?}", decode(&input, SearchContext::default())),
+                format!("{:?}", function_key(i))
+            );
+        }
+        let logical = Key::Named(NamedKey::Tab);
+        let input = KeyInput {
+            physical: PhysicalKey::Code(KeyCode::Tab),
+            logical: &logical,
+            text: None,
+            modifiers: ModifiersState::CONTROL | ModifiersState::SHIFT,
+        };
+        assert!(matches!(
+            decode(&input, SearchContext::default()),
+            Some(Intent::NextTab { forward: false })
+        ));
+        let logical = Key::Character("й".into());
+        let input = KeyInput {
+            physical: PhysicalKey::Code(KeyCode::KeyQ),
+            logical: &logical,
+            text: None,
+            modifiers: ModifiersState::SUPER,
+        };
+        assert!(matches!(
+            decode(&input, SearchContext::default()),
+            Some(Intent::File(FileIntent::Quit))
+        ));
+    }
+    #[test]
+    fn document_details_shortcut_is_independent_of_keyboard_language() {
+        let logical = Key::Character("Ш".into());
+        let input = KeyInput {
+            physical: PhysicalKey::Code(KeyCode::KeyI),
+            logical: &logical,
+            text: None,
+            modifiers: ModifiersState::SUPER | ModifiersState::SHIFT,
+        };
+        assert!(matches!(
+            decode(&input, SearchContext::default()),
+            Some(Intent::DocumentInfo)
+        ));
+    }
     #[test]
     fn appearance_shortcuts_use_physical_keys_even_with_search_open() {
         let key = Key::Character("б".into());

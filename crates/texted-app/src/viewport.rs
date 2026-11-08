@@ -114,15 +114,12 @@ impl Viewport {
         font: &FontEngine,
         width: usize,
         height: usize,
-        compact: bool,
     ) -> Frame {
         if self.blink.elapsed() >= Duration::from_millis(500) {
             self.caret = !self.caret;
             self.blink = Instant::now();
         }
-        let text_height = height.saturating_sub(
-            (if compact { 14 } else { 28 }) + if self.wrap { 0 } else { BAR_HEIGHT },
-        );
+        let text_height = height.saturating_sub(if self.wrap { 0 } else { BAR_HEIGHT });
         let (cur_line, cur_col) = snap.offset_to_line_col(snap.cursor_offset);
         let visible_rows = (text_height as f32 / font.line_height_px).floor() as usize;
         let snap_horizontal = self.snap;
@@ -199,6 +196,30 @@ impl Viewport {
             cur_line,
             cur_col,
             layout_time: now.elapsed(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn document_uses_all_space_above_the_one_command_panel() {
+        let snapshot =
+            texted_buffer::TextBuffer::from_string("one\ntwo\nthree".into()).create_snapshot();
+        let font = FontEngine::new(16.0);
+        for (width, height, compact) in [(256, 192, true), (980, 700, false)] {
+            let g = crate::chrome::Geometry::new(width, height, compact, true);
+            let mut viewport = Viewport::new(|| {});
+            let frame = viewport.prepare(&snapshot, &font, width, g.document_height());
+            assert_eq!(frame.text_height, height - g.top - g.bottom);
+            viewport.wrap = false;
+            assert_eq!(
+                viewport
+                    .prepare(&snapshot, &font, width, g.document_height())
+                    .text_height,
+                height - g.top - g.bottom - BAR_HEIGHT
+            );
         }
     }
 }

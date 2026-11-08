@@ -4,10 +4,7 @@ use crate::{
     transfers::submit,
 };
 use std::{collections::VecDeque, sync::Arc};
-use texted_app::{
-    buffer_service::{BufferClient, Command, Published},
-    input::{FileIntent, Intent},
-};
+use texted_app::buffer_service::{BufferClient, Command, Published};
 use texted_io::LineEnding;
 use winit::window::Window;
 pub(crate) struct FileFlow {
@@ -17,13 +14,16 @@ pub(crate) struct FileFlow {
     pub reset: bool,
 }
 impl FileFlow {
-    pub fn new(content: ropey::Rope) -> Self {
+    pub fn new(content: ropey::Rope, wake: crate::Wake) -> Self {
         Self {
-            documents: Documents::new(content, None, false, LineEnding::Lf),
+            documents: Documents::new(content, None, false, LineEnding::Lf, wake),
             queue: VecDeque::new(),
             install: None,
             reset: false,
         }
+    }
+    pub fn idle(&self) -> bool {
+        self.install.is_none() && self.queue.is_empty() && self.documents.is_idle()
     }
     pub fn locked(&self) -> bool {
         self.install.is_some() || !self.queue.is_empty() || self.documents.locked()
@@ -34,16 +34,6 @@ impl FileFlow {
         }
         self.queue.push_back(action);
         Ok(())
-    }
-    pub fn route(&mut self, intent: &Intent) -> Option<Result<(), String>> {
-        let action = match intent {
-            Intent::File(FileIntent::New) => Action::New,
-            Intent::File(FileIntent::Open) => Action::OpenDialog,
-            Intent::File(FileIntent::Save { as_new }) => Action::Save { save_as: *as_new },
-            Intent::File(FileIntent::Close) => Action::Close,
-            _ => return None,
-        };
-        Some(self.enqueue(action))
     }
     fn next_ready(&mut self, p: &Published, accepted: u64, transferring: bool) -> Option<Action> {
         if self.documents.is_idle() && ready(p, accepted, transferring) {
@@ -103,16 +93,12 @@ mod tests {
             let _ = wake.try_send(());
         });
         let client = &service.client;
-        let mut flow = FileFlow::new(client.latest().snapshot.content.clone());
+        let mut flow = FileFlow::new(client.latest().snapshot.content.clone(), Arc::new(|| {}));
         client
             .submit(Command::Edit(EditorCommand::Insert("prior".into())))
             .unwrap_or_else(|_| panic!("rejected"));
-        flow.route(&Intent::File(FileIntent::Save { as_new: false }))
-            .unwrap()
-            .unwrap();
-        flow.route(&Intent::File(FileIntent::Close))
-            .unwrap()
-            .unwrap();
+        flow.enqueue(Action::Save { save_as: false }).unwrap();
+        flow.enqueue(Action::Close).unwrap();
         assert!(flow.locked());
         assert!(flow
             .next_ready(&client.latest(), client.barrier(), true)
@@ -163,7 +149,7 @@ mod tests {
     fn initial_saved_root_is_the_actual_published_root() {
         let service = texted_app::buffer_service::BufferService::new(|| {});
         let p = service.client.latest();
-        let flow = FileFlow::new(p.snapshot.content.clone());
+        let flow = FileFlow::new(p.snapshot.content.clone(), Arc::new(|| {}));
         assert!(!flow.documents.dirty(&p.snapshot));
     }
 }
