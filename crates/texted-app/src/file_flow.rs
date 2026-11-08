@@ -1,6 +1,6 @@
 //! File actions wait for accepted edits and clipboard continuations before dirty checks.
 use crate::{
-    documents::{Action, Documents, Effect},
+    documents::{Action, Caret, Documents, Effect},
     transfers::submit,
 };
 use std::collections::VecDeque;
@@ -11,6 +11,8 @@ pub(crate) struct FileFlow {
     queue: VecDeque<Action>,
     install: Option<u64>,
     pub reset: bool,
+    /// A status-line message from file work, taken by the app.
+    pub notice: Option<String>,
 }
 impl FileFlow {
     pub fn new(content: ropey::Rope, wake: crate::Wake, dialogs: crate::dialog_ui::Client) -> Self {
@@ -19,6 +21,7 @@ impl FileFlow {
             queue: VecDeque::new(),
             install: None,
             reset: false,
+            notice: None,
         }
     }
     pub fn idle(&self) -> bool {
@@ -26,6 +29,12 @@ impl FileFlow {
     }
     pub fn locked(&self) -> bool {
         self.install.is_some() || !self.queue.is_empty() || self.documents.locked()
+    }
+    /// Checks the file on disk unless other file work is queued.
+    pub fn check_disk(&mut self) {
+        if self.install.is_none() && self.queue.is_empty() {
+            self.documents.check_disk();
+        }
     }
     pub fn enqueue(&mut self, action: Action) -> Result<(), String> {
         if self.queue.len() >= 16 {
@@ -62,11 +71,32 @@ impl FileFlow {
         match effect {
             Effect::None => {}
             Effect::Close => return Ok(true),
-            Effect::Install(document) => {
-                let sequence = submit(client, Command::Load(document.content.clone()))?;
+            Effect::Install {
+                document,
+                caret,
+                draft,
+            } => {
+                let place = match caret {
+                    Caret::Start => None,
+                    Caret::Keep => Some(p.snapshot.offset_to_line_col(p.snapshot.cursor_offset)),
+                    Caret::At(line, col) => Some((line, col)),
+                };
+                let mut sequence = submit(client, Command::Load(document.content.clone()))?;
+                if let Some((line, col)) = place {
+                    let line = line.min(document.content.len_lines().saturating_sub(1));
+                    let caret = texted_app::selection::SelectionState::caret(line, col);
+                    sequence = submit(
+                        client,
+                        Command::Edit(texted_app::commands::EditorCommand::SetSelection(caret)),
+                    )?;
+                }
                 self.documents.installed(&document);
+                if draft {
+                    self.documents.mark_unsaved();
+                }
                 self.install = Some(sequence);
             }
+            Effect::Notice(message) => self.notice = Some(message),
         }
         Ok(false)
     }

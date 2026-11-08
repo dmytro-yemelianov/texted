@@ -562,7 +562,9 @@ impl Renderer {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Texted frame"),
                 });
-        if mapping.pixelated {
+        // Native screens take the extra pass only while an effect is on.
+        if mapping.pixelated || !mapping.effects.is_neutral() {
+            self.presenter.set_effects(&self.painter.queue, &mapping);
             let source = self.presenter.source(&self.painter.device, mapping.source);
             self.painter.encode(&mut encoder, source, list.clear);
             self.presenter.encode(&mut encoder, &view, mapping);
@@ -600,6 +602,124 @@ mod tests {
             (before.x, before.y, before.height)
         );
         assert_eq!(shelf.allocate(ATLAS_SIZE - 1, 4), Some((0, 21)));
+    }
+    /// Fills an 8x8 framebuffer with `fill`, presents it into 64x64 through `mapping` and reads
+    /// the window back as RGBA rows.
+    fn present_effects(mapping: texted_app::framebuffer::ScreenMapping, fill: u32) -> Vec<u8> {
+        pollster::block_on(async {
+            let adapter = instance()
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .unwrap();
+            let (device, queue) = device(&adapter).await.unwrap();
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let format = wgpu::TextureFormat::Rgba8Unorm;
+            let mut painter = Painter::new(device.clone(), queue, format);
+            let mut presenter = crate::presentation::PixelPresenter::new(&device, format);
+            let mut list = DrawList::default();
+            list.reset(0);
+            crate::graphics::draw_rect(&mut list, 8, 8, 0, 0, 8, 8, fill);
+            painter.prepare(&list, 8, 8).unwrap();
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("effect readback"),
+                size: wgpu::Extent3d {
+                    width: 64,
+                    height: 64,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 64 * 64 * 4,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            presenter.set_effects(&painter.queue, &mapping);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            let source = presenter.source(&device, (8, 8));
+            painter.encode(&mut encoder, source, list.clear);
+            presenter.encode(
+                &mut encoder,
+                &target.create_view(&Default::default()),
+                mapping,
+            );
+            encoder.copy_texture_to_buffer(
+                target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(64),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 64,
+                    height: 64,
+                    depth_or_array_layers: 1,
+                },
+            );
+            painter.queue.submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            rx.recv().unwrap().unwrap();
+            let bytes = readback.slice(..).get_mapped_range().to_vec();
+            presenter.release();
+            assert!(device.pop_error_scope().await.is_none());
+            bytes
+        })
+    }
+    #[test]
+    #[ignore = "Requires a real Metal GPU; run explicitly on a Mac"]
+    fn metal_crt_curves_the_picture_and_darkens_its_corners() {
+        use texted_app::framebuffer::{CrtEffect, ScreenMapping, VisualEffects};
+        let strong = CrtEffect::Strong.effects(VisualEffects::NEUTRAL);
+        // One font pixel is 8 window pixels: font pixel rows span y 0..8, 8..16 and so on.
+        let mapping = ScreenMapping::new((64, 64), Some((8, 8))).with_effects(strong, 0.0, 8.0);
+        let bytes = present_effects(mapping, 0xc0c0c0);
+        let red = |x: usize, y: usize| bytes[(y * 64 + x) * 4];
+        assert!(red(0, 0) < 0x20, "the curved corner fades to dark glass");
+        assert!(red(36, 36) > 0x80, "the centre keeps the picture");
+        // Pixel SSH's beam lights the middle of each font pixel row; its edges fall dark.
+        assert!(
+            red(36, 32) < red(36, 36),
+            "scanlines darken font pixel row edges"
+        );
+    }
+    #[test]
+    #[ignore = "Requires a real Metal GPU; run explicitly on a Mac"]
+    fn metal_gameboy_matrix_shows_the_theme_between_font_pixels() {
+        use texted_app::framebuffer::{Phosphor, ScreenMapping, VisualEffects};
+        use texted_app::visuals::{MatrixBackground, Separation};
+        let lcd = VisualEffects {
+            separation: Separation::GameboyMatrix,
+            matrix_background: MatrixBackground::Theme,
+            inner_square: 0.0,
+            ..VisualEffects::NEUTRAL
+        };
+        let mapping = ScreenMapping::new((64, 64), Some((8, 8)))
+            .with_effects(lcd, 0.0, 8.0)
+            .with_glass(Phosphor::White, 0x9cad75);
+        let bytes = present_effects(mapping, 0x2e3d1f);
+        let rgb = |x: usize, y: usize| {
+            let at = (y * 64 + x) * 4;
+            [bytes[at], bytes[at + 1], bytes[at + 2]]
+        };
+        assert_eq!(
+            rgb(36, 36),
+            [0x2e, 0x3d, 0x1f],
+            "the pixel keeps its colour"
+        );
+        assert_eq!(rgb(32, 32), [0x9c, 0xad, 0x75], "the gap shows the theme");
     }
     #[test]
     #[ignore = "Requires a real Metal GPU; run explicitly on a Mac"]

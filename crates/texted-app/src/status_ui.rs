@@ -13,6 +13,10 @@ use texted_io::LineEnding;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     Wrap,
+    /// Cycle the encoding the next save writes.
+    Encoding,
+    /// Reread the file in the encoding the details card offers.
+    Reread,
     Close,
     Consumed,
 }
@@ -30,11 +34,15 @@ pub(crate) struct Model<'a> {
     pub cur_line: usize,
     pub cur_col: usize,
     pub word_wrap: bool,
-    pub bom: bool,
+    pub format: String,
+    /// The encoding a reread would use; `None` until the document has a file.
+    pub reread: Option<&'static str>,
     pub ending: LineEnding,
 }
 pub(crate) struct Layout {
     pub card: Rect,
+    pub reread: Rect,
+    pub encoding: Rect,
     pub wrap: Rect,
     pub close: Rect,
 }
@@ -42,7 +50,7 @@ impl Layout {
     pub fn new(g: Geometry) -> Self {
         let pad = if g.compact { 2 } else { 12 };
         let y = g.height.saturating_sub(g.bottom);
-        let card_h = if g.compact { 100 } else { 184 };
+        let card_h = if g.compact { 126 } else { 236 };
         let card_w = if g.compact { 250 } else { 380 };
         let card = Rect {
             x: g.width.saturating_sub(card_w + pad).max(pad).min(g.width),
@@ -62,7 +70,22 @@ impl Layout {
             w: 20,
             h: 20,
         };
-        Self { card, wrap, close }
+        let row = if g.compact { 14 } else { 26 };
+        let encoding = Rect {
+            y: wrap.y.saturating_sub(row),
+            ..wrap
+        };
+        let reread = Rect {
+            y: encoding.y.saturating_sub(row),
+            ..wrap
+        };
+        Self {
+            card,
+            reread,
+            encoding,
+            wrap,
+            close,
+        }
     }
 }
 pub(crate) fn selection_label(
@@ -134,6 +157,16 @@ impl PanelHelp {
                 rect: l.wrap,
                 text: "Toggle line wrapping".into(),
             })
+        } else if self.details && l.encoding.contains(x, y) {
+            Some(Tip {
+                rect: l.encoding,
+                text: "Change the encoding the next save writes".into(),
+            })
+        } else if self.details && l.reread.contains(x, y) {
+            Some(Tip {
+                rect: l.reread,
+                text: "Read the file again in another encoding".into(),
+            })
         } else {
             command
         };
@@ -162,7 +195,11 @@ impl PanelHelp {
     }
     pub fn cursor(&self, g: Geometry, x: f32, y: f32) -> Option<crate::cursor_ui::Shape> {
         let l = Layout::new(g);
-        if self.details && (l.close.contains(x, y) || l.wrap.contains(x, y)) {
+        if self.details
+            && [l.close, l.wrap, l.encoding, l.reread]
+                .iter()
+                .any(|r| r.contains(x, y))
+        {
             Some(crate::cursor_ui::Shape::Pointer)
         } else if self.details && l.card.contains(x, y) {
             Some(crate::cursor_ui::Shape::Arrow)
@@ -180,6 +217,12 @@ impl PanelHelp {
         }
         if l.wrap.contains(x, y) {
             return Some(Action::Wrap);
+        }
+        if l.encoding.contains(x, y) {
+            return Some(Action::Encoding);
+        }
+        if l.reread.contains(x, y) {
+            return Some(Action::Reread);
         }
         if l.card.contains(x, y) {
             return Some(Action::Consumed);
@@ -216,11 +259,7 @@ impl PanelHelp {
                         .map_or(String::new(), |s| format!(" · {s}"))
                 ),
                 format!("Line {}  ·  Column {}", m.cur_line + 1, m.cur_col + 1),
-                format!(
-                    "Text: {} bytes  ·  {}",
-                    m.snap.total_bytes,
-                    if m.bom { "UTF-8 with BOM" } else { "UTF-8" }
-                ),
+                format!("Text: {} bytes", m.snap.total_bytes),
                 format!(
                     "Line endings: {}",
                     if m.ending == LineEnding::Crlf {
@@ -251,6 +290,36 @@ impl PanelHelp {
                 "x",
                 c.gutter_text,
             );
+            let reread = m.reread.map_or_else(
+                || "Reread: save the file first".to_owned(),
+                |name| format!("Reread as {name} (click)"),
+            );
+            for (rect, text, color) in [
+                (
+                    l.encoding,
+                    format!("Encoding: {} (change)", m.format),
+                    c.status_accent,
+                ),
+                (
+                    l.reread,
+                    reread,
+                    if m.reread.is_some() {
+                        c.status_accent
+                    } else {
+                        c.gutter_text
+                    },
+                ),
+            ] {
+                font.draw_string(
+                    draws,
+                    rect.x + rect.w,
+                    g.height,
+                    rect.x + 2,
+                    rect.y + 3,
+                    &text,
+                    color,
+                );
+            }
             font.draw_string(
                 draws,
                 l.wrap.x + l.wrap.w,
@@ -349,6 +418,33 @@ mod tests {
                 assert!(l.card.y + l.card.h <= h - g.bottom);
                 assert!(l.wrap.y + l.wrap.h <= l.card.y + l.card.h);
             }
+        }
+    }
+    #[test]
+    fn encoding_rows_sit_between_the_text_and_the_wrap_switch() {
+        for (w, h, compact) in [(256, 192, true), (320, 200, true), (980, 700, false)] {
+            let g = Geometry::new(w, h, compact, true);
+            let l = Layout::new(g);
+            let step = if compact { 13 } else { 26 };
+            assert!(l.reread.y >= l.card.y + 8 + 5 * step, "{w}x{h}");
+            assert!(l.reread.y + l.reread.h <= l.encoding.y, "{w}x{h}");
+            assert!(l.encoding.y + l.encoding.h <= l.wrap.y, "{w}x{h}");
+        }
+    }
+    #[test]
+    fn encoding_rows_report_their_own_actions() {
+        let mut f = PanelHelp::new();
+        f.details = true;
+        let g = Geometry::new(980, 700, false, true);
+        let l = Layout::new(g);
+        let center = |r: Rect| ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32);
+        for (rect, action) in [
+            (l.encoding, Action::Encoding),
+            (l.reread, Action::Reread),
+            (l.wrap, Action::Wrap),
+        ] {
+            let (x, y) = center(rect);
+            assert_eq!(f.click(g, x, y), Some(action));
         }
     }
     #[test]

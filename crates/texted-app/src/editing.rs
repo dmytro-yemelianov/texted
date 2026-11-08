@@ -133,6 +133,9 @@ impl EditorModel {
                 }
                 self.select_offsets(start, end);
             }
+            EditorCommand::DuplicateLines => self.duplicate_lines(),
+            EditorCommand::MoveLines { up } => self.move_lines(up),
+            EditorCommand::TrimTrailingWhitespace => self.trim_trailing_whitespace(),
             EditorCommand::SetSelection(selection) => {
                 self.selection = selection;
                 let snap = self.buffer.create_snapshot();
@@ -145,6 +148,110 @@ impl EditorModel {
             return Err("Operation cancelled".into());
         }
         Ok(())
+    }
+    /// Whole lines under the caret or selection; a selection ending at a line start stops before it.
+    fn touched_lines(&self) -> (usize, usize) {
+        let snap = self.buffer.create_snapshot();
+        match self.selection.mode {
+            SelectionMode::Stream => {
+                let (a, b) = self.selection.offsets(&snap);
+                let (first, _) = snap.offset_to_line_col(a);
+                let (last, col) = snap.offset_to_line_col(b);
+                (
+                    first,
+                    if b > a && col == 0 && last > first {
+                        last - 1
+                    } else {
+                        last
+                    },
+                )
+            }
+            SelectionMode::Block => {
+                let (a, b, _, _) = self.selection.block();
+                (a, b.min(snap.total_lines - 1))
+            }
+            SelectionMode::None => {
+                let (line, _) = snap.offset_to_line_col(snap.cursor_offset);
+                (line, line)
+            }
+        }
+    }
+    /// Moves the caret, or the selection, by whole lines after a line edit.
+    fn follow_lines(&mut self, caret: (usize, usize), delta: isize) {
+        let shift = |line: usize| line.saturating_add_signed(delta);
+        let (line, col) = if self.selection.mode == SelectionMode::None {
+            (shift(caret.0), caret.1)
+        } else {
+            self.selection.anchor_line = shift(self.selection.anchor_line);
+            self.selection.active_line = shift(self.selection.active_line);
+            (self.selection.active_line, self.selection.active_col)
+        };
+        let snap = self.buffer.create_snapshot();
+        self.buffer
+            .set_cursor_offset(snap.line_col_to_offset(line, col));
+    }
+    fn duplicate_lines(&mut self) {
+        let snap = self.buffer.create_snapshot();
+        let caret = snap.offset_to_line_col(snap.cursor_offset);
+        let (first, last) = self.touched_lines();
+        let start = snap.line_col_to_offset(first, 0);
+        let end = snap.line_col_to_offset(last, usize::MAX);
+        let copy = format!("\n{}", snap.content.byte_slice(start..end));
+        self.buffer.transaction(|buffer| buffer.insert(end, &copy));
+        self.follow_lines(caret, (last - first + 1) as isize);
+    }
+    fn move_lines(&mut self, up: bool) {
+        let snap = self.buffer.create_snapshot();
+        let caret = snap.offset_to_line_col(snap.cursor_offset);
+        let (first, last) = self.touched_lines();
+        if (up && first == 0) || (!up && last + 1 >= snap.total_lines) {
+            return;
+        }
+        let (low, high) = if up {
+            (first - 1, last)
+        } else {
+            (first, last + 1)
+        };
+        let mut lines: Vec<String> = (low..=high).map(|l| snap.line(l).to_string()).collect();
+        if up {
+            lines.rotate_left(1);
+        } else {
+            lines.rotate_right(1);
+        }
+        let start = snap.line_col_to_offset(low, 0);
+        let end = snap.line_col_to_offset(high, usize::MAX);
+        let text = lines.join("\n");
+        self.buffer.transaction(|buffer| {
+            buffer.delete(start, end);
+            buffer.insert(start, &text);
+        });
+        self.follow_lines(caret, if up { -1 } else { 1 });
+    }
+    /// Spaces and tabs only, so a raw `\r` before a newline is kept.
+    fn trim_trailing_whitespace(&mut self) {
+        let snap = self.buffer.create_snapshot();
+        let caret = snap.offset_to_line_col(snap.cursor_offset);
+        self.buffer.transaction(|buffer| {
+            // Bottom-up, so the snapshot's offsets stay valid for the lines above.
+            for line in (0..snap.total_lines).rev() {
+                let text = snap.line(line);
+                let len = text.len_chars();
+                let mut keep = len;
+                while keep > 0 && matches!(text.char(keep - 1), ' ' | '\t') {
+                    keep -= 1;
+                }
+                if keep < len {
+                    buffer.delete(
+                        snap.line_col_to_offset(line, keep),
+                        snap.line_col_to_offset(line, len),
+                    );
+                }
+            }
+        });
+        self.selection.mode = SelectionMode::None;
+        let snap = self.buffer.create_snapshot();
+        self.buffer
+            .set_cursor_offset(snap.line_col_to_offset(caret.0, caret.1));
     }
     fn current_caret(&self) -> SelectionState {
         let s = self.buffer.create_snapshot();
@@ -295,12 +402,10 @@ impl EditorModel {
                 return Err("Block edit exceeds generated-text capacity".into());
             }
         }
-        let mut aborted = false;
-        self.buffer.transaction(|buffer| {
+        self.buffer.try_transaction(|buffer| {
             for (index, line) in (a..=max).rev().enumerate() {
                 if cancelled() {
-                    aborted = true;
-                    break;
+                    return Err("Operation cancelled".to_owned());
                 }
                 buffer.block_delete(line, line, from, to);
                 if !text.is_empty() {
@@ -310,10 +415,8 @@ impl EditorModel {
                     progress(index + 1, max - a + 1);
                 }
             }
-        });
-        if aborted {
-            return Err("Operation cancelled".into());
-        }
+            Ok(())
+        })?;
         let col = from + text.chars().count();
         self.selection = SelectionState {
             mode: SelectionMode::Block,
@@ -598,6 +701,93 @@ two",
         assert_eq!(e.buffer.to_string(), "aї\nxї\naї");
         assert!(e.buffer.undo());
         assert_eq!(e.buffer.to_string(), "abc\nx\nabc");
+        assert!(!e.buffer.undo());
+    }
+    #[test]
+    fn cancelled_block_delete_leaves_the_model_unchanged() {
+        let mut e = EditorModel::new(ropey::Rope::from_str("abc\nabc\nabc"));
+        e.selection = SelectionState {
+            mode: SelectionMode::Block,
+            anchor_line: 0,
+            active_line: 2,
+            anchor_col: 1,
+            active_col: 2,
+        };
+        let original = e.buffer.create_snapshot();
+        // Progress is reported after the first line changes, so this cancels mid-edit.
+        let edited = std::cell::Cell::new(false);
+        let result = e.apply_cancellable(
+            EditorCommand::Delete {
+                backward: true,
+                unit: DeleteUnit::Character,
+            },
+            &|| edited.get(),
+            &|_, _| edited.set(true),
+        );
+        assert!(result.is_err());
+        assert_eq!(e.buffer.to_string(), "abc\nabc\nabc");
+        assert!(e
+            .buffer
+            .create_snapshot()
+            .content
+            .is_instance(&original.content));
+        assert!(!e.buffer.undo());
+    }
+    fn caret_at(e: &mut EditorModel, line: usize, col: usize) {
+        e.apply(EditorCommand::SetSelection(SelectionState::caret(
+            line, col,
+        )))
+        .unwrap();
+    }
+    fn caret(e: &EditorModel) -> (usize, usize) {
+        let snap = e.buffer.create_snapshot();
+        snap.offset_to_line_col(snap.cursor_offset)
+    }
+    #[test]
+    fn duplicating_copies_the_caret_line_below_and_follows_it() {
+        let mut e = EditorModel::new(ropey::Rope::from_str("one\ntwo\nthree"));
+        caret_at(&mut e, 1, 2);
+        e.apply(EditorCommand::DuplicateLines).unwrap();
+        assert_eq!(e.buffer.to_string(), "one\ntwo\ntwo\nthree");
+        assert_eq!(caret(&e), (2, 2));
+        // The last line has no newline after it; the copy still lands on its own line.
+        caret_at(&mut e, 3, 0);
+        e.apply(EditorCommand::DuplicateLines).unwrap();
+        assert_eq!(e.buffer.to_string(), "one\ntwo\ntwo\nthree\nthree");
+        assert!(e.buffer.undo());
+        assert_eq!(e.buffer.to_string(), "one\ntwo\ntwo\nthree");
+    }
+    #[test]
+    fn duplicating_a_selection_copies_every_line_it_touches() {
+        let mut e = EditorModel::new(ropey::Rope::from_str("a\nb\nc\n"));
+        e.select_offsets(0, 3); // "a\nb": two lines.
+        e.apply(EditorCommand::DuplicateLines).unwrap();
+        assert_eq!(e.buffer.to_string(), "a\nb\na\nb\nc\n");
+        let snap = e.buffer.create_snapshot();
+        assert_eq!(e.selection.offsets(&snap), (4, 7));
+    }
+    #[test]
+    fn moving_lines_swaps_them_with_a_neighbour_in_one_undo_step() {
+        let mut e = EditorModel::new(ropey::Rope::from_str("one\ntwo\nthree"));
+        caret_at(&mut e, 1, 1);
+        e.apply(EditorCommand::MoveLines { up: true }).unwrap();
+        assert_eq!(e.buffer.to_string(), "two\none\nthree");
+        assert_eq!(caret(&e), (0, 1));
+        e.apply(EditorCommand::MoveLines { up: true }).unwrap(); // Already at the top.
+        assert_eq!(e.buffer.to_string(), "two\none\nthree");
+        caret_at(&mut e, 1, 0);
+        e.apply(EditorCommand::MoveLines { up: false }).unwrap();
+        assert_eq!(e.buffer.to_string(), "two\nthree\none");
+        assert_eq!(caret(&e), (2, 0));
+        assert!(e.buffer.undo());
+        assert_eq!(e.buffer.to_string(), "two\none\nthree");
+    }
+    #[test]
+    fn trimming_removes_trailing_spaces_and_tabs_but_keeps_carriage_returns() {
+        let mut e = EditorModel::new(ropey::Rope::from_str("a  \nb\t\nc \r\n  \nїжак "));
+        e.apply(EditorCommand::TrimTrailingWhitespace).unwrap();
+        assert_eq!(e.buffer.to_string(), "a\nb\nc \r\n\nїжак");
+        assert!(e.buffer.undo());
         assert!(!e.buffer.undo());
     }
     #[test]

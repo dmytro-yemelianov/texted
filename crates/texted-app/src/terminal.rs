@@ -82,6 +82,18 @@ impl Drop for TerminalGuard {
         restore(&self.registry);
     }
 }
+/// Hand the terminal back before a fatal panic prints. Worker panics are caught and the
+/// editor keeps drawing, so only a panic on the thread that owns the terminal restores it.
+fn restore_on_terminal_thread(
+    owner: std::thread::ThreadId,
+    restore: impl Fn() + Send + Sync + 'static,
+) -> impl Fn() + Send + Sync + 'static {
+    move || {
+        if std::thread::current().id() == owner {
+            restore();
+        }
+    }
+}
 
 fn modifiers(m: KeyModifiers) -> ModifiersState {
     let mut result = ModifiersState::empty();
@@ -336,9 +348,12 @@ pub(crate) fn run(mut arguments: Vec<String>) -> Result<(), String> {
     let (columns, rows) = size(columns, rows)?;
     let registry = crate::kitty::Registry::default();
     let panic_registry = registry.clone();
+    let restore_terminal = restore_on_terminal_thread(std::thread::current().id(), move || {
+        restore(&panic_registry)
+    });
     let old_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore(&panic_registry);
+        restore_terminal();
         old_hook(info);
     }));
     let _guard = TerminalGuard::enter(registry.clone()).map_err(|e| e.to_string())?;
@@ -552,6 +567,7 @@ pub(crate) fn run(mut arguments: Vec<String>) -> Result<(), String> {
             }
             Event::FocusGained => {
                 app.resized();
+                app.focus_gained();
             }
             Event::FocusLost => {
                 app.set_modifiers(ModifiersState::empty());
@@ -571,6 +587,249 @@ mod tests {
         assert_eq!(physical, PhysicalKey::Code(KeyCode::KeyS));
         assert_eq!(logical, Key::Character("і".into()));
         assert_eq!(text.as_deref(), Some("і"));
+    }
+    fn press(app: &mut App, key: NamedKey) {
+        let logical = Key::Named(key);
+        app.key(&KeyInput {
+            physical: PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+            logical: &logical,
+            text: None,
+            modifiers: ModifiersState::empty(),
+        });
+    }
+    fn settle(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.settled() {
+            app.tick();
+            assert!(Instant::now() < deadline, "app never settled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.tick();
+    }
+    /// Ticks and redraws until the frame shows `expected`.
+    fn wait_for_text(app: &mut App, expected: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.tick();
+            app.redraw();
+            let text = app.rendered_grid().unwrap().text();
+            if text.contains(expected) {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never showed {expected:?}:\n{text}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    #[test]
+    fn search_switches_on_function_keys_change_what_matches() {
+        let dir = std::env::temp_dir().join(format!("texted-search-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cats.txt");
+        std::fs::write(&path, "Кіт кіт кітки КІТ\n").unwrap();
+        let (_, mut app) = application(100, 30, vec![path], None, None);
+        settle(&mut app);
+        let find = Key::Character("f".into());
+        app.key(&KeyInput {
+            physical: PhysicalKey::Code(KeyCode::KeyF),
+            logical: &find,
+            text: None,
+            modifiers: ModifiersState::SUPER,
+        });
+        app.paste_text("кіт".into());
+        let text = wait_for_text(&mut app, "/2");
+        assert!(text.contains("Case") && text.contains("Part"), "{text}");
+        press(&mut app, NamedKey::F5);
+        let text = wait_for_text(&mut app, "/4");
+        assert!(text.contains("NoCs"), "{text}");
+        press(&mut app, NamedKey::F6);
+        let text = wait_for_text(&mut app, "/3");
+        assert!(text.contains("Word"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn cmd_j_jumps_to_a_typed_line() {
+        let dir = std::env::temp_dir().join(format!("texted-goto-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lines.txt");
+        let text: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&path, text).unwrap();
+        let (_, mut app) = application(100, 30, vec![path], None, None);
+        settle(&mut app);
+        let jump = Key::Character("j".into());
+        app.key(&KeyInput {
+            physical: PhysicalKey::Code(KeyCode::KeyJ),
+            logical: &jump,
+            text: None,
+            modifiers: ModifiersState::SUPER,
+        });
+        app.paste_text("12".into());
+        wait_for_text(&mut app, "Enter: line 12");
+        press(&mut app, NamedKey::Enter);
+        settle(&mut app);
+        press(&mut app, NamedKey::F12);
+        wait_for_text(&mut app, "Line 12");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn quitting_keeps_unsaved_tabs_and_the_next_start_restores_them() {
+        let dir = std::env::temp_dir().join(format!("texted-hot-exit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let store = dir.join("session");
+        {
+            let (_, mut app) = application(100, 30, vec![path.clone()], None, None);
+            app.keep_session(store.clone());
+            settle(&mut app);
+            press(&mut app, NamedKey::ArrowDown);
+            settle(&mut app);
+            app.paste_text("mine ".into());
+            settle(&mut app);
+            press(&mut app, NamedKey::F6);
+            settle(&mut app);
+            app.paste_text("draft".into());
+            settle(&mut app);
+            let quit = Key::Character("q".into());
+            app.key(&KeyInput {
+                physical: PhysicalKey::Code(KeyCode::KeyQ),
+                logical: &quit,
+                text: None,
+                modifiers: ModifiersState::SUPER,
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !app.tick() {
+                assert!(Instant::now() < deadline, "quit waited for an answer");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        let (_, mut app) = application(100, 30, vec![], None, None);
+        app.keep_session(store);
+        settle(&mut app);
+        app.redraw();
+        let text = app.rendered_grid().unwrap().text();
+        assert!(text.contains("notes.txt *"), "{text}");
+        assert!(text.contains("Untitled *"), "{text}");
+        assert!(text.contains("draft"), "{text}");
+        press(&mut app, NamedKey::F7);
+        settle(&mut app);
+        press(&mut app, NamedKey::F12);
+        app.tick();
+        app.redraw();
+        let text = app.rendered_grid().unwrap().text();
+        assert!(text.contains("mine two"), "{text}");
+        assert!(text.contains("Line 2"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn regaining_focus_reloads_a_file_changed_elsewhere_and_keeps_the_caret_line() {
+        let dir = std::env::temp_dir().join(format!("texted-focus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let (_, mut app) = application(100, 30, vec![path.clone()], None, None);
+        settle(&mut app);
+        press(&mut app, NamedKey::ArrowDown);
+        press(&mut app, NamedKey::ArrowDown);
+        settle(&mut app);
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&path, "one\ntwo\nthree, edited elsewhere\nfour\n").unwrap();
+        app.focus_gained();
+        settle(&mut app);
+        press(&mut app, NamedKey::F12);
+        app.tick();
+        app.redraw();
+        let text = app.rendered_grid().unwrap().text();
+        assert!(text.contains("three, edited elsewhere"), "{text}");
+        assert!(text.contains("Line 3"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn details_show_a_legacy_file_encoding_and_offer_a_reread() {
+        let dir = std::env::temp_dir().join(format!("texted-details-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.txt");
+        std::fs::write(&path, [191, 230, 224, 234, 10]).unwrap(); // "їжак\n" in Windows-1251
+        let (_, mut app) = application(100, 30, vec![path], None, None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.settled() {
+            app.tick();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let details = Key::Named(NamedKey::F12);
+        app.key(&KeyInput {
+            physical: PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+            logical: &details,
+            text: None,
+            modifiers: ModifiersState::empty(),
+        });
+        app.tick();
+        app.redraw();
+        let text = app.rendered_grid().unwrap().text();
+        assert!(text.contains("їжак"), "{text}");
+        assert!(text.contains("Encoding: Windows-1251"), "{text}");
+        assert!(text.contains("Reread as KOI8-U"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn a_frame_shorter_than_the_command_bar_still_renders() {
+        // The window and graphics backends share this redraw; a 16 px frame is below the bar.
+        let size = crate::kitty::Size {
+            columns: 80,
+            rows: 1,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let (_, mut app) = application_with_graphics(
+            80,
+            1,
+            vec![],
+            Some(Box::new(io::sink())),
+            None,
+            Some(size),
+            crate::kitty::Registry::default(),
+        );
+        app.tick();
+        app.redraw();
+        assert_eq!(app.render_failure(), None);
+        // Appearance and dialogs paint into the zero-height area above the bar.
+        for key in [NamedKey::F9, NamedKey::F2] {
+            let logical = Key::Named(key);
+            app.key(&KeyInput {
+                physical: PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+                logical: &logical,
+                text: None,
+                modifiers: ModifiersState::empty(),
+            });
+            for _ in 0..30 {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            app.redraw();
+            assert_eq!(app.render_failure(), None);
+        }
+    }
+    #[test]
+    fn worker_panics_leave_the_terminal_to_its_owner() {
+        let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = restores.clone();
+        let hook = Arc::new(restore_on_terminal_thread(
+            std::thread::current().id(),
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        // Worker panics are caught and the editor keeps running, so the terminal must stay set up.
+        let worker = hook.clone();
+        std::thread::spawn(move || worker()).join().unwrap();
+        assert_eq!(restores.load(Ordering::SeqCst), 0);
+        hook();
+        assert_eq!(restores.load(Ordering::SeqCst), 1);
     }
     #[test]
     fn shared_app_renders_loaded_text_tabs_commands_and_modal_without_a_window() {

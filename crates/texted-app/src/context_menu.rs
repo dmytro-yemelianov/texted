@@ -87,6 +87,12 @@ const ITEMS: &[(crate::menus::MenuCommand, &str)] = &[
     (crate::menus::MenuCommand::Delete, "Delete selection"),
     (crate::menus::MenuCommand::SelectAll, "Select all"),
     (crate::menus::MenuCommand::Block, "Column selection"),
+    (crate::menus::MenuCommand::DuplicateLines, "Duplicate line"),
+    (
+        crate::menus::MenuCommand::TrimTrailingSpaces,
+        "Trim trailing spaces",
+    ),
+    (crate::menus::MenuCommand::GoToLine, "Go to line..."),
     (crate::menus::MenuCommand::Find, "Find..."),
     (crate::menus::MenuCommand::Replace, "Replace..."),
     (crate::menus::MenuCommand::Style, "Appearance..."),

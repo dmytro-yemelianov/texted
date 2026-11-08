@@ -22,10 +22,22 @@ use texted_app::{
 use winit::keyboard::{Key, NamedKey};
 #[derive(Clone, Debug)]
 pub(crate) enum Kind {
-    Open { directory: PathBuf },
-    Save { path: PathBuf },
-    ConfirmSave { name: String },
-    Error { message: String },
+    Open {
+        directory: PathBuf,
+    },
+    Save {
+        path: PathBuf,
+    },
+    ConfirmSave {
+        name: String,
+    },
+    /// Saving would replace a version another program wrote.
+    ConfirmOverwrite {
+        name: String,
+    },
+    Error {
+        message: String,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Answer {
@@ -215,6 +227,7 @@ impl DialogUi {
             Some(Kind::Open { .. }) => "Open file",
             Some(Kind::Save { .. }) => "Save file",
             Some(Kind::ConfirmSave { .. }) => "Save changes?",
+            Some(Kind::ConfirmOverwrite { .. }) => "Changed on disk",
             Some(Kind::Error { .. }) => "Texted",
             None => "",
         }
@@ -233,6 +246,7 @@ impl DialogUi {
         }
         match a.request.kind {
             Kind::ConfirmSave { .. } => vec!["Save", "Discard", "Cancel"],
+            Kind::ConfirmOverwrite { .. } => vec!["Overwrite", "Reload", "Cancel"],
             Kind::Error { .. } => vec!["OK"],
             Kind::Open { .. } => vec!["Open", "Cancel"],
             Kind::Save { .. } => vec!["Save", "Cancel"],
@@ -416,7 +430,7 @@ impl DialogUi {
             return;
         }
         match &a.request.kind {
-            Kind::ConfirmSave { .. } => {
+            Kind::ConfirmSave { .. } | Kind::ConfirmOverwrite { .. } => {
                 let answer =
                     [Answer::Save, Answer::Discard, Answer::Cancel][a.focus.min(2)].clone();
                 self.finish(answer);
@@ -818,6 +832,9 @@ impl DialogUi {
             } else {
                 match &a.request.kind {
                     Kind::ConfirmSave { name } => format!("Save changes to {name} before closing?"),
+                    Kind::ConfirmOverwrite { name } => format!(
+                        "{name} changed on disk since it was opened. Replace it with your version?"
+                    ),
                     Kind::Error { message } => message.clone(),
                     _ => String::new(),
                 }

@@ -7,7 +7,7 @@ use std::{
     thread,
 };
 use texted_buffer::{
-    search::{Checkpoint, ScanState, SearchMatch, SearchSession, MAX_QUERY_BYTES},
+    search::{Checkpoint, ScanState, SearchMatch, SearchOptions, SearchSession, MAX_QUERY_BYTES},
     BufferSnapshot,
 };
 use texted_layout::{
@@ -33,6 +33,7 @@ struct Job {
     view_id: u64,
     snapshot: BufferSnapshot,
     query: Arc<str>,
+    options: SearchOptions,
     viewport: SearchViewport,
     seek: Option<Seek>,
 }
@@ -113,7 +114,12 @@ fn run_job(shared: &Shared, job: &Job, cache: &mut Option<Cache>) -> Result<(), 
         .is_none_or(|c| c.generation != job.generation)
     {
         *cache = None;
-        let session = match SearchSession::new(job.snapshot.clone(), &job.query, cancelled) {
+        let session = match SearchSession::with_options(
+            job.snapshot.clone(),
+            &job.query,
+            job.options,
+            cancelled,
+        ) {
             Ok(s) => s,
             Err(texted_buffer::search::SearchError::Cancelled) => return Ok(()),
             Err(e) => return Err(format!("Search could not start: {e:?}")),
@@ -176,7 +182,7 @@ fn run_job(shared: &Shared, job: &Job, cache: &mut Option<Cache>) -> Result<(), 
         let end = job
             .viewport
             .end()
-            .saturating_add(job.query.len().saturating_sub(1))
+            .saturating_add(session.match_reach().saturating_sub(1))
             .min(session.snapshot.total_bytes);
         let report = session.scan_until(
             cache.before_offset(job.viewport.start()),
@@ -287,6 +293,10 @@ fn worker(shared: Arc<Shared>) {
 pub struct SearchState {
     pub mode: SearchBarMode,
     pub find_query: String,
+    /// Case and whole-word rules shared by highlighting, navigation and Replace.
+    pub options: SearchOptions,
+    /// The find field holds `:line[:column]` for Go to Line instead of a query.
+    pub goto: bool,
     pub replace_query: String,
     pub active_field: usize,
     pub pending: bool,
@@ -336,6 +346,8 @@ impl SearchState {
         Self {
             mode: SearchBarMode::Closed,
             find_query: String::new(),
+            options: SearchOptions::default(),
+            goto: false,
             replace_query: String::new(),
             active_field: 0,
             pending: false,
@@ -369,7 +381,21 @@ impl SearchState {
         self.latest = None;
         self.shared.ready.notify_all();
     }
+    /// The zero-based line and column typed as `:line[:column]` in Go to Line.
+    pub fn line_target(&self) -> Option<(usize, usize)> {
+        if !self.goto {
+            return None;
+        }
+        let mut parts = self.find_query.strip_prefix(':')?.splitn(2, ':');
+        let line: usize = parts.next()?.parse().ok()?;
+        let column: usize = match parts.next() {
+            Some(column) => column.parse().ok()?,
+            None => 1,
+        };
+        Some((line.max(1) - 1, column.max(1) - 1))
+    }
     pub fn close(&mut self) {
+        self.goto = false;
         self.mode = SearchBarMode::Closed;
         self.invalidate();
         self.submitted = None;
@@ -381,7 +407,23 @@ impl SearchState {
         self.viewport = SearchViewport::default();
         self.view_id += 1;
     }
+    /// Reruns the current query under new matching rules.
+    pub fn set_options(&mut self, options: SearchOptions, snap: BufferSnapshot) {
+        if options == self.options {
+            return;
+        }
+        self.options = options;
+        self.submitted = None;
+        self.submit(snap);
+    }
     pub fn submit(&mut self, snap: BufferSnapshot) {
+        if self.goto {
+            // A line number is not searched for.
+            self.invalidate();
+            self.submitted = None;
+            self.latest = Some(snap);
+            return;
+        }
         if self.find_query.len() > MAX_QUERY_BYTES {
             self.find_query = self
                 .submitted
@@ -426,6 +468,7 @@ impl SearchState {
             view_id: self.view_id,
             snapshot: snap.clone(),
             query: Arc::from(self.find_query.as_str()),
+            options: self.options,
             viewport: self.viewport.clone(),
             seek: self.target.map(|target| Seek {
                 serial: self.serial,
@@ -548,6 +591,12 @@ impl SearchState {
         plan
     }
     pub fn label(&self) -> String {
+        if self.goto {
+            return self.line_target().map_or_else(
+                || "Type a line number".into(),
+                |(line, _)| format!("Enter: line {}", line + 1),
+            );
+        }
         match self.count {
             None if self.pending => format!("Searching… {}+", self.counted),
             Some(0) => "No matches".into(),
@@ -610,6 +659,26 @@ mod tests {
             assert!(Instant::now() < deadline, "search deadline");
         }
         navigation
+    }
+    #[test]
+    fn options_recount_the_same_query() {
+        let mut s = SearchState::default();
+        let snap = TextBuffer::from_string("Кіт кіт кітки".into()).create_snapshot();
+        s.find_query = "кіт".into();
+        s.submit(snap.clone());
+        finish(&mut s);
+        assert_eq!(s.count, Some(2));
+        let mut options = SearchOptions {
+            ignore_case: true,
+            whole_word: false,
+        };
+        s.set_options(options, snap.clone());
+        finish(&mut s);
+        assert_eq!(s.count, Some(3));
+        options.whole_word = true;
+        s.set_options(options, snap);
+        finish(&mut s);
+        assert_eq!(s.count, Some(2));
     }
     #[test]
     fn one_active_job_and_one_latest_pending_job_survive_query_churn() {

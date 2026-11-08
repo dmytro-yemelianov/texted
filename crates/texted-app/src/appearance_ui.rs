@@ -8,6 +8,7 @@ use texted_app::{
     appearance::{Appearance, FontFamily, MouseCursor, Palette, Theme},
     framebuffer::Framebuffer,
     input::KeyInput,
+    visuals::{Effect, Look, Machine, Preset, Visuals},
 };
 use winit::keyboard::{Key, NamedKey};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,7 +27,25 @@ impl Rect {
     }
 }
 
-const ROWS: usize = 6;
+/// Style fields: theme, screen, font, size, spacing and cursor.
+const STYLE_FIELDS: usize = 6;
+/// Visuals fields, as in ShaderWallpaper: machine preset, frame rate, time, then the effects.
+const PRESET: usize = STYLE_FIELDS;
+const FRAME_RATE: usize = STYLE_FIELDS + 1;
+const TIME: usize = STYLE_FIELDS + 2;
+const FIRST_EFFECT: usize = STYLE_FIELDS + 3;
+/// Chrome: ShaderWallpaper's text and border shadow.
+const SHADOW: usize = FIRST_EFFECT + Effect::ALL.len();
+const SHADOW_X: usize = SHADOW + 1;
+const SHADOW_Y: usize = SHADOW + 2;
+/// Chrome: ShaderWallpaper's border tiles and panel inset.
+const BORDER: usize = SHADOW + 3;
+const CORNER: usize = BORDER + 1;
+const INSET_X: usize = BORDER + 2;
+const INSET_Y: usize = BORDER + 3;
+const FIELDS: usize = BORDER + 4;
+/// The most rows shown at once; small screens show fewer, and pages scroll.
+const ROWS: usize = 7;
 struct Panel {
     rect: Rect,
     input: usize,
@@ -35,14 +54,19 @@ struct Panel {
     row_h: usize,
     pad: usize,
     buttons: usize,
+    /// Field rows that fit this screen, 1 to ROWS.
+    rows: usize,
 }
 impl Panel {
     fn new(width: usize, height: usize, compact: bool) -> Self {
-        let (limit, h, margin, input, row_top, step, row_h, pad) = if compact {
-            (400, 168, 8, 72, 32, 16, 16, 8)
+        // `tail` holds the buttons and the status line below the rows.
+        let (limit, tail, margin, input, row_top, step, row_h, pad) = if compact {
+            (400, 32, 8, 72, 32, 16, 16, 8)
         } else {
-            (704, 352, 16, 152, 64, 32, 32, 16)
+            (704, 80, 16, 152, 64, 32, 32, 16)
         };
+        let rows = (height.saturating_sub(row_top + tail) / step).clamp(1, ROWS);
+        let h = row_top + rows * step + tail;
         let w = width.saturating_sub(margin).min(limit) / 8 * 8;
         Self {
             rect: Rect {
@@ -57,7 +81,8 @@ impl Panel {
             step,
             row_h,
             pad,
-            buttons: row_top + ROWS * step + if compact { 0 } else { 16 },
+            buttons: row_top + rows * step + if compact { 0 } else { 16 },
+            rows,
         }
     }
     fn placed(width: usize, height: usize, compact: bool, position: Option<(f32, f32)>) -> Self {
@@ -87,11 +112,25 @@ impl Panel {
         }
     }
     fn reset(&self) -> Rect {
+        let x = self.rect.x + self.pad;
+        // Narrow screens shrink Reset so it stops a pad short of Done.
+        let room = self.done().x.saturating_sub(x + self.pad);
         Rect {
-            x: self.rect.x + self.pad,
+            x,
             y: self.rect.y + self.buttons,
-            w: if self.pad == 8 { 96 } else { 168 },
+            w: (if self.pad == 8 { 96 } else { 168 }).min(room),
             h: self.row_h,
+        }
+    }
+    /// The Style and Visuals page tabs in the title row.
+    fn tab(&self, visuals: bool) -> Rect {
+        let compact = self.pad == 8;
+        let (style_w, visuals_w, h) = if compact { (48, 64, 16) } else { (72, 96, 28) };
+        Rect {
+            x: self.rect.x + self.pad + if visuals { style_w } else { 0 },
+            y: self.rect.y + if compact { 2 } else { 10 },
+            w: if visuals { visuals_w } else { style_w },
+            h,
         }
     }
 }
@@ -99,7 +138,11 @@ impl Panel {
 enum Hit {
     Close,
     Reset,
+    /// A row slot; the page and its scroll decide which field it shows.
     Field(usize),
+    Page {
+        visuals: bool,
+    },
 }
 #[cfg(test)]
 fn hit(width: usize, height: usize, x: f32, y: f32, compact: bool) -> Option<Hit> {
@@ -112,7 +155,12 @@ fn hit_panel(p: &Panel, x: f32, y: f32) -> Option<Hit> {
     {
         return Some(Hit::Close);
     }
-    for row in 0..ROWS {
+    for visuals in [false, true] {
+        if p.tab(visuals).contains(x, y) {
+            return Some(Hit::Page { visuals });
+        }
+    }
+    for row in 0..p.rows {
         let r = p.row(row);
         if r.contains(x, y) {
             return Some(Hit::Field(row));
@@ -134,6 +182,20 @@ enum Value {
     Size(u16),
     Spacing(u16),
     Cursor(MouseCursor),
+    Preset(Option<Preset>),
+    /// Effects that match no preset; no list entry equals it.
+    Custom,
+    Fps(u8),
+    Time(Option<u32>),
+    /// An effect by its Effect::ALL index, at a step of its range.
+    Effect(usize, u16),
+    Shadow(bool),
+    /// A shadow offset in font pixels; `true` is horizontal.
+    Offset(bool, u8),
+    Border(texted_app::visuals::Border),
+    Corner(u8),
+    /// A panel inset in font pixels; `true` is horizontal.
+    Inset(bool, u8),
 }
 struct Choice {
     label: String,
@@ -157,6 +219,10 @@ pub(crate) struct AppearanceUi {
     terminal_graphics: bool,
     pub save_status: String,
     focus: usize,
+    /// The first field of the current page shown in the top row.
+    scroll: usize,
+    /// Rows the panel showed last; small screens show fewer than ROWS.
+    rows: std::cell::Cell<usize>,
     dropdown: Option<Dropdown>,
     font_query: String,
     origin: Option<Appearance>,
@@ -182,6 +248,8 @@ impl AppearanceUi {
             terminal_graphics: false,
             save_status: "Changes save automatically".into(),
             focus: 0,
+            scroll: 0,
+            rows: std::cell::Cell::new(ROWS),
             dropdown: None,
             font_query: String::new(),
             origin: None,
@@ -243,6 +311,60 @@ impl AppearanceUi {
         self.open = open;
         self.save_status = status;
     }
+    fn visuals_page(&self) -> bool {
+        self.focus >= STYLE_FIELDS
+    }
+    fn page(&self) -> (usize, usize) {
+        if self.visuals_page() {
+            (STYLE_FIELDS, FIELDS)
+        } else {
+            (0, STYLE_FIELDS)
+        }
+    }
+    /// The field a row slot shows on the current page.
+    fn field_at(&self, slot: usize) -> Option<usize> {
+        let (start, end) = self.page();
+        let field = start + self.scroll + slot;
+        (slot < self.rows.get() && field < end).then_some(field)
+    }
+    fn slot_of(&self, field: usize) -> Option<usize> {
+        (0..self.rows.get()).find(|&slot| self.field_at(slot) == Some(field))
+    }
+    /// Focuses a field, turning to its page and scrolling it into view.
+    fn set_focus(&mut self, field: usize) {
+        let page = self.visuals_page();
+        self.focus = field.min(FIELDS - 1);
+        if page != self.visuals_page() {
+            self.scroll = 0;
+        }
+        let rows = self.rows.get();
+        let index = self.focus - self.page().0;
+        if index < self.scroll {
+            self.scroll = index;
+        } else if index >= self.scroll + rows {
+            self.scroll = index + 1 - rows;
+        }
+    }
+    fn step_focus(&mut self, back: bool) {
+        self.set_focus((self.focus + if back { FIELDS - 1 } else { 1 }) % FIELDS);
+    }
+    fn visuals_mut(&mut self) -> &mut Visuals {
+        let current = self.settings.visuals();
+        self.settings.visuals.get_or_insert(current)
+    }
+    /// On the Visuals page, the theme's visuals; elsewhere, every appearance default.
+    pub fn reset(&mut self) {
+        if self.visuals_page() {
+            self.cancel_preview();
+            let time = self.settings.visuals().time;
+            self.settings.visuals = Some(Visuals {
+                time,
+                ..Visuals::for_theme(self.settings.theme)
+            });
+        } else {
+            self.reset_defaults();
+        }
+    }
     pub fn browse(&mut self, forward: bool, width: usize, height: usize, compact: bool) {
         if self.dropdown.is_none() {
             self.open_dropdown(self.focus, width, height, compact);
@@ -271,7 +393,9 @@ impl AppearanceUi {
         had
     }
     fn panel(&self, width: usize, height: usize, compact: bool) -> Panel {
-        Panel::placed(width, height, compact, self.position)
+        let p = Panel::placed(width, height, compact, self.position);
+        self.rows.set(p.rows);
+        p
     }
     pub fn cursor(
         &self,
@@ -318,13 +442,106 @@ impl AppearanceUi {
             2 => Value::Font(t.family),
             3 => Value::Size(t.scale_percent()),
             4 => Value::Spacing(t.line_spacing),
-            _ => Value::Cursor(self.settings.mouse_cursor),
+            5 => Value::Cursor(self.settings.mouse_cursor),
+            PRESET => {
+                let v = self.settings.visuals();
+                match v.preset() {
+                    Some(preset) => Value::Preset(Some(preset)),
+                    None if v.effects.is_neutral() => Value::Preset(None),
+                    None => Value::Custom,
+                }
+            }
+            FRAME_RATE => Value::Fps(self.settings.visuals().fps),
+            TIME => Value::Time(self.settings.visuals().time),
+            SHADOW => Value::Shadow(self.settings.visuals().shadow),
+            SHADOW_X => Value::Offset(true, self.settings.visuals().shadow_x),
+            SHADOW_Y => Value::Offset(false, self.settings.visuals().shadow_y),
+            BORDER => Value::Border(self.settings.visuals().border),
+            CORNER => Value::Corner(self.settings.visuals().corner_inset),
+            INSET_X => Value::Inset(true, self.settings.visuals().inset_x),
+            INSET_Y => Value::Inset(false, self.settings.visuals().inset_y),
+            field => {
+                let index = field - FIRST_EFFECT;
+                let effect = Effect::ALL[index];
+                let amount = effect.get(&self.settings.visuals().effects);
+                Value::Effect(index, effect.step_of(amount))
+            }
+        }
+    }
+    /// A row's value text, including what terminals manage themselves.
+    fn field_text(&self, field: usize) -> String {
+        if field >= STYLE_FIELDS && (self.cell_backend || self.terminal_graphics) {
+            return "Window only".into();
+        }
+        if self.cell_backend && field != 0 {
+            return "Terminal setting".into();
+        }
+        if self.terminal_graphics && field == 5 {
+            return "Terminal pointer".into();
+        }
+        let t = self.settings.editor_typography();
+        match field {
+            0 => self.settings.theme.name().into(),
+            1 if self.settings.framebuffer == Framebuffer::Auto => self
+                .settings
+                .resolution()
+                .map_or("Auto: Native".into(), |(w, h)| format!("Auto: {w}x{h}")),
+            1 => self.settings.framebuffer.name().into(),
+            2 => t.family.name().into(),
+            3 => format!("{}%", t.scale_percent()),
+            4 => format!("{}%", t.line_spacing),
+            5 => self.settings.mouse_cursor.name().into(),
+            field => self.value_text(field),
+        }
+    }
+    /// A row's value as drawn in `cells` character cells: effect amounts get Pixel SSH's gauge
+    /// in front when it fits.
+    fn shown_text(&self, field: usize, cells: usize) -> String {
+        const GAUGE: usize = 5;
+        let text = self.field_text(field);
+        if let Value::Effect(index, _) = self.selected(field) {
+            let effect = Effect::ALL[index];
+            if !self.cell_backend && !self.terminal_graphics && cells > GAUGE + text.chars().count()
+            {
+                if let Some(gauge) =
+                    effect.meter(effect.get(&self.settings.visuals().effects), GAUGE)
+                {
+                    return format!("{gauge} {text}");
+                }
+            }
+        }
+        text
+    }
+    /// What a Visuals row shows for its current value.
+    fn value_text(&self, field: usize) -> String {
+        let v = self.settings.visuals();
+        match self.selected(field) {
+            Value::Preset(preset) => preset.map_or("Off", Preset::name).into(),
+            Value::Custom => "Custom".into(),
+            Value::Fps(fps) => format!("{fps} FPS"),
+            Value::Time(None) => "Live".into(),
+            Value::Time(Some(t)) => format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60),
+            Value::Effect(index, _) => {
+                let effect = Effect::ALL[index];
+                effect.label(effect.get(&v.effects))
+            }
+            Value::Shadow(on) => if on { "On" } else { "Off" }.into(),
+            Value::Offset(_, pixels) | Value::Inset(_, pixels) | Value::Corner(pixels) => {
+                pixels.to_string()
+            }
+            Value::Border(border) => border.name().into(),
+            _ => String::new(),
         }
     }
     fn choices(&self, row: usize) -> Arc<Vec<Choice>> {
-        if (self.cell_backend && row != 0) || (self.terminal_graphics && row == 5) {
+        // Terminals draw their own pointer, and their pictures skip the effect pass.
+        if (self.cell_backend && row != 0) || (self.terminal_graphics && row >= 5) {
             return Arc::new(vec![Choice {
-                label: "Managed by the terminal emulator".into(),
+                label: if row >= STYLE_FIELDS {
+                    "Window only".into()
+                } else {
+                    "Managed by the terminal emulator".into()
+                },
                 value: self.selected(row),
                 enabled: false,
             }]);
@@ -389,6 +606,52 @@ impl AppearanceUi {
                 .into_iter()
                 .map(|c| Choice::new(c.name().into(), Value::Cursor(c)))
                 .collect(),
+            PRESET => std::iter::once(Choice::new("Off".into(), Value::Preset(None)))
+                .chain(
+                    Machine::ALL
+                        .into_iter()
+                        .map(Preset::Machine)
+                        .chain(Look::ALL.into_iter().map(Preset::Look))
+                        .map(|p| Choice::new(p.name().into(), Value::Preset(Some(p)))),
+                )
+                .collect(),
+            FRAME_RATE => (4..=30)
+                .map(|fps| Choice::new(format!("{fps} FPS"), Value::Fps(fps)))
+                .collect(),
+            TIME => std::iter::once(Choice::new("Live".into(), Value::Time(None)))
+                .chain((0..24).map(|hour| {
+                    Choice::new(format!("{hour:02}:00"), Value::Time(Some(hour * 3600)))
+                }))
+                .collect(),
+            SHADOW => [false, true]
+                .into_iter()
+                .map(|on| Choice::new(if on { "On" } else { "Off" }.into(), Value::Shadow(on)))
+                .collect(),
+            BORDER => texted_app::visuals::Border::ALL
+                .into_iter()
+                .map(|b| Choice::new(b.name().into(), Value::Border(b)))
+                .collect(),
+            CORNER => (0..=32)
+                .map(|n| Choice::new(n.to_string(), Value::Corner(n)))
+                .collect(),
+            INSET_X | INSET_Y => (0..=8)
+                .map(|n| Choice::new(n.to_string(), Value::Inset(row == INSET_X, n)))
+                .collect(),
+            SHADOW_X | SHADOW_Y => (0..=4)
+                .map(|n| Choice::new(n.to_string(), Value::Offset(row == SHADOW_X, n)))
+                .collect(),
+            field if field >= FIRST_EFFECT => {
+                let index = field - FIRST_EFFECT;
+                let effect = Effect::ALL[index];
+                (0..=effect.steps())
+                    .map(|step| {
+                        Choice::new(
+                            effect.label(effect.value_at(step)),
+                            Value::Effect(index, step),
+                        )
+                    })
+                    .collect()
+            }
             row => {
                 let t = self.settings.editor_typography();
                 let mut numbers: Vec<u16> = if row == 3 {
@@ -428,9 +691,48 @@ impl AppearanceUi {
                 if self.settings.theme != theme {
                     self.settings.theme = theme;
                     self.settings.colors.clear();
+                    // Like applying a machine in ShaderWallpaper, a theme brings its visuals.
+                    let time = self.settings.visuals().time;
+                    self.settings.visuals = Some(Visuals {
+                        time,
+                        ..Visuals::for_theme(theme)
+                    });
                 }
             }
             Value::Screen(screen) => self.settings.framebuffer = screen,
+            Value::Preset(preset) => {
+                let v = self.visuals_mut();
+                *v = match preset {
+                    // A machine brings its timing and chrome, as in ShaderWallpaper.
+                    Some(Preset::Machine(machine)) => Visuals {
+                        time: v.time,
+                        ..machine.visuals()
+                    },
+                    // Pixel SSH's presets only set the effects.
+                    Some(Preset::Look(look)) => Visuals {
+                        effects: look.effects(),
+                        ..*v
+                    },
+                    None => Visuals {
+                        effects: Default::default(),
+                        ..*v
+                    },
+                };
+            }
+            Value::Custom => {}
+            Value::Fps(fps) => self.visuals_mut().fps = fps,
+            Value::Time(time) => self.visuals_mut().time = time,
+            Value::Effect(index, step) => {
+                let effect = Effect::ALL[index];
+                effect.set(&mut self.visuals_mut().effects, effect.value_at(step));
+            }
+            Value::Shadow(on) => self.visuals_mut().shadow = on,
+            Value::Offset(true, n) => self.visuals_mut().shadow_x = n,
+            Value::Offset(false, n) => self.visuals_mut().shadow_y = n,
+            Value::Border(border) => self.visuals_mut().border = border,
+            Value::Corner(n) => self.visuals_mut().corner_inset = n,
+            Value::Inset(true, n) => self.visuals_mut().inset_x = n,
+            Value::Inset(false, n) => self.visuals_mut().inset_y = n,
             Value::Font(font) => {
                 let t = self.settings.editor_typography_mut();
                 let zoom = t.scale_percent();
@@ -468,7 +770,8 @@ impl AppearanceUi {
                 .unwrap_or(0)
         };
         Popup::new(
-            self.panel(width, height, compact).row(d.field),
+            self.panel(width, height, compact)
+                .row(self.slot_of(d.field).unwrap_or(0)),
             (width, height),
             compact,
             choices.len(),
@@ -484,10 +787,10 @@ impl AppearanceUi {
             .iter()
             .position(|c| c.value == self.selected(row))
             .unwrap_or(0);
+        self.set_focus(row);
         let mut d = Dropdown::new(row, selected);
         let popup = self.popup(d, width, height, compact, &choices);
         d.reveal(popup.visible, choices.len());
-        self.focus = row;
         self.dropdown = Some(d);
     }
     pub fn hover(&mut self, width: usize, height: usize, x: f32, y: f32, compact: bool) -> bool {
@@ -514,7 +817,24 @@ impl AppearanceUi {
     }
     pub fn wheel(&mut self, rows: f64, width: usize, height: usize, compact: bool) -> bool {
         let Some(mut d) = self.dropdown else {
-            return false;
+            let visible = self.panel(width, height, compact).rows;
+            let (start, end) = self.page();
+            if rows == 0.0 || end - start <= visible {
+                return false;
+            }
+            let before = self.scroll;
+            let most = end - start - visible;
+            self.scroll = if rows > 0.0 {
+                self.scroll.saturating_sub(1)
+            } else {
+                (self.scroll + 1).min(most)
+            };
+            // Keep the focus on a row that is still shown.
+            if self.slot_of(self.focus).is_none() {
+                let edge = if rows > 0.0 { visible - 1 } else { 0 };
+                self.focus = self.field_at(edge).unwrap_or(self.focus);
+            }
+            return self.scroll != before;
         };
         let choices = self.choices(d.field);
         let popup = self.popup(d, width, height, compact, &choices);
@@ -555,6 +875,15 @@ impl AppearanceUi {
             self.open = false;
             return;
         }
+        // A tab turns the page; the title row still drags the panel from anywhere.
+        if !over_popup {
+            for visuals in [false, true] {
+                if panel.tab(visuals).contains(x, y) && visuals != self.visuals_page() {
+                    self.cancel_preview();
+                    self.set_focus(if visuals { PRESET } else { 0 });
+                }
+            }
+        }
         if !over_popup
             && panel.rect.contains(x, y)
             && y < (panel.rect.y + if compact { 24 } else { 36 }) as f32
@@ -586,23 +915,26 @@ impl AppearanceUi {
                 return;
             }
             self.cancel_preview();
-            if let Some(Hit::Field(row)) = hit_panel(&self.panel(width, height, compact), x, y) {
-                if row != d.field {
-                    self.open_dropdown(row, width, height, compact);
+            if let Some(Hit::Field(slot)) = hit_panel(&self.panel(width, height, compact), x, y) {
+                if let Some(field) = self.field_at(slot).filter(|&f| f != d.field) {
+                    self.open_dropdown(field, width, height, compact);
                 }
             }
             return;
         }
         match hit_panel(&self.panel(width, height, compact), x, y) {
             Some(Hit::Close) => self.set_open(false),
-            Some(Hit::Reset) => {
-                self.reset_defaults();
+            Some(Hit::Reset) => self.reset(),
+            Some(Hit::Field(slot)) => {
+                if let Some(field) = self.field_at(slot) {
+                    self.open_dropdown(field, width, height, compact);
+                }
             }
-            Some(Hit::Field(row)) => self.open_dropdown(row, width, height, compact),
-            None => {}
+            Some(Hit::Page { .. }) | None => {}
         }
     }
     pub fn key(&mut self, input: &KeyInput<'_>, width: usize, height: usize, compact: bool) {
+        self.panel(width, height, compact);
         let activate = matches!(input.logical, Key::Named(NamedKey::Enter))
             || matches!(input.logical,Key::Character(s) if s==" ");
         if let Some(mut d) = self.dropdown {
@@ -651,13 +983,7 @@ impl AppearanceUi {
                 }
                 Key::Named(NamedKey::Tab) => {
                     self.cancel_preview();
-                    self.focus = (self.focus
-                        + if input.modifiers.shift_key() {
-                            ROWS - 1
-                        } else {
-                            1
-                        })
-                        % ROWS;
+                    self.step_focus(input.modifiers.shift_key());
                     return;
                 }
                 Key::Named(NamedKey::ArrowUp) => d.navigate(-1, &enabled),
@@ -702,15 +1028,7 @@ impl AppearanceUi {
         }
         match input.logical {
             Key::Named(NamedKey::Escape) => self.set_open(false),
-            Key::Named(NamedKey::Tab) => {
-                self.focus = (self.focus
-                    + if input.modifiers.shift_key() {
-                        ROWS - 1
-                    } else {
-                        1
-                    })
-                    % ROWS
-            }
+            Key::Named(NamedKey::Tab) => self.step_focus(input.modifiers.shift_key()),
             Key::Named(
                 NamedKey::ArrowUp
                 | NamedKey::ArrowDown
@@ -750,15 +1068,24 @@ impl AppearanceUi {
             c.panel_border,
         );
         let top = if compact { 4 } else { 16 };
-        label(
-            draws,
-            font,
-            (width, height),
-            (r.x + p.pad, r.y + top),
-            "Appearance",
-            c.text,
-            r.w.saturating_sub(40),
-        );
+        for (visuals, name) in [(false, "Style"), (true, "Visuals")] {
+            let tab = p.tab(visuals);
+            let active = visuals == self.visuals_page();
+            label(
+                draws,
+                font,
+                (width, height),
+                (tab.x, r.y + top),
+                name,
+                if active { c.text } else { c.status_text },
+                tab.w,
+            );
+            if active {
+                let under = r.y + top + if compact { 9 } else { 18 };
+                let w = name.chars().count() * if compact { 8 } else { 9 };
+                draw_rect(draws, width, height, tab.x, under, w, 1, c.status_accent);
+            }
+        }
         label(
             draws,
             font,
@@ -782,6 +1109,18 @@ impl AppearanceUi {
                         &self.font_query
                     }
                 )
+            } else if self.page().1 - self.page().0 > p.rows {
+                let total = self.page().1 - self.page().0;
+                let first = self.scroll + 1;
+                let last = (self.scroll + p.rows).min(total);
+                format!(
+                    "Rows {first}-{last} of {total}{}",
+                    if compact {
+                        ""
+                    } else {
+                        "  Tab: field  Enter: list"
+                    }
+                )
             } else if compact {
                 "Tab: field  Enter: list".into()
             } else {
@@ -790,51 +1129,18 @@ impl AppearanceUi {
             c.status_text,
             r.w.saturating_sub(2 * p.pad),
         );
-        let t = self.settings.editor_typography();
-        let screen = if self.settings.framebuffer == texted_app::framebuffer::Framebuffer::Auto {
-            self.settings
-                .resolution()
-                .map_or("Auto: Native".into(), |(w, h)| format!("Auto: {w}x{h}"))
-        } else {
-            self.settings.framebuffer.name().into()
-        };
-        let mut values = [
-            self.settings.theme.name().to_owned(),
-            screen,
-            t.family.name().into(),
-            format!("{}%", t.scale_percent()),
-            format!("{}%", t.line_spacing),
-            self.settings.mouse_cursor.name().into(),
-        ];
-        if self.cell_backend {
-            for value in &mut values[1..] {
-                *value = "Terminal setting".into();
-            }
-        }
-        if self.terminal_graphics {
-            values[5] = "Terminal pointer".into();
-        }
-        let titles = if compact {
-            ["Theme", "Screen", "Font", "Size", "Spacing", "Cursor"]
-        } else {
-            [
-                "Theme",
-                "Resolution",
-                "Editor font",
-                "Text scale",
-                "Line height",
-                "Mouse cursor",
-            ]
-        };
-        for (row, (title, value)) in titles.iter().zip(values).enumerate() {
-            let field = p.row(row);
-            let text_y = field.y + if compact { 4 } else { 5 };
+        for slot in 0..p.rows {
+            let Some(field) = self.field_at(slot) else {
+                break;
+            };
+            let field_rect = p.row(slot);
+            let text_y = field_rect.y + if compact { 4 } else { 5 };
             label(
                 draws,
                 font,
                 (width, height),
                 (r.x + p.pad, text_y),
-                title,
+                field_title(field, compact),
                 c.text,
                 p.input.saturating_sub(2 * p.pad),
             );
@@ -842,32 +1148,34 @@ impl AppearanceUi {
                 draws,
                 width,
                 height,
-                field.x,
-                field.y,
-                field.w,
-                field.h,
+                field_rect.x,
+                field_rect.y,
+                field_rect.w,
+                field_rect.h,
                 c.input_bg,
-                if self.focus == row {
+                if self.focus == field {
                     c.input_active
                 } else {
                     c.input_border
                 },
             );
+            let room = field_rect.w.saturating_sub(if compact { 20 } else { 38 });
+            let cells = (room as f32 / font.char_width_px.max(1.0)) as usize;
             label(
                 draws,
                 font,
                 (width, height),
-                (field.x + if compact { 4 } else { 10 }, text_y),
-                &value,
+                (field_rect.x + if compact { 4 } else { 10 }, text_y),
+                &self.shown_text(field, cells),
                 c.text,
-                field.w.saturating_sub(if compact { 20 } else { 38 }),
+                room,
             );
             label(
                 draws,
                 font,
                 (width, height),
                 (
-                    field.x + field.w.saturating_sub(if compact { 12 } else { 24 }),
+                    field_rect.x + field_rect.w.saturating_sub(if compact { 12 } else { 24 }),
                     text_y,
                 ),
                 "v",
@@ -875,10 +1183,12 @@ impl AppearanceUi {
                 16,
             );
         }
-        for (rect, text) in [
-            (p.reset(), if compact { "Reset" } else { "Reset defaults" }),
-            (p.done(), "Done"),
-        ] {
+        let reset = match (compact, self.visuals_page()) {
+            (true, _) => "Reset",
+            (false, false) => "Reset defaults",
+            (false, true) => "Theme visuals",
+        };
+        for (rect, text) in [(p.reset(), reset), (p.done(), "Done")] {
             draw_box(
                 draws,
                 width,
@@ -1066,6 +1376,49 @@ impl AppearanceUi {
         }
     }
 }
+/// Row titles; compact ones fit seven 8-pixel cells.
+fn field_title(field: usize, compact: bool) -> &'static str {
+    if (FIRST_EFFECT..SHADOW).contains(&field) {
+        let effect = Effect::ALL[field - FIRST_EFFECT];
+        return if compact {
+            effect.short()
+        } else {
+            effect.title()
+        };
+    }
+    const COMPACT: [&str; FIELDS - Effect::ALL.len()] = [
+        "Theme", "Screen", "Font", "Size", "Spacing", "Cursor", "Preset", "FPS", "Time", "Shadow",
+        "Shad X", "Shad Y", "Border", "Corner", "Inset X", "Inset Y",
+    ];
+    const FULL: [&str; FIELDS - Effect::ALL.len()] = [
+        "Theme",
+        "Resolution",
+        "Editor font",
+        "Text scale",
+        "Line height",
+        "Mouse cursor",
+        "Preset",
+        "Frame rate",
+        "Time of day",
+        "Shadow",
+        "Shadow X",
+        "Shadow Y",
+        "Border",
+        "Corner inset",
+        "Inset X",
+        "Inset Y",
+    ];
+    let index = if field >= SHADOW {
+        field - Effect::ALL.len()
+    } else {
+        field
+    };
+    if compact {
+        COMPACT[index]
+    } else {
+        FULL[index]
+    }
+}
 fn label(
     draws: &mut DrawList,
     font: &mut FontEngine,
@@ -1238,7 +1591,7 @@ mod tests {
         assert!(ui.dropdown.is_some());
         assert_eq!(ui.settings, original);
         press(&mut ui, NamedKey::End, false);
-        assert_eq!(ui.dropdown.unwrap().highlighted, 9);
+        assert_eq!(ui.dropdown.unwrap().highlighted, Theme::ALL.len() - 1);
         assert_ne!(ui.settings, original); // Arrow navigation previews immediately.
         press(&mut ui, NamedKey::Escape, false);
         assert!(ui.open && ui.dropdown.is_none());
@@ -1249,7 +1602,7 @@ mod tests {
         press(&mut ui, NamedKey::Enter, false);
         press(&mut ui, NamedKey::End, false);
         press(&mut ui, NamedKey::Enter, false);
-        assert_eq!(ui.settings.theme, Theme::GreenCrt);
+        assert_eq!(Some(&ui.settings.theme), Theme::ALL.last());
         assert!(ui.settings.colors.is_empty());
         assert!(ui.dropdown.is_none());
     }
@@ -1274,6 +1627,225 @@ mod tests {
                 |c| matches!(c.value,Value::Size(v) if v % 10 == 0 && (10..=800).contains(&v))
             ));
         }
+    }
+    fn key_input(key: NamedKey, shift: bool) -> KeyInput<'static> {
+        let logical: &'static Key = Box::leak(Box::new(Key::Named(key)));
+        KeyInput {
+            physical: winit::keyboard::PhysicalKey::Unidentified(
+                winit::keyboard::NativeKeyCode::Unidentified,
+            ),
+            logical,
+            text: None,
+            modifiers: if shift {
+                winit::keyboard::ModifiersState::SHIFT
+            } else {
+                winit::keyboard::ModifiersState::empty()
+            },
+        }
+    }
+    fn pick(ui: &mut AppearanceUi, field: usize, label: &str) {
+        let (w, h) = (320, 200);
+        ui.open_dropdown(field, w, h, true);
+        let d = ui.dropdown.unwrap();
+        let choices = ui.choices(field);
+        let index = choices.iter().position(|c| c.label == label).unwrap();
+        let mut d = d;
+        d.highlighted = index;
+        let popup = ui.popup(d, w, h, true, &choices);
+        d.reveal(popup.visible, choices.len());
+        ui.dropdown = Some(d);
+        let row = popup.row(index, d.first).unwrap();
+        ui.click(w, h, (row.x + 10) as f32, (row.y + 4) as f32, true);
+        assert!(ui.dropdown.is_none(), "{label} was not chosen");
+    }
+    #[test]
+    fn tab_walks_from_the_style_page_into_the_scrolling_visuals_page_and_back() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        ui.set_focus(5);
+        assert!(!ui.visuals_page());
+        ui.key(&key_input(NamedKey::Tab, false), 320, 200, true);
+        assert_eq!((ui.focus, ui.visuals_page()), (PRESET, true));
+        assert_eq!(ui.field_at(0), Some(PRESET));
+        for _ in PRESET..FIELDS - 1 {
+            ui.key(&key_input(NamedKey::Tab, false), 320, 200, true);
+            assert!(
+                ui.slot_of(ui.focus).is_some(),
+                "field {} is off screen",
+                ui.focus
+            );
+        }
+        assert_eq!(ui.field_at(ROWS - 1), Some(FIELDS - 1));
+        ui.key(&key_input(NamedKey::Tab, false), 320, 200, true);
+        assert_eq!((ui.focus, ui.visuals_page()), (0, false));
+        ui.key(&key_input(NamedKey::Tab, true), 320, 200, true);
+        assert_eq!(ui.focus, FIELDS - 1);
+    }
+    #[test]
+    fn the_visuals_tab_turns_the_page_with_the_mouse() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        let tab = Panel::new(320, 200, true).tab(true);
+        ui.click(320, 200, (tab.x + 4) as f32, (tab.y + 4) as f32, true);
+        assert!(ui.visuals_page());
+        ui.end_drag();
+        let style = Panel::new(320, 200, true).tab(false);
+        ui.click(320, 200, (style.x + 4) as f32, (style.y + 4) as f32, true);
+        assert!(!ui.visuals_page());
+    }
+    #[test]
+    fn a_machine_preset_fills_frame_rate_and_every_effect_and_rows_set_exact_steps() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        pick(&mut ui, PRESET, "Atari ST");
+        assert_eq!(ui.settings.visuals(), Machine::AtariSt.visuals());
+        assert_eq!(ui.field_text(PRESET), "Atari ST");
+        pick(&mut ui, FIRST_EFFECT, "0.95");
+        assert_eq!(
+            ui.settings.visuals().effects.brightness,
+            Effect::Brightness.value_at(9)
+        );
+        assert_eq!(ui.field_text(PRESET), "Custom");
+        pick(&mut ui, FRAME_RATE, "30 FPS");
+        pick(&mut ui, TIME, "13:00");
+        assert_eq!(
+            (ui.settings.visuals().fps, ui.settings.visuals().time),
+            (30, Some(13 * 3600))
+        );
+        assert_eq!(ui.field_text(TIME), "13:00:00");
+    }
+    #[test]
+    fn pixel_ssh_looks_set_only_the_effects_and_show_in_the_preset_row() {
+        use texted_app::visuals::Look;
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        let names: Vec<String> = ui.choices(PRESET).iter().map(|c| c.label.clone()).collect();
+        assert_eq!(
+            names,
+            [
+                "Off",
+                "ZX Spectrum",
+                "Atari ST",
+                "Mac System 2.0",
+                "Game Boy",
+                "Pixel SSH",
+                "CRT",
+                "Arcade",
+                "Bloom",
+                "Glitch"
+            ]
+        );
+        pick(&mut ui, PRESET, "Atari ST");
+        pick(&mut ui, TIME, "13:00");
+        pick(&mut ui, PRESET, "Arcade");
+        let v = ui.settings.visuals();
+        assert_eq!(v.effects, Look::Arcade.effects());
+        assert_eq!(
+            (v.fps, v.time, v.shadow, v.inset_x),
+            (14, Some(13 * 3600), true, 2),
+            "timing and chrome stay"
+        );
+        assert_eq!(ui.field_text(PRESET), "Arcade");
+        pick(&mut ui, PRESET, "Off");
+        assert!(ui.settings.visuals().effects.is_neutral());
+        assert_eq!(ui.field_text(PRESET), "Off");
+    }
+    #[test]
+    fn separation_rows_offer_dithergl_modes_and_matrix_settings() {
+        use texted_app::visuals::{MatrixBackground, Separation};
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        let separation = FIRST_EFFECT + Effect::Separation as usize;
+        let names: Vec<String> = ui
+            .choices(separation)
+            .iter()
+            .map(|c| c.label.clone())
+            .collect();
+        assert_eq!(names, Separation::ALL.map(|m| m.name().to_string()));
+        pick(&mut ui, separation, "LED Matrix");
+        pick(
+            &mut ui,
+            FIRST_EFFECT + Effect::MatrixSpacing as usize,
+            "0.250",
+        );
+        pick(&mut ui, FIRST_EFFECT + Effect::InnerSquare as usize, "Off");
+        pick(
+            &mut ui,
+            FIRST_EFFECT + Effect::MatrixBackground as usize,
+            "Theme",
+        );
+        let e = ui.settings.visuals().effects;
+        assert_eq!(
+            (
+                e.separation,
+                e.matrix_spacing,
+                e.inner_square,
+                e.matrix_background
+            ),
+            (Separation::LedMatrix, 0.25, 0.0, MatrixBackground::Theme)
+        );
+        assert_eq!(ui.field_text(separation), "LED Matrix");
+    }
+    #[test]
+    fn effect_rows_draw_a_gauge_where_it_fits() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        let scan = FIRST_EFFECT + Effect::Scanlines as usize;
+        pick(&mut ui, scan, "0.35");
+        assert_eq!(ui.field_text(scan), "0.35");
+        assert_eq!(ui.shown_text(scan, 30), "█▓░░░ 0.35");
+        // A Game Boy row has room for the number only.
+        assert_eq!(ui.shown_text(scan, 6), "0.35");
+        let separation = FIRST_EFFECT + Effect::Separation as usize;
+        assert_eq!(ui.shown_text(separation, 30), "Off");
+        assert_eq!(ui.shown_text(PRESET, 30), "Custom");
+    }
+    #[test]
+    fn a_theme_brings_its_visuals_and_reset_restores_them_without_touching_style() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        pick(&mut ui, 0, Theme::ZxSpectrum.name());
+        assert_eq!(ui.settings.visuals(), Machine::ZxSpectrum.visuals());
+        pick(&mut ui, FIRST_EFFECT + Effect::Noise as usize, "0.10");
+        ui.set_focus(FIRST_EFFECT + Effect::Noise as usize);
+        ui.reset();
+        assert_eq!(ui.settings.visuals(), Machine::ZxSpectrum.visuals());
+        assert_eq!(ui.settings.theme, Theme::ZxSpectrum);
+    }
+    #[test]
+    fn shadow_rows_switch_it_and_set_its_offsets() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        pick(&mut ui, SHADOW, "On");
+        pick(&mut ui, SHADOW_X, "2");
+        pick(&mut ui, SHADOW_Y, "0");
+        let v = ui.settings.visuals();
+        assert_eq!((v.shadow, v.shadow_x, v.shadow_y), (true, 2, 0));
+        assert_eq!(ui.field_text(SHADOW), "On");
+        assert_eq!(ui.field_text(SHADOW_X), "2");
+    }
+    #[test]
+    fn border_and_inset_rows_set_the_chrome() {
+        use texted_app::visuals::Border;
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        pick(&mut ui, BORDER, Border::Double.name());
+        pick(&mut ui, CORNER, "24");
+        pick(&mut ui, INSET_X, "3");
+        pick(&mut ui, INSET_Y, "1");
+        let v = ui.settings.visuals();
+        assert_eq!(
+            (v.border, v.corner_inset, v.inset_x, v.inset_y),
+            (Border::Double, 24, 3, 1)
+        );
+        assert_eq!(ui.field_text(BORDER), "Double ═║");
+    }
+    #[test]
+    fn terminals_show_visuals_as_window_only() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_cell_backend(true);
+        assert!(ui.choices(PRESET).iter().all(|c| !c.enabled));
+        assert_eq!(ui.field_text(FIRST_EFFECT), "Window only");
     }
     #[test]
     fn compact_lists_commit_clicked_values_and_outside_clicks_dismiss_only_the_list() {
@@ -1310,6 +1882,34 @@ mod tests {
         press(&mut ui, NamedKey::Enter, true);
         assert_eq!(ui.settings.pixel_typography.scale_percent(), 800);
         assert!(ui.dropdown.is_none());
+    }
+    #[test]
+    fn the_panel_fits_a_game_boy_screen_and_scrolls_every_page() {
+        let (w, h) = (160, 144);
+        let p = Panel::new(w, h, true);
+        assert!(p.rect.y + p.rect.h <= h && p.rect.x + p.rect.w <= w);
+        assert!(p.rows >= 1 && p.rows < ROWS);
+        assert!(p.buttons + p.row_h + 4 + 8 <= p.rect.h);
+        assert!(
+            p.reset().x + p.reset().w < p.done().x,
+            "Reset runs into Done"
+        );
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        for _ in 0..FIELDS {
+            ui.key(&key_input(NamedKey::Tab, false), w, h, true);
+            let slot = ui.slot_of(ui.focus).expect("focused field is shown");
+            assert!(p.row(slot).y + p.row(slot).h <= p.rect.y + p.buttons);
+        }
+    }
+    #[test]
+    fn the_status_line_stays_inside_the_panel_below_seven_rows() {
+        for (w, h, compact, text_h) in [(256, 176, true, 8), (980, 700, false, 16)] {
+            let p = Panel::new(w, h, compact);
+            let status_bottom = p.buttons + p.row_h + 4 + text_h;
+            assert!(status_bottom <= p.rect.h, "{status_bottom} > {}", p.rect.h);
+            assert!(p.rect.y + p.rect.h <= h);
+        }
     }
     #[test]
     fn compact_panel_controls_fit_the_smallest_canvas_and_share_hit_geometry() {

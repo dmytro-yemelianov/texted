@@ -23,6 +23,8 @@ pub(crate) struct Viewport {
     pub top_wrap_row: usize,
     pub wrap: bool,
     pub line_numbers: bool,
+    /// Room before the text in pixels, from the Visuals panel inset.
+    pub text_inset: f32,
     pub current: Option<Frame>,
     pub bar: Option<Scrollbar>,
     pub caret: bool,
@@ -38,6 +40,7 @@ impl Viewport {
             top_wrap_row: 0,
             wrap: true,
             line_numbers: true,
+            text_inset: 0.0,
             current: None,
             bar: None,
             caret: true,
@@ -147,6 +150,7 @@ impl Viewport {
             word_wrap: self.wrap,
             show_line_numbers: self.line_numbers,
             line_number_gutter_width_px: gutter_w,
+            text_inset_px: self.text_inset,
         };
         config.top_line = config.top_line.min(snap.total_lines - 1);
         if !self.wrap {
@@ -154,8 +158,7 @@ impl Viewport {
         }
         if self.wrap {
             if self.snap {
-                let caret_row =
-                    (cur_col / config.columns()).min(config.rows_for_line(snap, cur_line) - 1);
+                let caret_row = config.wrap_rows(snap, cur_line).row_of(cur_col);
                 if cur_line == config.top_line && caret_row < config.top_wrap_row {
                     config.top_wrap_row = caret_row;
                 }
@@ -203,6 +206,20 @@ impl Viewport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn caret_at_the_end_of_a_long_word_wrapped_line_scrolls_into_view() {
+        // Rows end at spaces, so this line takes more rows than characters / columns.
+        let text = format!("{} ", "x".repeat(51)).repeat(400);
+        let mut buffer = texted_buffer::TextBuffer::from_string(text);
+        let snapshot = buffer.create_snapshot();
+        buffer.set_cursor_offset(snapshot.total_bytes);
+        let snapshot = buffer.create_snapshot();
+        let font = FontEngine::new(16.0);
+        let mut viewport = Viewport::new(|| {});
+        viewport.input(true);
+        let frame = viewport.prepare(&snapshot, &font, 980, 600);
+        assert!(frame.layout.caret_rect.y >= 0.0, "caret off screen");
+    }
     #[test]
     fn document_uses_all_space_above_the_one_command_panel() {
         let snapshot =

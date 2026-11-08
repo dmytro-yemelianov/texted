@@ -1,6 +1,73 @@
 //! Viewport-bounded layout and a single coordinate mapping for drawing and input.
 use texted_buffer::BufferSnapshot;
 pub mod search;
+/// Lines longer than this wrap at character cells, so deep scrolling stays O(1).
+pub const WORD_WRAP_LIMIT: usize = 64 * 1024;
+/// Where each wrapped row of one line starts. Rows break after whitespace, and a
+/// word longer than a row is split at the row edge.
+#[derive(Clone, Debug)]
+pub struct WrapRows {
+    /// `None` for lines that fit one row or wrap at character cells.
+    starts: Option<Vec<usize>>,
+    len: usize,
+    columns: usize,
+}
+impl WrapRows {
+    fn compute(chars: impl Iterator<Item = char>, len: usize, columns: usize) -> Self {
+        if len <= columns || len > WORD_WRAP_LIMIT {
+            return Self {
+                starts: None,
+                len,
+                columns,
+            };
+        }
+        let mut starts = vec![0];
+        let mut row_start = 0;
+        let mut after_space = None;
+        for (i, c) in chars.enumerate() {
+            if i - row_start == columns {
+                row_start = after_space.filter(|&b| b > row_start).unwrap_or(i);
+                starts.push(row_start);
+                after_space = None;
+            }
+            if c.is_whitespace() {
+                after_space = Some(i + 1);
+            }
+        }
+        Self {
+            starts: Some(starts),
+            len,
+            columns,
+        }
+    }
+    pub fn count(&self) -> usize {
+        match &self.starts {
+            Some(starts) => starts.len(),
+            None => self.len.div_ceil(self.columns).max(1),
+        }
+    }
+    pub fn start(&self, row: usize) -> usize {
+        match &self.starts {
+            Some(starts) => starts[row],
+            None => row.saturating_mul(self.columns),
+        }
+    }
+    /// Exclusive end column; the last row ends at the line's end.
+    pub fn end(&self, row: usize) -> usize {
+        if row + 1 < self.count() {
+            self.start(row + 1)
+        } else {
+            self.len
+        }
+    }
+    /// The row showing `col`; a column on a soft break belongs to the row it starts.
+    pub fn row_of(&self, col: usize) -> usize {
+        match &self.starts {
+            Some(starts) => starts.partition_point(|&s| s <= col).saturating_sub(1),
+            None => (col / self.columns).min(self.count() - 1),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ViewportConfig {
@@ -17,6 +84,8 @@ pub struct ViewportConfig {
     pub word_wrap: bool,
     pub show_line_numbers: bool,
     pub line_number_gutter_width_px: f32,
+    /// Extra room before the text, in pixels (ShaderWallpaper's horizontal panel inset).
+    pub text_inset_px: f32,
 }
 impl Default for ViewportConfig {
     fn default() -> Self {
@@ -31,29 +100,37 @@ impl Default for ViewportConfig {
             word_wrap: false,
             show_line_numbers: true,
             line_number_gutter_width_px: 50.0,
+            text_inset_px: 0.0,
         }
     }
 }
 impl ViewportConfig {
     pub fn text_x(&self) -> f32 {
-        if self.show_line_numbers {
-            self.line_number_gutter_width_px + 8.0
-        } else {
-            10.0
-        }
+        self.text_inset_px
+            + if self.show_line_numbers {
+                self.line_number_gutter_width_px + 8.0
+            } else {
+                10.0
+            }
     }
     pub fn columns(&self) -> usize {
         ((self.width_px - self.text_x() - 8.0).max(self.char_width_px) / self.char_width_px)
             .floor()
             .max(1.0) as usize
     }
+    /// Row breaks for `line`; without wrapping the whole line is one row.
+    pub fn wrap_rows(&self, snapshot: &BufferSnapshot, line: usize) -> WrapRows {
+        let columns = if self.word_wrap {
+            self.columns()
+        } else {
+            usize::MAX
+        };
+        let text = snapshot.line(line);
+        WrapRows::compute(text.chars(), text.len_chars(), columns)
+    }
     pub fn rows_for_line(&self, snapshot: &BufferSnapshot, line: usize) -> usize {
         if self.word_wrap {
-            snapshot
-                .line(line)
-                .len_chars()
-                .div_ceil(self.columns())
-                .max(1)
+            self.wrap_rows(snapshot, line).count()
         } else {
             1
         }
@@ -84,6 +161,8 @@ impl ViewportConfig {
 pub struct VisibleLine {
     pub line_index: usize,
     pub is_continuation: bool,
+    /// Another wrapped row of the same line follows this one.
+    pub continues: bool,
     pub start_col: usize,
     pub end_col: usize,
     pub text: String,
@@ -199,7 +278,12 @@ impl ViewportLayout {
             .or_else(|| self.visible_lines.last())
         {
             let col = ((x - config.text_x()).max(0.0) / config.char_width_px).round() as usize;
-            (line.line_index, line.start_col + col)
+            let mut col = line.start_col + col;
+            if line.continues {
+                // The break column is drawn on the next row, so stay before it.
+                col = col.min(line.end_col.saturating_sub(1).max(line.start_col));
+            }
+            (line.line_index, col)
         } else {
             (config.top_line, 0)
         }
@@ -212,7 +296,12 @@ impl ViewportLayout {
         to: usize,
     ) -> Option<Rect> {
         let a = from.max(row.start_col);
-        let b = to.min(row.start_col + config.columns());
+        let limit = if config.word_wrap {
+            row.end_col
+        } else {
+            row.start_col + config.columns()
+        };
+        let b = to.min(limit);
         if b <= a {
             return None;
         }
@@ -235,35 +324,37 @@ impl LayoutEngine {
         let columns = config.columns();
         let mut visible_lines = Vec::with_capacity(capacity);
         let mut line = config.top_line.min(snapshot.total_lines - 1);
-        let mut wrap = if config.word_wrap {
-            config
-                .top_wrap_row
-                .min(config.rows_for_line(snapshot, line) - 1)
-        } else {
-            0
-        };
+        let mut rows = config.wrap_rows(snapshot, line);
+        let mut wrap = config.top_wrap_row.min(rows.count() - 1);
         while line < snapshot.total_lines && visible_lines.len() < capacity {
             let text = snapshot.line(line);
             let len = text.len_chars();
-            let start = if config.word_wrap {
-                wrap * columns
+            let (start, end) = if config.word_wrap {
+                (rows.start(wrap), rows.end(wrap))
             } else {
-                config.left_col
+                (
+                    config.left_col,
+                    config.left_col.saturating_add(columns).min(len),
+                )
             };
-            let end = start.saturating_add(columns).min(len);
+            let continues = wrap + 1 < rows.count();
             visible_lines.push(VisibleLine {
                 line_index: line,
                 is_continuation: wrap > 0,
+                continues,
                 start_col: start,
                 end_col: end,
                 text: text.slice(start.min(len)..end).to_string(),
                 y_px: visible_lines.len() as f32 * config.line_height_px,
             });
-            if config.word_wrap && wrap + 1 < config.rows_for_line(snapshot, line) {
+            if continues {
                 wrap += 1;
             } else {
                 line += 1;
                 wrap = 0;
+                if line < snapshot.total_lines {
+                    rows = config.wrap_rows(snapshot, line);
+                }
             }
         }
         let (cursor_line, cursor_col) = snapshot.offset_to_line_col(snapshot.cursor_offset);
@@ -283,9 +374,7 @@ impl LayoutEngine {
             if row.line_index == cursor_line
                 && cursor_col >= row.start_col
                 && cursor_col <= row.end_col
-                && (!config.word_wrap
-                    || cursor_col < row.start_col + columns
-                    || cursor_col == snapshot.line(cursor_line).len_chars())
+                && (!config.word_wrap || cursor_col < row.end_col || !row.continues)
             {
                 result.caret_rect.x =
                     config.text_x() + (cursor_col - row.start_col) as f32 * config.char_width_px;
@@ -317,6 +406,78 @@ impl LayoutEngine {
 mod tests {
     use super::*;
     use texted_buffer::TextBuffer;
+    fn wrapped(text: &str, columns: usize) -> (BufferSnapshot, ViewportConfig) {
+        let snap = TextBuffer::from_string(text.into()).create_snapshot();
+        let config = ViewportConfig {
+            word_wrap: true,
+            show_line_numbers: false,
+            char_width_px: 9.0,
+            width_px: 10.0 + 8.0 + 9.0 * columns as f32,
+            ..Default::default()
+        };
+        assert_eq!(config.columns(), columns);
+        (snap, config)
+    }
+    #[test]
+    fn a_text_inset_moves_text_caret_and_clicks_together() {
+        let mut snap = TextBuffer::from_string("abcdef".into()).create_snapshot();
+        snap.cursor_offset = 2;
+        let flat = ViewportConfig::default();
+        let inset = ViewportConfig {
+            text_inset_px: 18.0,
+            ..flat
+        };
+        assert_eq!(inset.text_x(), flat.text_x() + 18.0);
+        let a = LayoutEngine::compute_layout(&snap, &flat, None);
+        let b = LayoutEngine::compute_layout(&snap, &inset, None);
+        assert_eq!(b.caret_rect.x, a.caret_rect.x + 18.0);
+        let x = flat.text_x() + 3.0 * flat.char_width_px;
+        assert_eq!(a.screen_to_line_col(&flat, x, 1.0), (0, 3));
+        assert_eq!(b.screen_to_line_col(&inset, x + 18.0, 1.0), (0, 3));
+    }
+    #[test]
+    fn word_wrap_breaks_after_spaces_and_splits_only_words_longer_than_a_row() {
+        let (snap, config) = wrapped("hello world again\nsupercalifragilistic", 10);
+        let layout = LayoutEngine::compute_layout(&snap, &config, None);
+        let rows: Vec<_> = layout
+            .visible_lines
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(
+            rows,
+            ["hello ", "world ", "again", "supercalif", "ragilistic"]
+        );
+        assert_eq!(config.rows_for_line(&snap, 0), 3);
+    }
+    #[test]
+    fn caret_and_clicks_follow_word_wrapped_rows() {
+        let (mut snap, config) = wrapped("hello world again", 10);
+        snap.cursor_offset = 6; // The start of "world", which moved to the second row.
+        let layout = LayoutEngine::compute_layout(&snap, &config, None);
+        assert_eq!(
+            (layout.caret_rect.x, layout.caret_rect.y),
+            (config.text_x(), config.line_height_px)
+        );
+        // Past the end of a wrapped row lands before its trailing space, not on the next row.
+        assert_eq!(layout.screen_to_line_col(&config, 500.0, 1.0), (0, 5));
+        // The last row keeps virtual columns past the text for block selection.
+        let last_row = config.line_height_px * 2.0 + 1.0;
+        let (line, col) = layout.screen_to_line_col(&config, 500.0, last_row);
+        assert!(line == 0 && col >= 17, "{line}:{col}");
+    }
+    #[test]
+    fn a_match_across_a_soft_break_highlights_each_rows_own_cells() {
+        let (snap, config) = wrapped("hello world again", 10);
+        let layout = LayoutEngine::compute_layout(&snap, &config, None);
+        let plan = layout.search_highlights(&snap, &config, snap.revision, &[(4, 7)], None);
+        let cells: Vec<_> = plan
+            .highlights
+            .iter()
+            .map(|h| (h.rect.y, h.rect.width / config.char_width_px))
+            .collect();
+        assert_eq!(cells, [(0.0, 2.0), (config.line_height_px, 1.0)]);
+    }
     #[test]
     fn search_work_is_bounded_at_a_million_column_offset_and_deep_wrap() {
         let snap = TextBuffer::from_string("a".repeat(2_000_000)).create_snapshot();

@@ -98,6 +98,16 @@ impl TextBuffer {
     }
     /// Groups a compound edit into one undo entry, preserving ordinary typing grouping.
     pub fn transaction<R>(&mut self, edit: impl FnOnce(&mut Self) -> R) -> R {
+        match self.try_transaction(|buffer| Ok::<R, std::convert::Infallible>(edit(buffer))) {
+            Ok(value) => value,
+            Err(never) => match never {},
+        }
+    }
+    /// Like `transaction`, but an `Err` restores the document as if the edit never ran.
+    pub fn try_transaction<R, E>(
+        &mut self,
+        edit: impl FnOnce(&mut Self) -> Result<R, E>,
+    ) -> Result<R, E> {
         if self.history_suspended {
             return edit(self);
         }
@@ -110,13 +120,14 @@ impl TextBuffer {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| edit(self)));
         self.history_suspended = false;
         let result = match result {
-            Ok(value) => value,
-            Err(error) => {
-                self.text = before.text;
-                self.cursor_offset = before.cursor;
-                self.typing = None;
-                self.revision = self.revision.wrapping_add(1);
-                std::panic::resume_unwind(error);
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                self.roll_back(before);
+                return Err(error);
+            }
+            Err(panic) => {
+                self.roll_back(before);
+                std::panic::resume_unwind(panic);
             }
         };
         if !self.text.is_instance(&before.text) {
@@ -127,6 +138,12 @@ impl TextBuffer {
             self.redo_stack.clear();
         }
         result
+    }
+    fn roll_back(&mut self, before: Revision) {
+        self.text = before.text;
+        self.cursor_offset = before.cursor;
+        self.typing = None;
+        self.revision = self.revision.wrapping_add(1);
     }
     fn replace_range_raw(&mut self, start: usize, end: usize, text: &str) {
         let a = self.text.byte_to_char(self.clamp_byte(start));

@@ -90,12 +90,28 @@ pub fn main_entry(force_terminal: bool) {
         }
     };
     let menus = menus::NativeMenus::new(event_loop.create_proxy()).expect("Could not create menus");
-    let mut app = App::new(
+    let app = App::new(
         window,
         renderer,
         arguments.into_iter().map(PathBuf::from).collect(),
         menus,
         event_loop.create_proxy(),
     );
-    let _ = event_loop.run(move |event, target| app.event(event, target));
+    let mut app = Some(app);
+    let _ = event_loop.run(move |event, target| {
+        let Some(running) = app.as_mut() else {
+            return;
+        };
+        if !running.event(event, target) {
+            return;
+        }
+        if native_macos::terminate_pending() {
+            // AppKit ends the process without unwinding this loop, and stopping the loop
+            // would cancel the logout, so clean up here and let AppKit finish.
+            app = None;
+            native_macos::accept_terminate();
+        } else {
+            target.exit();
+        }
+    });
 }

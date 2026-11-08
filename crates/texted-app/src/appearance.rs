@@ -16,9 +16,12 @@ pub enum Theme {
     ZxSpectrum,
     Amber,
     GreenCrt,
+    /// ShaderWallpaper's Mac System 2.0 and Game Boy machines.
+    MacSystem2,
+    GameBoy,
 }
 impl Theme {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::ModernDark,
         Self::ModernLight,
         Self::Vga,
@@ -29,6 +32,8 @@ impl Theme {
         Self::ZxSpectrum,
         Self::Amber,
         Self::GreenCrt,
+        Self::MacSystem2,
+        Self::GameBoy,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -42,6 +47,8 @@ impl Theme {
             Self::ZxSpectrum => "ZX Spectrum",
             Self::Amber => "Amber",
             Self::GreenCrt => "Green CRT",
+            Self::MacSystem2 => "Mac System 2.0",
+            Self::GameBoy => "Game Boy",
         }
     }
     pub fn step(self, delta: i32) -> Self {
@@ -80,6 +87,13 @@ impl Theme {
             Self::GreenCrt => (
                 0x061108, 0x90e69c, 0x0d2012, 0x68ac74, 0xc0ffd0, 0x234f2c, 0x375126, 0x536b2b,
             ),
+            // Background, clock text, details and accent from ShaderWallpaper's palettes.
+            Self::MacSystem2 => (
+                0xe3e0d1, 0x141414, 0xd4d1c2, 0x2e2e2e, 0x050505, 0xb8b5a8, 0xcfccbf, 0xa3a094,
+            ),
+            Self::GameBoy => (
+                0x9cad75, 0x2e3d1f, 0x8e9f68, 0x47592e, 0x1a2412, 0x7d8e57, 0xb5c48f, 0x6e7f4a,
+            ),
             Self::ModernDark => unreachable!(),
         };
         Palette {
@@ -104,6 +118,13 @@ impl Theme {
             status_border: muted,
             status_text: fg,
             status_accent: accent,
+            // ShaderWallpaper's machines shadow with black; a light screen needs grey.
+            shadow: match self {
+                Self::ModernLight => 0xb0b0b0,
+                Self::MacSystem2 => 0x1f1f1f,
+                Self::GameBoy => 0x2b361f,
+                _ => 0x000000,
+            },
         }
     }
 }
@@ -130,6 +151,8 @@ pub struct Palette {
     pub status_border: u32,
     pub status_text: u32,
     pub status_accent: u32,
+    /// Behind shadowed text and borders, as ShaderWallpaper's palette `shadow`.
+    pub shadow: u32,
 }
 impl Default for Palette {
     fn default() -> Self {
@@ -155,6 +178,7 @@ impl Default for Palette {
             status_border: 0x282828,
             status_text: 0x888888,
             status_accent: 0x569cd6,
+            shadow: 0,
         }
     }
 }
@@ -182,6 +206,7 @@ impl Palette {
             "status_border" => &mut self.status_border,
             "status_text" => &mut self.status_text,
             "status_accent" => &mut self.status_accent,
+            "shadow" => &mut self.shadow,
             _ => return Err(format!("Unknown appearance color: {key}")),
         };
         *slot = value;
@@ -360,7 +385,7 @@ impl MouseCursor {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Appearance {
     pub version: u32,
@@ -368,6 +393,14 @@ pub struct Appearance {
     pub mouse_cursor: MouseCursor,
     pub typography: Typography,
     pub framebuffer: Framebuffer,
+    /// The Visuals page; files without it have no screen effects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visuals: Option<crate::visuals::Visuals>,
+    /// Read from files written before the Visuals page, then folded into `visuals`.
+    #[serde(skip_serializing)]
+    pub crt: Option<crate::visuals::CrtEffect>,
+    #[serde(skip_serializing)]
+    pub effects: Option<crate::visuals::VisualEffects>,
     pub pixel_typography: Typography,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub colors: BTreeMap<String, String>,
@@ -380,6 +413,9 @@ impl Default for Appearance {
             mouse_cursor: MouseCursor::System,
             typography: Typography::default(),
             framebuffer: Framebuffer::default(),
+            visuals: None,
+            crt: None,
+            effects: None,
             pixel_typography: Typography {
                 family: FontFamily::Bios,
                 size_px: 8,
@@ -391,6 +427,16 @@ impl Default for Appearance {
     }
 }
 impl Appearance {
+    /// The Visuals page settings, including what an older `crt` key meant.
+    pub fn visuals(&self) -> crate::visuals::Visuals {
+        self.visuals
+            .map(crate::visuals::Visuals::current)
+            .or_else(|| {
+                self.crt
+                    .map(|crt| crt.visuals(self.effects.unwrap_or_default()))
+            })
+            .unwrap_or_default()
+    }
     pub fn resolution(&self) -> Option<(u32, u32)> {
         self.framebuffer.resolve(self.theme)
     }
@@ -413,6 +459,10 @@ impl Appearance {
         if self.version != 1 {
             return Err(format!("Unsupported appearance version {}", self.version));
         }
+        if self.visuals.is_some() || self.crt.is_some() {
+            self.visuals = Some(self.visuals().normalized());
+        }
+        (self.crt, self.effects) = (None, None);
         self.typography.normalize();
         self.pixel_typography.normalize();
         self.palette()?;
@@ -527,6 +577,88 @@ mod tests {
             serde_json::from_str::<Appearance>(&serde_json::to_string(&a).unwrap()).unwrap(),
             a
         );
+    }
+    #[test]
+    fn shaderwallpaper_machines_are_themes_with_their_palettes() {
+        for (theme, id, name, bg, text, shadow) in [
+            (
+                Theme::MacSystem2,
+                "mac_system2",
+                "Mac System 2.0",
+                0xe3e0d1,
+                0x141414,
+                0x1f1f1f,
+            ),
+            (
+                Theme::GameBoy,
+                "game_boy",
+                "Game Boy",
+                0x9cad75,
+                0x2e3d1f,
+                0x2b361f,
+            ),
+        ] {
+            let p = theme.palette();
+            assert_eq!((p.bg, p.text, p.shadow), (bg, text, shadow), "{name}");
+            assert_eq!(theme.name(), name);
+            assert_eq!(serde_json::to_string(&theme).unwrap(), format!("\"{id}\""));
+            assert!(Theme::ALL.contains(&theme));
+        }
+    }
+    #[test]
+    fn every_theme_has_a_shadow_color_and_it_can_be_overridden() {
+        for theme in Theme::ALL {
+            let expected = match theme {
+                Theme::ModernLight => 0xb0b0b0,
+                Theme::MacSystem2 => 0x1f1f1f,
+                Theme::GameBoy => 0x2b361f,
+                _ => 0x000000,
+            };
+            assert_eq!(theme.palette().shadow, expected, "{theme:?}");
+        }
+        let mut a = Appearance::default();
+        a.colors.insert("shadow".into(), "#203040".into());
+        assert_eq!(a.palette().unwrap().shadow, 0x203040);
+    }
+    #[test]
+    fn visuals_are_saved_and_older_crt_files_migrate() {
+        use crate::visuals::Machine;
+        let old: Appearance =
+            serde_json::from_str(r#"{"theme":"green_crt","crt":"wallpaper"}"#).unwrap();
+        assert_eq!(old.visuals(), Machine::AtariSt.visuals());
+        let mut migrated = old.clone();
+        migrated.normalize().unwrap();
+        let json = serde_json::to_string(&migrated).unwrap();
+        assert!(
+            json.contains(r#""visuals""#) && !json.contains(r#""crt""#),
+            "{json}"
+        );
+        let again: Appearance = serde_json::from_str(&json).unwrap();
+        assert_eq!(again.visuals(), Machine::AtariSt.visuals());
+        let plain: Appearance = serde_json::from_str(r#"{"theme":"zx_spectrum"}"#).unwrap();
+        assert!(plain.visuals().effects.is_neutral());
+    }
+    #[test]
+    fn visuals_saved_for_the_wallpaper_shader_read_as_the_retuned_machine() {
+        use crate::visuals::Machine;
+        // The appearance.json the previous build wrote, trimmed to the visuals.
+        let json = r#"{"theme":"atari","framebuffer":"mono_text","visuals":{"fps":14,"time":null,
+            "effects":{"brightness":0.96,"curvature":0.014,"chromatic_aberration":0.18,
+            "afterglow":0.12,"noise":0.55,"flicker":0.45,"scanlines":0.42},"shadow":true,
+            "shadow_x":3,"shadow_y":1,"border":"single","corner_inset":9,"inset_x":2,"inset_y":5}}"#;
+        let old: Appearance = serde_json::from_str(json).unwrap();
+        assert_eq!(old.visuals().effects, Machine::AtariSt.visuals().effects);
+        let mut saved = old.clone();
+        saved.normalize().unwrap();
+        let v = saved.visuals();
+        assert_eq!(
+            (v.shadow_x, v.corner_inset, v.inset_y),
+            (3, 9, 5),
+            "chrome kept"
+        );
+        let again: Appearance =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(again.visuals(), v);
     }
     #[test]
     fn future_versions_unknown_colors_and_invalid_rgb_are_rejected() {

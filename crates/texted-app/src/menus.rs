@@ -19,6 +19,11 @@ pub enum MenuCommand {
     Delete,
     SelectAll,
     Block,
+    DuplicateLines,
+    MoveLineUp,
+    MoveLineDown,
+    TrimTrailingSpaces,
+    GoToLine,
     Find,
     Replace,
     Next,
@@ -56,6 +61,12 @@ impl MenuCommand {
             }),
             SelectAll => Intent::Edit(EditorCommand::SelectAll),
             Block => Intent::Edit(EditorCommand::ToggleBlock),
+            DuplicateLines => Intent::Edit(EditorCommand::DuplicateLines),
+            MoveLineUp | MoveLineDown => Intent::Edit(EditorCommand::MoveLines {
+                up: self == MoveLineUp,
+            }),
+            TrimTrailingSpaces => Intent::Edit(EditorCommand::TrimTrailingWhitespace),
+            GoToLine => Intent::GoToLine,
             Find => Intent::Find,
             Replace => Intent::Replace,
             Next | Previous => Intent::NextMatch {
@@ -210,8 +221,30 @@ mod mac {
             edit.append(&sep()).map_err(|e| e.to_string())?;
             add(&edit, SelectAll, "Select All", Some((cmd, Code::KeyA)))?;
             add(&edit, Block, "Column Selection", Some((cmd, Code::KeyB)))?;
+            edit.append(&sep()).map_err(|e| e.to_string())?;
+            add(
+                &edit,
+                DuplicateLines,
+                "Duplicate Line",
+                Some((shift, Code::KeyD)),
+            )?;
+            let option = cmd | Modifiers::ALT;
+            add(
+                &edit,
+                MoveLineUp,
+                "Move Line Up",
+                Some((option, Code::ArrowUp)),
+            )?;
+            add(
+                &edit,
+                MoveLineDown,
+                "Move Line Down",
+                Some((option, Code::ArrowDown)),
+            )?;
+            add(&edit, TrimTrailingSpaces, "Trim Trailing Spaces", None)?;
             add(&search, Find, "Find…", Some((cmd, Code::KeyF)))?;
             add(&search, Replace, "Replace…", Some((cmd, Code::KeyR)))?;
+            add(&search, GoToLine, "Go to Line…", Some((cmd, Code::KeyJ)))?;
             search.append(&sep()).map_err(|e| e.to_string())?;
             add(&search, Next, "Find Next", Some((cmd, Code::KeyG)))?;
             add(

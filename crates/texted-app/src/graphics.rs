@@ -30,11 +30,76 @@ pub(crate) struct Draw {
     pub glyph: Option<Arc<CachedGlyph>>,
     pub crop: [f32; 4],
 }
+/// ShaderWallpaper's text shadow: an offset in font pixels and the palette's shadow color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TextShadow {
+    pub x: u8,
+    pub y: u8,
+    pub color: u32,
+}
+/// A tile frame for panels: one font pixel thick, single or double, with corner cells of
+/// eight font pixels and edge tiles starting `corner_inset` away, as in ShaderWallpaper.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Frame {
+    pub double: bool,
+    pub pixel: f32,
+    pub corner_inset: u8,
+}
+pub(crate) fn frame_rects(x: f32, y: f32, w: f32, h: f32, frame: Frame) -> Vec<[f32; 4]> {
+    let t = frame.pixel.max(1.0);
+    let cell = 8.0 * t;
+    // ShaderWallpaper starts edge tiles max((corner inset + 1) / 2, 8) pixels from a corner.
+    let edge = f32::from(u16::from(frame.corner_inset).div_ceil(2).max(8)) * t;
+    let mut rects = Vec::new();
+    let mut ring = |x: f32, y: f32, w: f32, h: f32| {
+        if w < 2.0 * cell || h < 2.0 * cell {
+            // Too small for corner cells, as the wallpaper skips such frames: plain lines.
+            rects.extend([
+                [x, y, w, t],
+                [x, y + h - t, w, t],
+                [x, y, t, h],
+                [x + w - t, y, t, h],
+            ]);
+            return;
+        }
+        for (cx, cy) in [
+            (x, y),
+            (x + w - cell, y),
+            (x, y + h - cell),
+            (x + w - cell, y + h - cell),
+        ] {
+            let line_y = if cy == y { y } else { y + h - t };
+            let line_x = if cx == x { x } else { x + w - t };
+            rects.push([cx, line_y, cell, t]);
+            rects.push([line_x, cy, t, cell]);
+        }
+        let (left, right) = (x + edge, x + w - edge);
+        if right > left {
+            rects.push([left, y, right - left, t]);
+            rects.push([left, y + h - t, right - left, t]);
+        }
+        let (top, bottom) = (y + edge, y + h - edge);
+        if bottom > top {
+            rects.push([x, top, t, bottom - top]);
+            rects.push([x + w - t, top, t, bottom - top]);
+        }
+    };
+    ring(x, y, w, h);
+    if frame.double {
+        let d = 2.0 * t;
+        ring(x + d, y + d, w - 2.0 * d, h - 2.0 * d);
+    }
+    rects
+}
 #[derive(Default)]
 pub(crate) struct DrawList {
     pub clear: u32,
     pub draws: Vec<Draw>,
     pub cells: Vec<CellCommand>,
+    /// Set by the window per frame and kept across `reset`; terminal cells never get it.
+    pub shadow: Option<TextShadow>,
+    /// Tile frames for every box, set like `shadow`; `None` keeps Texted's thin lines.
+    pub frame: Option<Frame>,
 }
 impl DrawList {
     pub fn reset(&mut self, clear: u32) {
@@ -226,6 +291,10 @@ impl FontEngine {
             x += self.char_width_px * factor;
         }
     }
+    /// One pixel of the bitmap face, in scene pixels at the current zoom.
+    pub fn pixel_px(&self) -> f32 {
+        self.scale as f32 * self.render_scale
+    }
     pub fn set_zoom(&mut self, percent: u16, line_spacing: u16) {
         self.render_scale = f32::from(percent.clamp(10, 800)) / 100.0;
         self.char_width_px = f32::from(self.face.width) * self.scale as f32 * self.render_scale;
@@ -310,13 +379,32 @@ impl FontEngine {
             return;
         }
         let glyph = self.glyph(ch);
+        let size = [
+            glyph.width as f32 * self.render_scale,
+            glyph.height as f32 * self.render_scale,
+        ];
+        // Like ShaderWallpaper, a shadow farther than a quarter of the cell is not drawn.
+        let shadow = buffer.shadow.filter(|s| {
+            (s.x > 0 || s.y > 0)
+                && u16::from(s.x) <= (self.face.width / 4).max(1)
+                && u16::from(s.y) <= (self.face.height / 4).max(1)
+        });
+        if let Some(shadow) = shadow {
+            let pixel = self.pixel_px();
+            buffer.push(
+                [
+                    x as f32 + f32::from(shadow.x) * pixel,
+                    y as f32 + f32::from(shadow.y) * pixel,
+                    size[0],
+                    size[1],
+                ],
+                [stride as f32, max_height as f32],
+                shadow.color,
+                Some(glyph.clone()),
+            );
+        }
         buffer.push(
-            [
-                x as f32,
-                y as f32,
-                glyph.width as f32 * self.render_scale,
-                glyph.height as f32 * self.render_scale,
-            ],
+            [x as f32, y as f32, size[0], size[1]],
             [stride as f32, max_height as f32],
             color,
             Some(glyph),
@@ -397,28 +485,46 @@ pub(crate) fn draw_box(
     border_color: u32,
 ) {
     draw_rect(buffer, stride, max_height, x, y, width, height, bg_color);
-    draw_rect(buffer, stride, max_height, x, y, width, 1, border_color);
-    draw_rect(
-        buffer,
-        stride,
-        max_height,
-        x,
-        y + height.saturating_sub(1),
-        width,
-        1,
-        border_color,
-    );
-    draw_rect(buffer, stride, max_height, x, y, 1, height, border_color);
-    draw_rect(
-        buffer,
-        stride,
-        max_height,
-        x + width.saturating_sub(1),
-        y,
-        1,
-        height,
-        border_color,
-    );
+    let bounds = [stride as f32, max_height as f32];
+    let lines = [
+        [x, y, width, 1],
+        [x, y + height.saturating_sub(1), width, 1],
+        [x, y, 1, height],
+        [x + width.saturating_sub(1), y, 1, height],
+    ];
+    match buffer.frame {
+        None => {
+            for [lx, ly, lw, lh] in lines {
+                draw_rect(buffer, stride, max_height, lx, ly, lw, lh, border_color);
+            }
+        }
+        Some(frame) => {
+            // Terminal cells keep the plain box; the window draws the tile frame.
+            for [lx, ly, lw, lh] in lines {
+                buffer.cells.push(CellCommand::Fill {
+                    rect: [lx as f32, ly as f32, lw as f32, lh as f32],
+                    bounds,
+                    color: border_color,
+                });
+            }
+            let rects = frame_rects(x as f32, y as f32, width as f32, height as f32, frame);
+            if let Some(shadow) = buffer.shadow.filter(|s| s.x > 0 || s.y > 0) {
+                let dx = f32::from(shadow.x) * frame.pixel;
+                let dy = f32::from(shadow.y) * frame.pixel;
+                for r in &rects {
+                    buffer.push(
+                        [r[0] + dx, r[1] + dy, r[2], r[3]],
+                        bounds,
+                        shadow.color,
+                        None,
+                    );
+                }
+            }
+            for r in rects {
+                buffer.push(r, bounds, border_color, None);
+            }
+        }
+    }
     buffer.cells.push(CellCommand::Border {
         rect: [x as f32, y as f32, width as f32, height as f32],
         bounds: [stride as f32, max_height as f32],
@@ -430,6 +536,126 @@ pub(crate) fn draw_box(
 mod tests {
     use super::*;
     use texted_app::appearance::FontFamily;
+    #[test]
+    fn tile_frames_follow_the_wallpaper_corners_edges_and_gaps() {
+        let covered = |rects: &[[f32; 4]], px: f32, py: f32| {
+            rects
+                .iter()
+                .any(|r| px >= r[0] && px < r[0] + r[2] && py >= r[1] && py < r[1] + r[3])
+        };
+        let frame = Frame {
+            double: false,
+            pixel: 2.0,
+            corner_inset: 16,
+        };
+        let single = frame_rects(10.0, 20.0, 200.0, 100.0, frame);
+        // Corners meet the edges, and the line is one font pixel thick.
+        for x in (10..210).step_by(5) {
+            assert!(covered(&single, x as f32 + 0.5, 20.5), "top at {x}");
+            assert!(covered(&single, x as f32 + 0.5, 118.5), "bottom at {x}");
+            if (14..206).contains(&x) {
+                assert!(!covered(&single, x as f32 + 0.5, 22.5), "thick at {x}");
+            }
+        }
+        for y in (20..120).step_by(5) {
+            assert!(covered(&single, 10.5, y as f32 + 0.5), "left at {y}");
+            assert!(covered(&single, 208.5, y as f32 + 0.5), "right at {y}");
+        }
+        let double = frame_rects(
+            10.0,
+            20.0,
+            200.0,
+            100.0,
+            Frame {
+                double: true,
+                ..frame
+            },
+        );
+        assert!(covered(&double, 100.5, 24.5) && !covered(&double, 100.5, 22.5));
+        // Edge tiles that start farther in leave a gap after each corner cell.
+        let gapped = frame_rects(
+            10.0,
+            20.0,
+            200.0,
+            100.0,
+            Frame {
+                corner_inset: 32,
+                ..frame
+            },
+        );
+        assert!(covered(&gapped, 20.5, 20.5));
+        assert!(!covered(&gapped, 34.5, 20.5));
+        assert!(covered(&gapped, 50.5, 20.5));
+    }
+    #[test]
+    fn a_framed_box_keeps_terminal_cells_and_draws_tiles_behind_their_shadow() {
+        let mut plain = DrawList::default();
+        draw_box(&mut plain, 400, 400, 10, 20, 200, 100, 0x111111, 0xeeeeee);
+        let frame = Frame {
+            double: false,
+            pixel: 2.0,
+            corner_inset: 16,
+        };
+        let mut framed = DrawList {
+            frame: Some(frame),
+            shadow: Some(TextShadow {
+                x: 1,
+                y: 1,
+                color: 0x000001,
+            }),
+            ..Default::default()
+        };
+        draw_box(&mut framed, 400, 400, 10, 20, 200, 100, 0x111111, 0xeeeeee);
+        assert_eq!(format!("{:?}", framed.cells), format!("{:?}", plain.cells));
+        let tiles = frame_rects(10.0, 20.0, 200.0, 100.0, frame);
+        let colors: Vec<_> = framed.draws.iter().map(|d| d.color).collect();
+        let mut expected = vec![0x111111];
+        expected.extend(std::iter::repeat_n(0x000001, tiles.len()));
+        expected.extend(std::iter::repeat_n(0xeeeeee, tiles.len()));
+        assert_eq!(colors, expected);
+        assert_eq!(framed.draws[1].rect[0], tiles[0][0] + 2.0);
+    }
+    #[test]
+    fn a_text_shadow_draws_each_glyph_offset_first_in_the_shadow_color() {
+        let mut font = FontEngine::with_typography(Typography {
+            family: FontFamily::Bios,
+            size_px: 8,
+            line_spacing: 100,
+            zoom_percent: 200,
+        });
+        let pixel = font.pixel_px();
+        let mut list = DrawList {
+            shadow: Some(TextShadow {
+                x: 1,
+                y: 2,
+                color: 0x123456,
+            }),
+            ..Default::default()
+        };
+        font.draw_char(&mut list, 400, 400, 10, 20, 'A', 0xffffff);
+        let drawn: Vec<_> = list
+            .draws
+            .iter()
+            .map(|d| (d.rect[0], d.rect[1], d.color))
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                (10.0 + pixel, 20.0 + 2.0 * pixel, 0x123456),
+                (10.0, 20.0, 0xffffff)
+            ]
+        );
+        assert_eq!(list.cells.len(), 1, "terminal cells get no shadow");
+        // ShaderWallpaper skips a shadow farther than a quarter of the cell.
+        list.draws.clear();
+        list.shadow = Some(TextShadow {
+            x: 3,
+            y: 1,
+            color: 0x123456,
+        });
+        font.draw_char(&mut list, 400, 400, 10, 20, 'A', 0xffffff);
+        assert_eq!(list.draws.len(), 1);
+    }
     #[test]
     fn tiny_and_tall_native_strikes_preserve_their_extreme_columns() {
         for (width, height, size) in [(1u16, 1u16, 64u16), (128, 96, 96)] {

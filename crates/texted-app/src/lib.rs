@@ -14,6 +14,7 @@ pub mod input;
 pub mod preferences;
 pub mod search;
 pub mod selection;
+pub mod visuals;
 
 pub(crate) mod app;
 pub(crate) mod appearance_ui;
@@ -37,6 +38,7 @@ pub(crate) mod raster;
 pub mod runtime;
 pub(crate) mod search_ui;
 pub(crate) mod session;
+pub(crate) mod session_store;
 pub(crate) mod status_ui;
 pub(crate) mod surface;
 pub(crate) mod terminal;

@@ -10,6 +10,8 @@ pub(crate) struct Geometry {
     pub bottom: usize,
     pub columns: usize,
     pub compact: bool,
+    /// Room above and below the document text, in pixels.
+    pub inset: usize,
 }
 #[derive(Debug, PartialEq)]
 pub(crate) enum Hit {
@@ -144,6 +146,18 @@ impl Commands {
                     if context.wrap { "on" } else { "off" }
                 ),
                 I::Find => "Find text (Cmd+F)".into(),
+                I::ToggleIgnoreCase => if context.search.ignore_case {
+                    "Capital letters are ignored. Click to match case"
+                } else {
+                    "Capital letters must match. Click to ignore case"
+                }
+                .into(),
+                I::ToggleWholeWord => if context.search.whole_word {
+                    "Only whole words match. Click to match inside words too"
+                } else {
+                    "Matches inside words count. Click to match whole words only"
+                }
+                .into(),
                 I::Replace => "Find and replace text (Cmd+R)".into(),
                 I::File(F::Close) => "Close this tab; ask to save changed text (Cmd+W)".into(),
                 I::File(F::Quit) => "Quit; check all changed tabs (Cmd+Q)".into(),
@@ -191,6 +205,22 @@ impl Commands {
                 I::Zoom(delta) => (if delta > 0 { "+10%" } else { "-10%" }, true),
                 I::ResetFontSize => ("100%", true),
                 I::SearchClose | I::Cancel => ("Back", true),
+                I::ToggleIgnoreCase => (
+                    if context.search.ignore_case {
+                        "NoCs"
+                    } else {
+                        "Case"
+                    },
+                    true,
+                ),
+                I::ToggleWholeWord => (
+                    if context.search.whole_word {
+                        "Word"
+                    } else {
+                        "Part"
+                    },
+                    true,
+                ),
                 I::ContextMenu => ("Menu", context.editable),
                 I::AcceptDialog => (context.dialog_accept, true),
                 I::CancelDialog => ("Back", true),
@@ -226,7 +256,7 @@ impl Commands {
                     .unwrap_or(6)
             });
         } else if context.search.open {
-            items.sort_by_key(|(i, _)| if matches!(i, 2 | 3 | 9) { 0 } else { 1 });
+            items.sort_by_key(|(i, _)| if matches!(i, 2..=5 | 9) { 0 } else { 1 });
         }
         Self { items, tips }
     }
@@ -250,6 +280,7 @@ impl Geometry {
             bottom,
             columns,
             compact,
+            inset: 0,
         }
     }
     pub fn command_slot(self, x: f32, y: f32) -> Option<usize> {
@@ -270,14 +301,30 @@ impl Geometry {
             h: self.bottom,
         }
     }
+    /// Height above the command row; frames shorter than the row have none.
+    pub fn above_commands(self) -> usize {
+        self.height.saturating_sub(self.bottom)
+    }
+    /// Room above and below the document, in pixels (the Visuals vertical panel inset).
+    pub fn with_inset(mut self, inset: usize) -> Self {
+        self.inset = inset;
+        self
+    }
+    /// Where the first document row is drawn.
+    pub fn document_top(self) -> usize {
+        self.top + self.inset
+    }
     pub fn document_height(self) -> usize {
-        self.height.saturating_sub(self.top + self.bottom).max(1)
+        self.height
+            .saturating_sub(self.top + self.bottom + 2 * self.inset)
+            .max(1)
     }
     pub fn document_point(self, (x, y): (f32, f32)) -> (f32, f32) {
-        (x, y - self.top as f32)
+        (x, y - self.document_top() as f32)
     }
     pub fn in_document(self, y: f32) -> bool {
-        y >= self.top as f32 && y < self.height.saturating_sub(self.bottom) as f32
+        y >= self.document_top() as f32
+            && y < self.height.saturating_sub(self.bottom + self.inset) as f32
     }
     pub fn tab_capacity(self) -> usize {
         (self.width.saturating_sub(84) / if self.compact { 88 } else { 176 }).max(1)
@@ -411,7 +458,7 @@ pub(crate) fn paint(
         return;
     }
     let controls = 0;
-    let y = g.height - g.bottom;
+    let y = g.above_commands();
     for (ordinal, (key, label)) in commands.items.iter().take(g.columns).enumerate() {
         let slot = if g.columns == 12 { *key } else { ordinal };
         let x = controls + slot * g.width.saturating_sub(controls) / g.columns;
@@ -471,6 +518,44 @@ mod tests {
             cursor: (3, 9),
             wrap: true,
         }
+    }
+    #[test]
+    fn search_offers_case_and_whole_word_switches_that_show_their_state() {
+        use texted_app::input::Intent as I;
+        use winit::keyboard::ModifiersState as M;
+        let mut c = context();
+        c.search.open = true;
+        assert!(matches!(
+            command(4, &c, M::empty()),
+            Some(I::ToggleIgnoreCase)
+        ));
+        assert!(matches!(
+            command(5, &c, M::empty()),
+            Some(I::ToggleWholeWord)
+        ));
+        let items = Commands::new(&c, M::empty()).items;
+        assert!(items.contains(&(4, "Case".into())), "{items:?}");
+        assert!(items.contains(&(5, "Part".into())), "{items:?}");
+        c.search.ignore_case = true;
+        c.search.whole_word = true;
+        let items = Commands::new(&c, M::empty()).items;
+        assert!(items.contains(&(4, "NoCs".into())), "{items:?}");
+        assert!(items.contains(&(5, "Word".into())), "{items:?}");
+        c.search.open = false;
+        assert!(matches!(
+            command(4, &c, M::empty()),
+            Some(I::File(texted_app::input::FileIntent::Open))
+        ));
+    }
+    #[test]
+    fn a_vertical_inset_moves_the_document_and_its_pointer_mapping() {
+        let flat = Geometry::new(980, 700, false, true);
+        let inset = flat.with_inset(10);
+        assert_eq!(inset.document_height(), flat.document_height() - 20);
+        let y = (flat.top + 10 + 5) as f32;
+        assert_eq!(inset.document_point((4.0, y)).1, 5.0);
+        assert!(!inset.in_document((flat.top + 5) as f32));
+        assert!(inset.in_document(y));
     }
     #[test]
     fn command_labels_follow_search_appearance_and_modifier_layers() {

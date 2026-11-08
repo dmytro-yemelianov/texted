@@ -53,6 +53,12 @@ pub(crate) struct App {
     pending_open: std::collections::VecDeque<Action>,
     closing: bool,
     quitting: bool,
+    /// Keeps tabs and unsaved text between runs; `None` means quitting asks to save.
+    store: Option<crate::session_store::SessionStore>,
+    /// Quit is waiting for file work to settle before keeping the session.
+    hot_exit: bool,
+    /// The restored session's active tab, selected once every tab has loaded.
+    restore_active: Option<usize>,
     renderer: RenderBackend,
     failed: bool,
     render_failure: Option<String>,
@@ -77,6 +83,9 @@ pub(crate) struct App {
     key_function: Option<usize>,
     mouse_function: Option<usize>,
     command_flash: Option<(usize, Instant)>,
+    /// The effect time last drawn, which holds while unfocused, and when the next frame is due.
+    effect_time: f32,
+    next_effect_frame: Option<Instant>,
     // Destroy the main-thread window last, after the renderer and document state.
     // Worker callbacks must notify `wake`, never capture this native window.
     window: Arc<Host>,
@@ -98,7 +107,7 @@ impl App {
                 .unwrap_or_else(|p| p.into_inner())
                 .send_event(AppEvent::Wake);
         });
-        Self::from_shell(
+        let mut app = Self::from_shell(
             Shell {
                 host: Host::native(window),
                 renderer: RenderBackend::Native(Box::new(renderer)),
@@ -107,7 +116,14 @@ impl App {
                 preferences: preferences::default_path(),
             },
             initial,
-        )
+        );
+        // The session sits beside the preferences, so TEXTED_SETTINGS_PATH isolates both.
+        if let Some(dir) =
+            preferences::default_path().and_then(|p| p.parent().map(|d| d.join("session")))
+        {
+            app.keep_session(dir);
+        }
+        app
     }
     pub(crate) fn from_shell(shell: Shell, initial: Vec<std::path::PathBuf>) -> Self {
         let Shell {
@@ -171,6 +187,9 @@ impl App {
             pending_open,
             closing: false,
             quitting: false,
+            store: None,
+            hot_exit: false,
+            restore_active: None,
             window,
             renderer,
             failed: false,
@@ -196,7 +215,27 @@ impl App {
             key_function: None,
             mouse_function: None,
             command_flash: None,
+            effect_time: 0.0,
+            next_effect_frame: None,
         }
+    }
+    /// Screen effects belong to the window backend; terminals draw the flat picture.
+    fn with_effects(&mut self, mapping: ScreenMapping) -> ScreenMapping {
+        if self.window.is_terminal() {
+            return mapping;
+        }
+        let visuals = self.appearance.settings.visuals();
+        if !visuals.animated() {
+            self.effect_time = visuals.effect_time(0.0);
+        } else if self.focused {
+            self.effect_time =
+                visuals.effect_time(texted_app::visuals::local_seconds_since_midnight());
+        }
+        let pixel = self.font.pixel_px() * mapping.scale().0;
+        let phosphor = texted_app::visuals::Phosphor::for_theme(self.appearance.settings.theme);
+        mapping
+            .with_effects(visuals.effects, self.effect_time, pixel)
+            .with_glass(phosphor, self.appearance.palette.bg)
     }
     fn resolution(&self) -> Option<(u32, u32)> {
         if self.window.is_cells() {
@@ -204,6 +243,89 @@ impl App {
         } else {
             self.appearance.settings.resolution()
         }
+    }
+    /// Restores the last session, and from now on keeps open tabs and unsaved text at
+    /// quit instead of asking to save.
+    pub(crate) fn keep_session(&mut self, dir: std::path::PathBuf) {
+        let store = match crate::session_store::SessionStore::open(dir) {
+            Ok(store) => store,
+            Err(error) => {
+                self.session.message = Some(format!(
+                    "Session not kept ({error}); quitting will ask to save"
+                ));
+                return;
+            }
+        };
+        let restored = match store.load() {
+            Ok(restored) => restored,
+            Err(error) => {
+                // Leave the unreadable session on disk rather than overwrite it at quit.
+                self.session.message = Some(format!(
+                    "The last session could not be read ({error}); quitting will ask to save"
+                ));
+                return;
+            }
+        };
+        let opening_files = !self.pending_open.is_empty() || !self.session.files.idle();
+        let mut active = None;
+        let tabs: Vec<_> = restored
+            .tabs
+            .into_iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.draft.is_some() || tab.path.as_ref().is_some_and(|p| p.exists()))
+            .enumerate()
+            .map(|(kept, (index, tab))| {
+                if index == restored.active {
+                    active = Some(kept);
+                }
+                Action::Restore(tab)
+            })
+            .collect();
+        for action in tabs.into_iter().rev() {
+            self.pending_open.push_front(action);
+        }
+        if !opening_files {
+            self.restore_active = active;
+        }
+        self.store = Some(store);
+    }
+    /// Writes every tab, with unsaved text as drafts, for the next start.
+    fn keep_tabs(&self) -> Result<(), String> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let mut tabs = vec![];
+        let mut active = 0;
+        for index in 0..self.tabs.len() {
+            let tab = if index == self.active {
+                &self.session
+            } else {
+                self.tabs[index]
+                    .as_ref()
+                    .expect("inactive tab owns its session")
+            };
+            let snapshot = tab.buffer.client.latest().snapshot.clone();
+            let documents = &tab.files.documents;
+            let unsaved = documents.dirty(&snapshot);
+            if documents.path.is_none() && !unsaved {
+                continue;
+            }
+            if index == self.active {
+                active = tabs.len();
+            }
+            let (line, column) = snapshot.offset_to_line_col(snapshot.cursor_offset);
+            tabs.push(crate::session_store::TabState {
+                path: documents.path.clone(),
+                draft: unsaved.then(|| snapshot.content.clone()),
+                encoding: documents.encoding,
+                bom: documents.bom,
+                ending: documents.ending,
+                line,
+                column,
+                disk: documents.disk(),
+            });
+        }
+        store.save(&tabs, active)
     }
     pub(crate) fn render_failure(&self) -> Option<&str> {
         self.render_failure.as_deref()
@@ -225,6 +347,11 @@ impl App {
     }
     pub(crate) fn notice(&mut self, message: &str) {
         self.report(Err(message.into()));
+    }
+    /// Another program may have changed the file while Texted was in the background.
+    pub(crate) fn focus_gained(&mut self) {
+        self.session.files.check_disk();
+        self.window.request_redraw();
     }
     pub(crate) fn resized(&mut self) {
         self.renderer.invalidate();
@@ -277,7 +404,7 @@ impl App {
         }
     }
     fn appearance_height(&self) -> usize {
-        self.display.source.1 as usize - self.geometry().bottom
+        self.geometry().above_commands()
     }
     fn panel_context(&self) -> crate::chrome::Context {
         let p = self.session.buffer.client.latest();
@@ -286,6 +413,8 @@ impl App {
                 open: self.session.search.state.mode != SearchBarMode::Closed,
                 replace: self.session.search.state.mode == SearchBarMode::Replace,
                 replacement_field: self.session.search.state.active_field == 1,
+                ignore_case: self.session.search.state.options.ignore_case,
+                whole_word: self.session.search.state.options.whole_word,
             },
             appearance: self.appearance.open,
             dialog: self.dialogs.open(),
@@ -378,6 +507,19 @@ impl App {
             self.display.pixelated,
             self.commands,
         )
+        .with_inset(self.chrome_insets().1)
+    }
+    /// ShaderWallpaper's panel inset around the document text, in scene pixels; terminals have none.
+    fn chrome_insets(&self) -> (f32, usize) {
+        if self.window.is_terminal() {
+            return (0.0, 0);
+        }
+        let visuals = self.appearance.settings.visuals();
+        let pixel = self.font.pixel_px();
+        (
+            f32::from(visuals.inset_x) * pixel,
+            (f32::from(visuals.inset_y) * pixel).round() as usize,
+        )
     }
     fn document_size(&self) -> (u32, u32) {
         (
@@ -415,6 +557,7 @@ impl App {
         self.tabs[self.active] = Some(old);
         self.active = index;
         self.reset_transient();
+        self.session.files.check_disk();
         true
     }
     fn file_action(&mut self, action: Action) {
@@ -503,12 +646,25 @@ impl App {
         self.appearance_changed(before);
         match self.session.files.enqueue(Action::Close) {
             Ok(()) => self.closing = true,
-            Err(error) => self.report(Err(error)),
+            Err(error) => {
+                self.report(Err(error));
+                self.abort_quit();
+            }
         }
+    }
+    fn abort_quit(&mut self) {
+        self.quitting = false;
+        crate::native_macos::cancel_terminate();
     }
     fn begin_quit(&mut self) {
         if self.session.files.locked() {
             crate::documents::reveal_for_dialog(&self.window);
+        }
+        if self.store.is_some() {
+            // Unsaved tabs are kept for the next start instead of asking now.
+            self.hot_exit = true;
+            self.pending_open.clear();
+            return;
         }
         self.quitting = true;
         self.begin_close();
@@ -548,20 +704,30 @@ impl App {
             || self.appearance.open
             || self.dialogs.open()
     }
-    pub fn event(&mut self, event: Event<AppEvent>, target: &EventLoopWindowTarget<AppEvent>) {
+    /// Returns true once the last tab has closed and the app should end.
+    pub fn event(
+        &mut self,
+        event: Event<AppEvent>,
+        target: &EventLoopWindowTarget<AppEvent>,
+    ) -> bool {
+        let effect_frame = self.next_effect_frame;
         target.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now()
-                + Duration::from_millis(
-                    if self.command_flash.is_some()
-                        || self.panel_help.pending_tip()
-                        || self.session.buffer.client.latest().busy.is_some()
-                        || self.session.search.state.pending
-                        || self.session.transfers.busy()
-                    {
-                        16
-                    } else {
-                        500
-                    },
+            effect_frame
+                .map_or(Instant::now() + Duration::from_secs(1), |at| at)
+                .min(
+                    Instant::now()
+                        + Duration::from_millis(
+                            if self.command_flash.is_some()
+                                || self.panel_help.pending_tip()
+                                || self.session.buffer.client.latest().busy.is_some()
+                                || self.session.search.state.pending
+                                || self.session.transfers.busy()
+                            {
+                                16
+                            } else {
+                                500
+                            },
+                        ),
                 ),
         ));
         match event {
@@ -577,13 +743,10 @@ impl App {
             {
                 self.window_event(event)
             }
-            Event::AboutToWait => {
-                if self.tick() {
-                    target.exit();
-                }
-            }
+            Event::AboutToWait => return self.tick(),
             _ => {}
         }
+        false
     }
     // Native event routing stays small; each branch delegates editing, geometry or file work.
     fn window_event(&mut self, event: WindowEvent) {
@@ -599,6 +762,9 @@ impl App {
                     self.command_hover = None;
                 }
                 self.focused = focused;
+                if focused {
+                    self.focus_gained();
+                }
                 self.update_cursor();
                 self.window.request_redraw();
             }
@@ -717,6 +883,8 @@ impl App {
             open: state.mode != SearchBarMode::Closed,
             replace: state.mode == SearchBarMode::Replace,
             replacement_field: state.active_field == 1,
+            ignore_case: state.options.ignore_case,
+            whole_word: state.options.whole_word,
         };
         if self.popup.is_some() {
             let state = self.menu_state();
@@ -958,7 +1126,7 @@ impl App {
                 let before = self.appearance.settings.clone();
                 match intent {
                     Intent::AcceptAppearance => self.appearance.accept_and_close(),
-                    Intent::ResetAppearance => self.appearance.reset_defaults(),
+                    Intent::ResetAppearance => self.appearance.reset(),
                     Intent::BrowseAppearance { forward } => self.appearance.browse(
                         forward,
                         self.display.source.0 as usize,
@@ -1063,6 +1231,10 @@ impl App {
         let snap = self.session.buffer.client.latest().snapshot.clone();
         if let Some(result) = self.session.search.handle(&intent, snap) {
             self.report(result);
+            if let Some((line, col)) = self.session.search.jump.take() {
+                let caret = texted_app::selection::SelectionState::caret(line, col);
+                self.edit(EditorCommand::SetSelection(caret), true);
+            }
             return;
         }
         match intent {
@@ -1089,6 +1261,7 @@ impl App {
                         Command::Replace {
                             query: self.session.search.state.find_query.clone(),
                             replacement: self.session.search.state.replace_query.clone(),
+                            options: self.session.search.state.options,
                             all,
                         },
                     );
@@ -1423,6 +1596,15 @@ impl App {
             match action {
                 Action::Close => self.panel_help.dismiss(),
                 Action::Wrap => self.intent(Intent::ToggleWrap),
+                Action::Encoding => self.session.files.documents.next_save_format(),
+                Action::Reread => {
+                    let documents = &self.session.files.documents;
+                    if documents.path.is_some() {
+                        let reopen = crate::documents::Action::Reopen(documents.reread_target());
+                        let result = self.session.files.enqueue(reopen);
+                        self.report(result);
+                    }
+                }
                 Action::Consumed => {}
             }
             self.window.request_redraw();
@@ -1482,6 +1664,13 @@ impl App {
         );
     }
     pub(crate) fn tick(&mut self) -> bool {
+        if self
+            .next_effect_frame
+            .is_some_and(|at| at <= Instant::now())
+        {
+            self.next_effect_frame = None;
+            self.window.request_redraw();
+        }
         self.poll_dialogs();
         if let Some(result) = self.preferences.as_mut().and_then(Preferences::poll) {
             match result {
@@ -1511,6 +1700,10 @@ impl App {
         {
             Ok(true) => {
                 if self.tabs.len() == 1 {
+                    // The last tab was closed on purpose, so the next start begins empty.
+                    if let Some(store) = &self.store {
+                        let _ = store.save(&[], 0);
+                    }
                     return true;
                 }
                 self.remove_active();
@@ -1522,13 +1715,31 @@ impl App {
             Err(error) => self.session.message = Some(error),
             _ => {}
         }
+        if let Some(notice) = self.session.files.notice.take() {
+            self.session.message = Some(notice);
+        }
         if self.closing && self.session.files.idle() {
             self.closing = false;
-            self.quitting = false; // A cancelled sheet/save aborts the quit sequence.
+            self.abort_quit(); // A cancelled sheet/save aborts the quit sequence.
         }
-        if !self.closing && !self.quitting && self.session.settled() {
+        if self.hot_exit && self.session.settled() {
+            self.hot_exit = false;
+            match self.keep_tabs() {
+                Ok(()) => return true,
+                Err(error) => {
+                    self.store = None;
+                    self.report(Err(format!(
+                        "Could not keep the session ({error}); asking to save instead"
+                    )));
+                    self.begin_quit();
+                }
+            }
+        }
+        if !self.closing && !self.quitting && !self.hot_exit && self.session.settled() {
             if let Some(action) = self.pending_open.pop_front() {
                 self.open_tab(action);
+            } else if let Some(index) = self.restore_active.take() {
+                self.switch_tab(index);
             }
         }
         if self.session.files.reset {
@@ -1630,14 +1841,20 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        let display = ScreenMapping::new((size.width, size.height), self.resolution());
+        let display = self.with_effects(ScreenMapping::new(
+            (size.width, size.height),
+            self.resolution(),
+        ));
         let (width, scene_height) = display.source;
+        let (text_inset, document_inset) = self.chrome_insets();
         let geometry = crate::chrome::Geometry::new(
             width as usize,
             scene_height as usize,
             display.pixelated,
             self.commands,
-        );
+        )
+        .with_inset(document_inset);
+        self.session.viewport.text_inset = text_inset;
         let height = geometry.document_height() as u32;
         let start = Instant::now();
         let p = self.session.buffer.client.latest();
@@ -1653,6 +1870,22 @@ impl App {
             .search
             .state
             .set_view(&p.snapshot, &frame.layout);
+        let visuals = self.appearance.settings.visuals();
+        let window = !self.window.is_terminal();
+        self.draws.shadow = (visuals.shadow && window).then_some(crate::graphics::TextShadow {
+            x: visuals.shadow_x,
+            y: visuals.shadow_y,
+            color: self.appearance.palette.shadow,
+        });
+        // Tiles use the interface font's pixel, as the wallpaper draws them from its font.
+        self.draws.frame = match visuals.border {
+            texted_app::visuals::Border::Lines => None,
+            border => window.then_some(crate::graphics::Frame {
+                double: border == texted_app::visuals::Border::Double,
+                pixel: self.ui_font.pixel_px(),
+                corner_inset: visuals.corner_inset,
+            }),
+        };
         editor_view::paint(
             &mut self.draws,
             &mut self.font,
@@ -1683,7 +1916,7 @@ impl App {
                 layout_time: frame.layout_time,
             },
         );
-        self.draws.translate(0.0, geometry.top as f32);
+        self.draws.translate(0.0, geometry.document_top() as f32);
         let labels: Vec<_> = self
             .tabs
             .iter()
@@ -1726,7 +1959,14 @@ impl App {
                 cur_line: frame.cur_line,
                 cur_col: frame.cur_col,
                 word_wrap: self.session.viewport.wrap,
-                bom: self.session.files.documents.bom,
+                format: self.session.files.documents.format_name(),
+                reread: self
+                    .session
+                    .files
+                    .documents
+                    .path
+                    .as_ref()
+                    .map(|_| self.session.files.documents.reread_target().name()),
                 ending: self.session.files.documents.ending,
             },
         );
@@ -1734,7 +1974,7 @@ impl App {
             &mut self.draws,
             &mut self.ui_font,
             width as usize,
-            scene_height as usize - geometry.bottom,
+            geometry.above_commands(),
             display.pixelated,
         );
         let state = self.menu_state();
@@ -1742,7 +1982,7 @@ impl App {
             popup.paint(
                 &mut self.draws,
                 &mut self.ui_font,
-                (width as usize, scene_height as usize - geometry.bottom),
+                (width as usize, geometry.above_commands()),
                 display.pixelated,
                 state,
                 self.appearance.palette,
@@ -1751,7 +1991,7 @@ impl App {
         self.dialogs.paint(
             &mut self.draws,
             &mut self.ui_font,
-            (width as usize, scene_height as usize - geometry.bottom),
+            (width as usize, geometry.above_commands()),
             display.pixelated,
             &self.appearance.palette,
         );
@@ -1779,6 +2019,12 @@ impl App {
                     .geometry()
                     .document_point(self.display.to_source_clamped(self.pointer_physical));
                 self.update_cursor();
+                // Moving effects advance at the Visuals frame rate while the window is in use.
+                let visuals = self.appearance.settings.visuals();
+                self.next_effect_frame = (visuals.animated()
+                    && self.focused
+                    && !self.window.is_terminal())
+                .then(|| Instant::now() + Duration::from_secs_f64(1.0 / f64::from(visuals.fps)));
             }
             Ok(false) => self.window.request_redraw(),
             Err(error) => {

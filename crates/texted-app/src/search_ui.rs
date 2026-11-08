@@ -8,12 +8,15 @@ use texted_buffer::BufferSnapshot;
 pub(crate) struct SearchUi {
     pub state: SearchState,
     serial: u64,
+    /// A `:line[:column]` target the app moves the caret to, zero-based.
+    pub jump: Option<(usize, usize)>,
 }
 impl SearchUi {
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             state: SearchState::new(wake),
             serial: 0,
+            jump: None,
         }
     }
     pub fn stamp(&self) -> Option<FieldStamp> {
@@ -71,7 +74,22 @@ impl SearchUi {
     }
     pub fn handle(&mut self, intent: &Intent, snap: BufferSnapshot) -> Option<Result<(), String>> {
         match intent {
+            Intent::GoToLine => {
+                self.state.mode = SearchBarMode::Find;
+                self.state.goto = true;
+                self.state.find_query = ":".into();
+                self.focus(0);
+                self.state.submit(snap);
+            }
+            Intent::NextMatch { .. } if self.state.goto => {
+                if let Some(target) = self.state.line_target() {
+                    self.jump = Some(target);
+                    self.state.close();
+                    self.serial += 1;
+                }
+            }
             Intent::Find | Intent::Replace => {
+                self.state.goto = false;
                 self.state.mode = if matches!(intent, Intent::Find) {
                     SearchBarMode::Find
                 } else {
@@ -81,6 +99,15 @@ impl SearchUi {
                 self.state.navigate(snap, true);
             }
             Intent::NextMatch { forward } => self.state.navigate(snap, *forward),
+            Intent::ToggleIgnoreCase | Intent::ToggleWholeWord => {
+                let mut options = self.state.options;
+                if matches!(intent, Intent::ToggleIgnoreCase) {
+                    options.ignore_case = !options.ignore_case;
+                } else {
+                    options.whole_word = !options.whole_word;
+                }
+                self.state.set_options(options, snap);
+            }
             Intent::SearchText(text) => return Some(self.append(text, snap)),
             Intent::SearchBackspace => {
                 if self.state.active_field == 0 {
