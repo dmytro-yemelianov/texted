@@ -1,9 +1,22 @@
 import plistlib
 import unittest
+import tempfile
+import shutil
+from pathlib import Path
 import package_macos
 
 
 class PackagingTests(unittest.TestCase):
+    def test_packages_require_fonts_sources_and_attribution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            resources = Path(directory)
+            shutil.copytree(package_macos.ROOT / "assets/fonts", resources / "fonts")
+            package_macos.verify_font_resources(resources)
+            notice = resources / "fonts/NOTICE.md"
+            notice.unlink()
+            with self.assertRaisesRegex(ValueError, "NOTICE.md"):
+                package_macos.verify_font_resources(resources)
+
     def test_tag_must_match_full_cargo_version(self):
         package_macos.validate_tag("0.1.0", "v0.1.0")
         package_macos.validate_tag("0.1.0-preview.1", "v0.1.0-preview.1")

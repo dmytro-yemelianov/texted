@@ -1,0 +1,51 @@
+{
+  "nasinnia_commit": "fdd545febf4a23048b4d5927c1f70fd649c845c8",
+  "oldschool_archive_sha256": "21b3c0a3770ef0afc46564760613d7b078f4fcc9ed93db4b829a440b68822e08",
+  "fonts": [
+    {
+      "id": "bios_8x8",
+      "file": "sources/BmPlus_IBM_BIOS.otb",
+      "width": 8,
+      "height": 8,
+      "baseline": 7,
+      "sha256": "b206520d2168584c20af52166305d2ed59da0a9c25c86380eeb042a20a5c1006",
+      "license": "CC-BY-SA-4.0"
+    },
+    {
+      "id": "ega_8x14",
+      "file": "sources/BmPlus_IBM_EGA_8x14.otb",
+      "width": 8,
+      "height": 14,
+      "baseline": 11,
+      "sha256": "a6e7954db580d0adb054d7497098021e638df4fdf7738251f4e371d95c635a7e",
+      "license": "CC-BY-SA-4.0"
+    },
+    {
+      "id": "vga_8x16",
+      "file": "sources/BmPlus_IBM_VGA_8x16.otb",
+      "width": 8,
+      "height": 16,
+      "baseline": 12,
+      "sha256": "c0dd65b2a3cf60f018b185b608d95f460278f39ed2362c5db9809680cc886f8e",
+      "license": "CC-BY-SA-4.0"
+    },
+    {
+      "id": "spleen_6x12",
+      "file": "sources/spleen-6x12.json",
+      "width": 6,
+      "height": 12,
+      "baseline": 9,
+      "sha256": "14e1242f5140bf03ee38f50f8ddfafae29c338e41bdc416b6548e8670eb00107",
+      "license": "BSD-2-Clause"
+    },
+    {
+      "id": "spleen_8x16",
+      "file": "sources/spleen-8x16.json",
+      "width": 8,
+      "height": 16,
+      "baseline": 12,
+      "sha256": "433d7d51ffeb0cc9bb610a0008b1e4498a586b7c35e33239cb2ab4c418cccb3e",
+      "license": "BSD-2-Clause"
+    }
+  ]
+}

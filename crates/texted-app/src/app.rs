@@ -78,10 +78,7 @@ impl App {
         }
         let path = preferences::default_path();
         let (settings,warning)=match path.as_deref().map(preferences::load) {Some(Ok(settings))=>(settings,None),Some(Err(error))=>(Appearance::default(),Some(format!("Appearance preferences could not be loaded: {error}. Changes apply for this session."))),None=>(Appearance::default(),Some("Appearance preferences path is unavailable; changes apply for this session.".into()))};
-        let mut appearance = AppearanceUi::new(
-            settings,
-            texted_app::appearance::FontFamily::ALL.map(FontEngine::available),
-        );
+        let mut appearance = AppearanceUi::new(settings);
         let w = window.clone();
         let preferences = if warning.is_none() {
             path.map(|path| Preferences::new(path, move || w.request_redraw()))
@@ -122,12 +119,12 @@ impl App {
     fn chrome_font(pixelated: bool) -> FontEngine {
         if pixelated {
             FontEngine::with_typography(Typography {
-                family: FontFamily::Pixel,
+                family: FontFamily::Bios,
                 size_px: 8,
                 line_spacing: 100,
             })
         } else {
-            FontEngine::new(18.0)
+            FontEngine::new(16.0)
         }
     }
     fn report(&mut self, result: Result<(), String>) {

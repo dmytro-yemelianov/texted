@@ -28,6 +28,14 @@ The `feat/native-menus` branch adds macOS application menus (Texted, File, Edit,
 
 `feat/aspect-fit-scaling` builds on the dropdown branch and removes whole-number scale quantization. Every fixed framebuffer fills one physical window dimension while retaining the original aspect ratio (rounded by less than one pixel on the other dimension). The shared mapping still governs rendering, pointer/drag input, wheel deltas and context-menu placement. Source resolution stays fixed; only presentation changes during resize. The Metal readback case now checks a 3×3 source at a non-integer 32/3 scale, including exact texels and black letterboxing. Validation passed 112 Rust tests, Clippy, formatting and both explicit Metal checks. Native preview confirmed the VGA canvas fills the window height with only aspect-ratio side bars, follows Zoom/restore resizing and retains correct Style-button hit testing.
 
+## Ukrainian bitmap fonts
+
+`feat/ukrainian-bitmap-fonts` builds on aspect-fit scaling. All custom UI and editor text now use bundled native bitmap strikes: IBM BIOS 8×8, EGA 8×14, VGA 8×16, Spleen 6×12 and Spleen 8×16. System-font loading, outline rasterization, thresholded Unicode fallback, `ab_glyph` and `font8x8` are removed. Native defaults to VGA 16 px; fixed framebuffers default to BIOS 8 px. Sizes are whole multiples of the selected native height, bounded by 64 px. Version-1 system-font family values migrate through serde aliases; native/framebuffer settings stay independent. Missing scalars show a visible box.
+
+`bitmap_fonts.rs` exposes sorted, embedded native masks. `assets/fonts` includes unchanged pinned OTB/JSON sources, original-row checksums, glyph-level modification records and full licenses. Existing glyphs remain unchanged. IBM Unicode Plus sources already cover Ukrainian; Spleen adds Є/є from mirrored native Э/э, and missing punctuation/currency uses each face's existing strokes. See the [catalog review and pixel sheets](docs/bitmap-font-review.md). The related local Nasinnia and pixel-ssh checkouts were read without changes. Optional offline regeneration needs `fonttools==4.60.2`; runtime and ordinary CI do not. Packages include and verify the complete font source/license tree.
+
+Validation passed 114 Rust tests, four Python asset/packaging tests, Clippy, formatting, reproducible asset regeneration and both explicit Metal tests. Readback checks now reject intermediate font edge colors. Native acceptance covered the five-face list, VGA/Spleen Ukrainian rendering, BIOS in a 256×192 framebuffer, restart persistence and a byte-identical saved UTF-8 fixture. Use the separate `target/ukrainian-fonts-preview/Texted Ukrainian Fonts.app` and settings for further GUI checks; older running previews may contain user work. No release tag is created.
+
 ## Component map
 
 | Component | Owner / invariant |
@@ -43,7 +51,7 @@ The `feat/native-menus` branch adds macOS application menus (Texted, File, Edit,
 | `documents.rs`, `file_flow.rs` | Native async sheets, background file I/O, saved-root dirty state, command/clipboard barriers |
 | `viewport.rs`, `texted-layout` | Visible geometry, scrolling, caret, compact search coverage and pure highlight clipping |
 | `framebuffer.rs`, `presentation.rs` | Fixed source canvases, bounded GPU targets and matching presentation/input transforms |
-| `editor_view.rs`, `graphics.rs`, `gpu.rs` | Immutable drawing-command preparation, bounded glyph caches, ordered Metal submission |
+| `bitmap_fonts.rs`, `graphics.rs`, `editor_view.rs`, `gpu.rs` | Embedded native bitmap masks, integer pixel scaling, immutable drawing preparation, bounded caches and ordered Metal submission |
 | `texted-buffer` | Persistent rope, byte-safe coordinates/history, resumable scanner, streaming replacement planner, local word traversal |
 | `texted-io` | Streaming UTF-8/BOM/CRLF load and atomic save |
 | `texted-kernel` | Reusable request/reply primitives retained for tests/benchmarks; not the GUI transport |
