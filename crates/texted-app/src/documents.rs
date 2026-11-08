@@ -23,12 +23,25 @@ pub enum Action {
     Close,
     /// Rereads the current file in another encoding, asking first if it has changes.
     Reopen(TextEncoding),
+    /// Brings back a tab from the last session, with its unsaved text if it had any.
+    Restore(crate::session_store::RestoredTab),
+}
+/// Where the caret goes once a document is installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Caret {
+    Start,
+    /// The same file reread after another program changed it.
+    Keep,
+    At(usize, usize),
 }
 pub enum Effect {
     None,
-    Install(LoadedDocument),
-    /// The same file reread after another program changed it; keep the caret's place.
-    Refresh(LoadedDocument),
+    Install {
+        document: LoadedDocument,
+        caret: Caret,
+        /// Unsaved text restored from the last session.
+        draft: bool,
+    },
     /// A message for the status line that needs no answer.
     Notice(String),
     Close,
@@ -60,7 +73,8 @@ enum Job {
     Save(mpsc::Receiver<Result<Saved, SaveFailure>>),
     Load {
         receive: mpsc::Receiver<Result<LoadedDocument, String>>,
-        refresh: bool,
+        caret: Caret,
+        draft: bool,
     },
     Check(mpsc::Receiver<std::io::Result<DiskStamp>>),
     Conflict {
@@ -202,6 +216,13 @@ impl Documents {
             }
         )
     }
+    pub fn disk(&self) -> Option<DiskStamp> {
+        self.disk
+    }
+    /// A draft restored from the last session differs from its file until it is saved.
+    pub fn mark_unsaved(&mut self) {
+        self.saved_text = Rope::new();
+    }
     pub fn installed(&mut self, document: &LoadedDocument) {
         self.path = document.path.clone();
         self.bom = document.has_bom;
@@ -258,15 +279,19 @@ impl Documents {
     fn proceed(&mut self, action: Action) -> Effect {
         match action {
             Action::Close => Effect::Close,
-            Action::New => Effect::Install(LoadedDocument {
-                content: Rope::new(),
-                path: None,
-                has_bom: false,
-                line_ending: LineEnding::Lf,
-                encoding: TextEncoding::Utf8,
-                byte_size: 0,
-                disk: None,
-            }),
+            Action::New => Effect::Install {
+                document: LoadedDocument {
+                    content: Rope::new(),
+                    path: None,
+                    has_bom: false,
+                    line_ending: LineEnding::Lf,
+                    encoding: TextEncoding::Utf8,
+                    byte_size: 0,
+                    disk: None,
+                },
+                caret: Caret::Start,
+                draft: false,
+            },
             Action::OpenDialog => {
                 let directory = self
                     .path
@@ -286,30 +311,68 @@ impl Documents {
                 Effect::None
             }
             Action::OpenPath(path) => {
-                self.open(path, None, false);
+                self.open(path, None, Caret::Start);
                 Effect::None
             }
             Action::Reopen(encoding) => {
                 match self.path.clone() {
-                    Some(path) => self.open(path, Some(encoding), false),
+                    Some(path) => self.open(path, Some(encoding), Caret::Start),
                     None => self.error("Save the document before reading it in another encoding"),
+                }
+                Effect::None
+            }
+            Action::Restore(tab) => {
+                let caret = Caret::At(tab.line, tab.column);
+                match (tab.draft.clone(), tab.path.clone()) {
+                    (Some(draft), _) => self.load(caret, true, move || {
+                        // Drafts hold the editor's own text, so they are read without any conversion.
+                        let content = std::fs::File::open(&draft)
+                            .and_then(|f| Rope::from_reader(std::io::BufReader::new(f)))
+                            .map_err(|e| {
+                                format!(
+                                    "Could not restore unsaved text from {}: {e}",
+                                    draft.display()
+                                )
+                            })?;
+                        Ok(LoadedDocument {
+                            byte_size: content.len_bytes(),
+                            content,
+                            path: tab.path,
+                            line_ending: tab.ending,
+                            has_bom: tab.bom,
+                            encoding: tab.encoding,
+                            disk: tab.disk,
+                        })
+                    }),
+                    (None, Some(path)) => self.open(path, None, caret),
+                    (None, None) => {}
                 }
                 Effect::None
             }
             Action::Save { .. } | Action::ReportError(_) => unreachable!(),
         }
     }
-    fn open(&mut self, path: PathBuf, encoding: Option<TextEncoding>, refresh: bool) {
+    fn open(&mut self, path: PathBuf, encoding: Option<TextEncoding>, caret: Caret) {
+        self.load(caret, false, move || {
+            IoManager::open_file_as(&path, encoding)
+                .map_err(|e| format!("Could not open {}: {e}", path.display()))
+        });
+    }
+    fn load(
+        &mut self,
+        caret: Caret,
+        draft: bool,
+        work: impl FnOnce() -> Result<LoadedDocument, String> + Send + 'static,
+    ) {
         let (tx, rx) = mpsc::channel();
         self.job = Some(Job::Load {
             receive: rx,
-            refresh,
+            caret,
+            draft,
         });
         let wake = self.wake.clone();
         thread::spawn(move || {
-            let result = IoManager::open_file_as(&path, encoding)
-                .map_err(|e| format!("Could not open {}: {e}", path.display()));
-            let _ = tx.send(result);
+            let _ = tx.send(work());
             wake();
         });
     }
@@ -383,7 +446,7 @@ impl Documents {
             return Effect::None;
         }
         if let (Some(_), Some(path), false) = (now, self.path.clone(), self.dirty(snapshot)) {
-            self.open(path, Some(self.encoding), true);
+            self.open(path, Some(self.encoding), Caret::Keep);
             return Effect::None;
         }
         self.warned = Some(now);
@@ -430,15 +493,28 @@ impl Documents {
                         return Effect::None;
                     }
                 },
-                Job::Load { receive, refresh } => match receive.try_recv() {
-                    Ok(Ok(document)) if refresh => return Effect::Refresh(document),
-                    Ok(Ok(document)) => return Effect::Install(document),
+                Job::Load {
+                    receive,
+                    caret,
+                    draft,
+                } => match receive.try_recv() {
+                    Ok(Ok(document)) => {
+                        return Effect::Install {
+                            document,
+                            caret,
+                            draft,
+                        }
+                    }
                     Ok(Err(error)) => {
                         self.error(&error);
                         return Effect::None;
                     }
                     Err(mpsc::TryRecvError::Empty) => {
-                        self.job = Some(Job::Load { receive, refresh });
+                        self.job = Some(Job::Load {
+                            receive,
+                            caret,
+                            draft,
+                        });
                         return Effect::None;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -465,7 +541,7 @@ impl Documents {
                 },
                 Job::ChooseOpen(ticket) => match ticket.poll() {
                     Some(Answer::Path(path)) => {
-                        self.open(path, None, false);
+                        self.open(path, None, Caret::Start);
                         return Effect::None;
                     }
                     Some(_) => {}
@@ -512,7 +588,7 @@ impl Documents {
                         return Effect::None;
                     }
                     Some(Answer::Discard) => {
-                        self.open(path, Some(self.encoding), true);
+                        self.open(path, Some(self.encoding), Caret::Keep);
                         return Effect::None;
                     }
                     Some(_) => self.next = None,
@@ -630,7 +706,7 @@ mod tests {
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let document = loop {
-            if let Effect::Install(document) = doc.poll(&snap, &service.client) {
+            if let Effect::Install { document, .. } = doc.poll(&snap, &service.client) {
                 break document;
             }
             assert!(
@@ -708,7 +784,11 @@ mod tests {
         doc.check_disk();
         let effects = effects_until_idle(&mut doc, &snap, &service.client);
         assert!(
-            matches!(&effects[..], [Effect::Refresh(d)] if d.content == "one\ntwo\nthree\n"),
+            matches!(
+                &effects[..],
+                [Effect::Install { document, caret: Caret::Keep, draft: false }]
+                    if document.content == "one\ntwo\nthree\n"
+            ),
             "{} effects",
             effects.len()
         );

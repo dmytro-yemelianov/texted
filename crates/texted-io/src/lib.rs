@@ -200,6 +200,23 @@ impl DiskStamp {
     pub fn of<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Ok(Self::from_metadata(&fs::metadata(path)?))
     }
+    /// Plain parts for keeping a stamp between runs: modification time since the Unix
+    /// epoch as seconds and nanoseconds, length and inode.
+    pub fn to_parts(self) -> (Option<(u64, u32)>, u64, u64) {
+        let modified = self
+            .modified
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs(), d.subsec_nanos()));
+        (modified, self.len, self.inode)
+    }
+    pub fn from_parts(modified: Option<(u64, u32)>, len: u64, inode: u64) -> Self {
+        Self {
+            modified: modified
+                .map(|(secs, nanos)| std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos)),
+            len,
+            inode,
+        }
+    }
     fn from_metadata(meta: &fs::Metadata) -> Self {
         #[cfg(unix)]
         let inode = std::os::unix::fs::MetadataExt::ino(meta);
@@ -679,6 +696,16 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(&path, "fresh").unwrap();
         assert_ne!(doc.disk, Some(DiskStamp::of(&path).unwrap()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn disk_stamp_survives_being_stored_as_parts() {
+        let dir = scratch("parts");
+        let path = dir.join("doc.txt");
+        fs::write(&path, "text").unwrap();
+        let stamp = DiskStamp::of(&path).unwrap();
+        let (modified, len, inode) = stamp.to_parts();
+        assert_eq!(DiskStamp::from_parts(modified, len, inode), stamp);
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

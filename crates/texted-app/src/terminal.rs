@@ -607,6 +607,58 @@ mod tests {
         app.tick();
     }
     #[test]
+    fn quitting_keeps_unsaved_tabs_and_the_next_start_restores_them() {
+        let dir = std::env::temp_dir().join(format!("texted-hot-exit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let store = dir.join("session");
+        {
+            let (_, mut app) = application(100, 30, vec![path.clone()], None, None);
+            app.keep_session(store.clone());
+            settle(&mut app);
+            press(&mut app, NamedKey::ArrowDown);
+            settle(&mut app);
+            app.paste_text("mine ".into());
+            settle(&mut app);
+            press(&mut app, NamedKey::F6);
+            settle(&mut app);
+            app.paste_text("draft".into());
+            settle(&mut app);
+            let quit = Key::Character("q".into());
+            app.key(&KeyInput {
+                physical: PhysicalKey::Code(KeyCode::KeyQ),
+                logical: &quit,
+                text: None,
+                modifiers: ModifiersState::SUPER,
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !app.tick() {
+                assert!(Instant::now() < deadline, "quit waited for an answer");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        let (_, mut app) = application(100, 30, vec![], None, None);
+        app.keep_session(store);
+        settle(&mut app);
+        app.redraw();
+        let text = app.rendered_grid().unwrap().text();
+        assert!(text.contains("notes.txt *"), "{text}");
+        assert!(text.contains("Untitled *"), "{text}");
+        assert!(text.contains("draft"), "{text}");
+        press(&mut app, NamedKey::F7);
+        settle(&mut app);
+        press(&mut app, NamedKey::F12);
+        app.tick();
+        app.redraw();
+        let text = app.rendered_grid().unwrap().text();
+        assert!(text.contains("mine two"), "{text}");
+        assert!(text.contains("Line 2"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn regaining_focus_reloads_a_file_changed_elsewhere_and_keeps_the_caret_line() {
         let dir = std::env::temp_dir().join(format!("texted-focus-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -53,6 +53,12 @@ pub(crate) struct App {
     pending_open: std::collections::VecDeque<Action>,
     closing: bool,
     quitting: bool,
+    /// Keeps tabs and unsaved text between runs; `None` means quitting asks to save.
+    store: Option<crate::session_store::SessionStore>,
+    /// Quit is waiting for file work to settle before keeping the session.
+    hot_exit: bool,
+    /// The restored session's active tab, selected once every tab has loaded.
+    restore_active: Option<usize>,
     renderer: RenderBackend,
     failed: bool,
     render_failure: Option<String>,
@@ -98,7 +104,7 @@ impl App {
                 .unwrap_or_else(|p| p.into_inner())
                 .send_event(AppEvent::Wake);
         });
-        Self::from_shell(
+        let mut app = Self::from_shell(
             Shell {
                 host: Host::native(window),
                 renderer: RenderBackend::Native(Box::new(renderer)),
@@ -107,7 +113,14 @@ impl App {
                 preferences: preferences::default_path(),
             },
             initial,
-        )
+        );
+        // The session sits beside the preferences, so TEXTED_SETTINGS_PATH isolates both.
+        if let Some(dir) =
+            preferences::default_path().and_then(|p| p.parent().map(|d| d.join("session")))
+        {
+            app.keep_session(dir);
+        }
+        app
     }
     pub(crate) fn from_shell(shell: Shell, initial: Vec<std::path::PathBuf>) -> Self {
         let Shell {
@@ -171,6 +184,9 @@ impl App {
             pending_open,
             closing: false,
             quitting: false,
+            store: None,
+            hot_exit: false,
+            restore_active: None,
             window,
             renderer,
             failed: false,
@@ -204,6 +220,89 @@ impl App {
         } else {
             self.appearance.settings.resolution()
         }
+    }
+    /// Restores the last session, and from now on keeps open tabs and unsaved text at
+    /// quit instead of asking to save.
+    pub(crate) fn keep_session(&mut self, dir: std::path::PathBuf) {
+        let store = match crate::session_store::SessionStore::open(dir) {
+            Ok(store) => store,
+            Err(error) => {
+                self.session.message = Some(format!(
+                    "Session not kept ({error}); quitting will ask to save"
+                ));
+                return;
+            }
+        };
+        let restored = match store.load() {
+            Ok(restored) => restored,
+            Err(error) => {
+                // Leave the unreadable session on disk rather than overwrite it at quit.
+                self.session.message = Some(format!(
+                    "The last session could not be read ({error}); quitting will ask to save"
+                ));
+                return;
+            }
+        };
+        let opening_files = !self.pending_open.is_empty() || !self.session.files.idle();
+        let mut active = None;
+        let tabs: Vec<_> = restored
+            .tabs
+            .into_iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.draft.is_some() || tab.path.as_ref().is_some_and(|p| p.exists()))
+            .enumerate()
+            .map(|(kept, (index, tab))| {
+                if index == restored.active {
+                    active = Some(kept);
+                }
+                Action::Restore(tab)
+            })
+            .collect();
+        for action in tabs.into_iter().rev() {
+            self.pending_open.push_front(action);
+        }
+        if !opening_files {
+            self.restore_active = active;
+        }
+        self.store = Some(store);
+    }
+    /// Writes every tab, with unsaved text as drafts, for the next start.
+    fn keep_tabs(&self) -> Result<(), String> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let mut tabs = vec![];
+        let mut active = 0;
+        for index in 0..self.tabs.len() {
+            let tab = if index == self.active {
+                &self.session
+            } else {
+                self.tabs[index]
+                    .as_ref()
+                    .expect("inactive tab owns its session")
+            };
+            let snapshot = tab.buffer.client.latest().snapshot.clone();
+            let documents = &tab.files.documents;
+            let unsaved = documents.dirty(&snapshot);
+            if documents.path.is_none() && !unsaved {
+                continue;
+            }
+            if index == self.active {
+                active = tabs.len();
+            }
+            let (line, column) = snapshot.offset_to_line_col(snapshot.cursor_offset);
+            tabs.push(crate::session_store::TabState {
+                path: documents.path.clone(),
+                draft: unsaved.then(|| snapshot.content.clone()),
+                encoding: documents.encoding,
+                bom: documents.bom,
+                ending: documents.ending,
+                line,
+                column,
+                disk: documents.disk(),
+            });
+        }
+        store.save(&tabs, active)
     }
     pub(crate) fn render_failure(&self) -> Option<&str> {
         self.render_failure.as_deref()
@@ -522,6 +621,12 @@ impl App {
     fn begin_quit(&mut self) {
         if self.session.files.locked() {
             crate::documents::reveal_for_dialog(&self.window);
+        }
+        if self.store.is_some() {
+            // Unsaved tabs are kept for the next start instead of asking now.
+            self.hot_exit = true;
+            self.pending_open.clear();
+            return;
         }
         self.quitting = true;
         self.begin_close();
@@ -1538,6 +1643,10 @@ impl App {
         {
             Ok(true) => {
                 if self.tabs.len() == 1 {
+                    // The last tab was closed on purpose, so the next start begins empty.
+                    if let Some(store) = &self.store {
+                        let _ = store.save(&[], 0);
+                    }
                     return true;
                 }
                 self.remove_active();
@@ -1556,9 +1665,24 @@ impl App {
             self.closing = false;
             self.abort_quit(); // A cancelled sheet/save aborts the quit sequence.
         }
-        if !self.closing && !self.quitting && self.session.settled() {
+        if self.hot_exit && self.session.settled() {
+            self.hot_exit = false;
+            match self.keep_tabs() {
+                Ok(()) => return true,
+                Err(error) => {
+                    self.store = None;
+                    self.report(Err(format!(
+                        "Could not keep the session ({error}); asking to save instead"
+                    )));
+                    self.begin_quit();
+                }
+            }
+        }
+        if !self.closing && !self.quitting && !self.hot_exit && self.session.settled() {
             if let Some(action) = self.pending_open.pop_front() {
                 self.open_tab(action);
+            } else if let Some(index) = self.restore_active.take() {
+                self.switch_tab(index);
             }
         }
         if self.session.files.reset {

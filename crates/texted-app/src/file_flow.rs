@@ -1,6 +1,6 @@
 //! File actions wait for accepted edits and clipboard continuations before dirty checks.
 use crate::{
-    documents::{Action, Documents, Effect},
+    documents::{Action, Caret, Documents, Effect},
     transfers::submit,
 };
 use std::collections::VecDeque;
@@ -71,21 +71,29 @@ impl FileFlow {
         match effect {
             Effect::None => {}
             Effect::Close => return Ok(true),
-            Effect::Install(document) => {
-                let sequence = submit(client, Command::Load(document.content.clone()))?;
+            Effect::Install {
+                document,
+                caret,
+                draft,
+            } => {
+                let place = match caret {
+                    Caret::Start => None,
+                    Caret::Keep => Some(p.snapshot.offset_to_line_col(p.snapshot.cursor_offset)),
+                    Caret::At(line, col) => Some((line, col)),
+                };
+                let mut sequence = submit(client, Command::Load(document.content.clone()))?;
+                if let Some((line, col)) = place {
+                    let line = line.min(document.content.len_lines().saturating_sub(1));
+                    let caret = texted_app::selection::SelectionState::caret(line, col);
+                    sequence = submit(
+                        client,
+                        Command::Edit(texted_app::commands::EditorCommand::SetSelection(caret)),
+                    )?;
+                }
                 self.documents.installed(&document);
-                self.install = Some(sequence);
-            }
-            Effect::Refresh(document) => {
-                let (line, col) = p.snapshot.offset_to_line_col(p.snapshot.cursor_offset);
-                let line = line.min(document.content.len_lines().saturating_sub(1));
-                submit(client, Command::Load(document.content.clone()))?;
-                let caret = texted_app::selection::SelectionState::caret(line, col);
-                let sequence = submit(
-                    client,
-                    Command::Edit(texted_app::commands::EditorCommand::SetSelection(caret)),
-                )?;
-                self.documents.installed(&document);
+                if draft {
+                    self.documents.mark_unsaved();
+                }
                 self.install = Some(sequence);
             }
             Effect::Notice(message) => self.notice = Some(message),
