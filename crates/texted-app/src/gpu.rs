@@ -603,11 +603,10 @@ mod tests {
         );
         assert_eq!(shelf.allocate(ATLAS_SIZE - 1, 4), Some((0, 21)));
     }
-    #[test]
-    #[ignore = "Requires a real Metal GPU; run explicitly on a Mac"]
-    fn metal_crt_curves_the_picture_and_darkens_its_corners() {
+    /// Fills an 8x8 framebuffer with `fill`, presents it into 64x64 through `mapping` and reads
+    /// the window back as RGBA rows.
+    fn present_effects(mapping: texted_app::framebuffer::ScreenMapping, fill: u32) -> Vec<u8> {
         pollster::block_on(async {
-            use texted_app::framebuffer::{CrtEffect, ScreenMapping, VisualEffects};
             let adapter = instance()
                 .request_adapter(&wgpu::RequestAdapterOptions::default())
                 .await
@@ -619,10 +618,10 @@ mod tests {
             let mut presenter = crate::presentation::PixelPresenter::new(&device, format);
             let mut list = DrawList::default();
             list.reset(0);
-            crate::graphics::draw_rect(&mut list, 8, 8, 0, 0, 8, 8, 0xc0c0c0);
+            crate::graphics::draw_rect(&mut list, 8, 8, 0, 0, 8, 8, fill);
             painter.prepare(&list, 8, 8).unwrap();
             let target = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("crt readback"),
+                label: Some("effect readback"),
                 size: wgpu::Extent3d {
                     width: 64,
                     height: 64,
@@ -641,8 +640,6 @@ mod tests {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            let strong = CrtEffect::Strong.effects(VisualEffects::NEUTRAL);
-            let mapping = ScreenMapping::new((64, 64), Some((8, 8))).with_effects(strong, 0.0, 8.0);
             presenter.set_effects(&painter.queue, &mapping);
             let mut encoder = device.create_command_encoder(&Default::default());
             let source = presenter.source(&device, (8, 8));
@@ -675,19 +672,54 @@ mod tests {
                 .map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             rx.recv().unwrap().unwrap();
-            let bytes = readback.slice(..).get_mapped_range();
-            let pixel = |x: usize, y: usize| bytes[(y * 64 + x) * 4];
-            assert_eq!(pixel(0, 0), 0, "the corner is black glass");
-            assert!(pixel(32, 32) > 0x80, "the centre keeps the picture");
-            // Rows alternate every 1.5 window pixels: row 32 is lit, row 33 is a scanline.
-            assert!(
-                pixel(32, 33) < pixel(32, 32),
-                "scanlines darken alternate rows"
-            );
-            drop(bytes);
+            let bytes = readback.slice(..).get_mapped_range().to_vec();
             presenter.release();
             assert!(device.pop_error_scope().await.is_none());
-        });
+            bytes
+        })
+    }
+    #[test]
+    #[ignore = "Requires a real Metal GPU; run explicitly on a Mac"]
+    fn metal_crt_curves_the_picture_and_darkens_its_corners() {
+        use texted_app::framebuffer::{CrtEffect, ScreenMapping, VisualEffects};
+        let strong = CrtEffect::Strong.effects(VisualEffects::NEUTRAL);
+        // One font pixel is 8 window pixels: font pixel rows span y 0..8, 8..16 and so on.
+        let mapping = ScreenMapping::new((64, 64), Some((8, 8))).with_effects(strong, 0.0, 8.0);
+        let bytes = present_effects(mapping, 0xc0c0c0);
+        let red = |x: usize, y: usize| bytes[(y * 64 + x) * 4];
+        assert!(red(0, 0) < 0x20, "the curved corner fades to dark glass");
+        assert!(red(36, 36) > 0x80, "the centre keeps the picture");
+        // Pixel SSH's beam lights the middle of each font pixel row; its edges fall dark.
+        assert!(
+            red(36, 32) < red(36, 36),
+            "scanlines darken font pixel row edges"
+        );
+    }
+    #[test]
+    #[ignore = "Requires a real Metal GPU; run explicitly on a Mac"]
+    fn metal_gameboy_matrix_shows_the_theme_between_font_pixels() {
+        use texted_app::framebuffer::{Phosphor, ScreenMapping, VisualEffects};
+        use texted_app::visuals::{MatrixBackground, Separation};
+        let lcd = VisualEffects {
+            separation: Separation::GameboyMatrix,
+            matrix_background: MatrixBackground::Theme,
+            inner_square: 0.0,
+            ..VisualEffects::NEUTRAL
+        };
+        let mapping = ScreenMapping::new((64, 64), Some((8, 8)))
+            .with_effects(lcd, 0.0, 8.0)
+            .with_glass(Phosphor::White, 0x9cad75);
+        let bytes = present_effects(mapping, 0x2e3d1f);
+        let rgb = |x: usize, y: usize| {
+            let at = (y * 64 + x) * 4;
+            [bytes[at], bytes[at + 1], bytes[at + 2]]
+        };
+        assert_eq!(
+            rgb(36, 36),
+            [0x2e, 0x3d, 0x1f],
+            "the pixel keeps its colour"
+        );
+        assert_eq!(rgb(32, 32), [0x9c, 0xad, 0x75], "the gap shows the theme");
     }
     #[test]
     #[ignore = "Requires a real Metal GPU; run explicitly on a Mac"]

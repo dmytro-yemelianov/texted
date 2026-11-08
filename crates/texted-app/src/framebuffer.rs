@@ -1,6 +1,6 @@
 //! Fixed reference canvases and the shared presentation/input transform. No window or GPU state.
 use crate::appearance::Theme;
-pub use crate::visuals::{CrtEffect, VisualEffects};
+pub use crate::visuals::{CrtEffect, Phosphor, VisualEffects};
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +86,9 @@ pub struct ScreenMapping {
     /// Seconds for animated effects, and one font pixel in window pixels for their size.
     pub effect_time: f32,
     pub effect_pixel: f32,
+    /// The theme's tube and background colour, which monochrome effects and matrix gaps use.
+    pub phosphor: Phosphor,
+    pub background: u32,
 }
 impl ScreenMapping {
     pub fn new(window: (u32, u32), resolution: Option<(u32, u32)>) -> Self {
@@ -98,6 +101,8 @@ impl ScreenMapping {
                 effects: VisualEffects::NEUTRAL,
                 effect_time: 0.0,
                 effect_pixel: 1.0,
+                phosphor: Phosphor::Color,
+                background: 0,
             };
         };
         // Fill one window dimension, preserving the source aspect to physical-pixel precision.
@@ -120,13 +125,21 @@ impl ScreenMapping {
             effects: VisualEffects::NEUTRAL,
             effect_time: 0.0,
             effect_pixel: 1.0,
+            phosphor: Phosphor::Color,
+            background: 0,
         }
     }
     /// Effects for the window backend; native and limited-resolution screens both get them.
     pub fn with_effects(mut self, effects: VisualEffects, time: f32, pixel: f32) -> Self {
         self.effects = effects;
-        self.effect_time = time;
+        self.effect_time = time.rem_euclid(crate::visuals::EFFECT_PERIOD);
         self.effect_pixel = pixel.max(1.0);
+        self
+    }
+    /// The theme's phosphor and background for the effect pass.
+    pub fn with_glass(mut self, phosphor: Phosphor, background: u32) -> Self {
+        self.phosphor = phosphor;
+        self.background = background;
         self
     }
     fn bent(self) -> bool {
@@ -144,7 +157,9 @@ impl ScreenMapping {
             return None;
         }
         if self.bent() {
-            let (u, v) = self.effects.bend(self.screen_fraction((x, y)));
+            let (u, v) = self
+                .effects
+                .bend(self.screen_fraction((x, y)), self.effect_time);
             if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                 return None; // Black glass beyond the curved picture.
             }
@@ -162,7 +177,9 @@ impl ScreenMapping {
             (y - self.destination.1 as f32) / sy,
         );
         if self.bent() {
-            let (u, v) = self.effects.bend(self.screen_fraction((x, y)));
+            let (u, v) = self
+                .effects
+                .bend(self.screen_fraction((x, y)), self.effect_time);
             (px, py) = (u * self.source.0 as f32, v * self.source.1 as f32);
         }
         (
@@ -173,9 +190,10 @@ impl ScreenMapping {
     pub fn to_window(self, (x, y): (f32, f32)) -> (f32, f32) {
         let (sx, sy) = self.scale();
         if self.bent() {
-            let (u, v) = self
-                .effects
-                .unbend((x / self.source.0 as f32, y / self.source.1 as f32));
+            let (u, v) = self.effects.unbend(
+                (x / self.source.0 as f32, y / self.source.1 as f32),
+                self.effect_time,
+            );
             let (dx, dy, w, h) = self.destination;
             return (dx as f32 + u * w as f32, dy as f32 + v * h as f32);
         }
@@ -262,38 +280,48 @@ mod tests {
                 (p.0 - q.0).abs() < 0.01 && (p.1 - q.1).abs() < 0.01,
                 "{q:?}"
             );
+            // Later frames breathe; clicks follow the frame on screen and still round-trip.
+            let later = flat.with_effects(strong, 1.0, 1.0);
+            assert_ne!(later.to_source((40.0, 40.0)), bent.to_source((40.0, 40.0)));
+            let q = later.to_source_clamped(later.to_window(p));
+            assert!(
+                (p.0 - q.0).abs() < 0.01 && (p.1 - q.1).abs() < 0.01,
+                "{q:?}"
+            );
             let off = flat.with_effects(VisualEffects::NEUTRAL, 0.0, 1.0);
             assert_eq!(off.to_source((40.0, 40.0)), Some((fx, fy)));
         }
     }
     #[test]
-    fn presets_and_custom_values_stay_inside_shaderwallpaper_ranges() {
-        let wallpaper = CrtEffect::Wallpaper.effects(VisualEffects::NEUTRAL);
-        assert_eq!(
-            wallpaper,
-            VisualEffects {
-                brightness: 0.96,
-                curvature: 0.014,
-                chromatic_aberration: 0.18,
-                afterglow: 0.12,
-                noise: 0.55,
-                flicker: 0.45,
-                scanlines: 0.42,
-            }
-        );
-        assert!(wallpaper.animated());
-        assert!(!CrtEffect::Strong.effects(wallpaper).animated());
-        assert!(CrtEffect::Off.effects(wallpaper).is_neutral());
-        let wild = VisualEffects {
-            brightness: 9.0,
-            curvature: -1.0,
-            noise: f32::NAN,
+    fn effect_time_wraps_so_shader_hashes_keep_their_precision() {
+        let e = VisualEffects {
+            curvature: 1.0,
             ..VisualEffects::NEUTRAL
         };
-        let custom = CrtEffect::Custom.effects(wild);
+        let m = ScreenMapping::new((640, 480), None).with_effects(e, 86_399.5, 1.0);
+        assert!((m.effect_time - 86_399.5 % crate::visuals::EFFECT_PERIOD).abs() < 0.01);
+        assert!(m.effect_time < crate::visuals::EFFECT_PERIOD);
+        let p = (100.0, 80.0);
+        let q = m.to_source_clamped(m.to_window(p));
+        assert!(
+            (p.0 - q.0).abs() < 0.01 && (p.1 - q.1).abs() < 0.01,
+            "{q:?}"
+        );
+    }
+    #[test]
+    fn the_tube_carries_its_phosphor_and_theme_background_to_the_effect_pass() {
+        let m = ScreenMapping::new((640, 480), None);
+        assert_eq!((m.phosphor, m.background), (Phosphor::Color, 0));
+        let green = m.with_glass(Phosphor::Green, 0x102030);
         assert_eq!(
-            (custom.brightness, custom.curvature, custom.noise),
-            (1.6, 0.0, 0.0)
+            (green.phosphor, green.background),
+            (Phosphor::Green, 0x102030)
+        );
+        assert_eq!(
+            green
+                .with_effects(VisualEffects::NEUTRAL, 1.0, 2.0)
+                .phosphor,
+            Phosphor::Green
         );
     }
     #[test]

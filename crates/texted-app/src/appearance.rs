@@ -430,6 +430,7 @@ impl Appearance {
     /// The Visuals page settings, including what an older `crt` key meant.
     pub fn visuals(&self) -> crate::visuals::Visuals {
         self.visuals
+            .map(crate::visuals::Visuals::current)
             .or_else(|| {
                 self.crt
                     .map(|crt| crt.visuals(self.effects.unwrap_or_default()))
@@ -636,6 +637,28 @@ mod tests {
         assert_eq!(again.visuals(), Machine::AtariSt.visuals());
         let plain: Appearance = serde_json::from_str(r#"{"theme":"zx_spectrum"}"#).unwrap();
         assert!(plain.visuals().effects.is_neutral());
+    }
+    #[test]
+    fn visuals_saved_for_the_wallpaper_shader_read_as_the_retuned_machine() {
+        use crate::visuals::Machine;
+        // The appearance.json the previous build wrote, trimmed to the visuals.
+        let json = r#"{"theme":"atari","framebuffer":"mono_text","visuals":{"fps":14,"time":null,
+            "effects":{"brightness":0.96,"curvature":0.014,"chromatic_aberration":0.18,
+            "afterglow":0.12,"noise":0.55,"flicker":0.45,"scanlines":0.42},"shadow":true,
+            "shadow_x":3,"shadow_y":1,"border":"single","corner_inset":9,"inset_x":2,"inset_y":5}}"#;
+        let old: Appearance = serde_json::from_str(json).unwrap();
+        assert_eq!(old.visuals().effects, Machine::AtariSt.visuals().effects);
+        let mut saved = old.clone();
+        saved.normalize().unwrap();
+        let v = saved.visuals();
+        assert_eq!(
+            (v.shadow_x, v.corner_inset, v.inset_y),
+            (3, 9, 5),
+            "chrome kept"
+        );
+        let again: Appearance =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(again.visuals(), v);
     }
     #[test]
     fn future_versions_unknown_colors_and_invalid_rgb_are_rejected() {

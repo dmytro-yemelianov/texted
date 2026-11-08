@@ -8,7 +8,7 @@ use texted_app::{
     appearance::{Appearance, FontFamily, MouseCursor, Palette, Theme},
     framebuffer::Framebuffer,
     input::KeyInput,
-    visuals::{Effect, Machine, Visuals},
+    visuals::{Effect, Look, Machine, Preset, Visuals},
 };
 use winit::keyboard::{Key, NamedKey};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,8 +182,8 @@ enum Value {
     Size(u16),
     Spacing(u16),
     Cursor(MouseCursor),
-    Preset(Option<Machine>),
-    /// Effects that match no machine; no list entry equals it.
+    Preset(Option<Preset>),
+    /// Effects that match no preset; no list entry equals it.
     Custom,
     Fps(u8),
     Time(Option<u32>),
@@ -445,8 +445,8 @@ impl AppearanceUi {
             5 => Value::Cursor(self.settings.mouse_cursor),
             PRESET => {
                 let v = self.settings.visuals();
-                match v.machine() {
-                    Some(machine) => Value::Preset(Some(machine)),
+                match v.preset() {
+                    Some(preset) => Value::Preset(Some(preset)),
                     None if v.effects.is_neutral() => Value::Preset(None),
                     None => Value::Custom,
                 }
@@ -494,11 +494,29 @@ impl AppearanceUi {
             field => self.value_text(field),
         }
     }
+    /// A row's value as drawn in `cells` character cells: effect amounts get Pixel SSH's gauge
+    /// in front when it fits.
+    fn shown_text(&self, field: usize, cells: usize) -> String {
+        const GAUGE: usize = 5;
+        let text = self.field_text(field);
+        if let Value::Effect(index, _) = self.selected(field) {
+            let effect = Effect::ALL[index];
+            if !self.cell_backend && !self.terminal_graphics && cells > GAUGE + text.chars().count()
+            {
+                if let Some(gauge) =
+                    effect.meter(effect.get(&self.settings.visuals().effects), GAUGE)
+                {
+                    return format!("{gauge} {text}");
+                }
+            }
+        }
+        text
+    }
     /// What a Visuals row shows for its current value.
     fn value_text(&self, field: usize) -> String {
         let v = self.settings.visuals();
         match self.selected(field) {
-            Value::Preset(machine) => machine.map_or("Off", Machine::name).into(),
+            Value::Preset(preset) => preset.map_or("Off", Preset::name).into(),
             Value::Custom => "Custom".into(),
             Value::Fps(fps) => format!("{fps} FPS"),
             Value::Time(None) => "Live".into(),
@@ -592,7 +610,9 @@ impl AppearanceUi {
                 .chain(
                     Machine::ALL
                         .into_iter()
-                        .map(|m| Choice::new(m.name().into(), Value::Preset(Some(m)))),
+                        .map(Preset::Machine)
+                        .chain(Look::ALL.into_iter().map(Preset::Look))
+                        .map(|p| Choice::new(p.name().into(), Value::Preset(Some(p)))),
                 )
                 .collect(),
             FRAME_RATE => (4..=30)
@@ -680,12 +700,18 @@ impl AppearanceUi {
                 }
             }
             Value::Screen(screen) => self.settings.framebuffer = screen,
-            Value::Preset(machine) => {
+            Value::Preset(preset) => {
                 let v = self.visuals_mut();
-                *v = match machine {
-                    Some(machine) => Visuals {
+                *v = match preset {
+                    // A machine brings its timing and chrome, as in ShaderWallpaper.
+                    Some(Preset::Machine(machine)) => Visuals {
                         time: v.time,
                         ..machine.visuals()
+                    },
+                    // Pixel SSH's presets only set the effects.
+                    Some(Preset::Look(look)) => Visuals {
+                        effects: look.effects(),
+                        ..*v
                     },
                     None => Visuals {
                         effects: Default::default(),
@@ -1133,14 +1159,16 @@ impl AppearanceUi {
                     c.input_border
                 },
             );
+            let room = field_rect.w.saturating_sub(if compact { 20 } else { 38 });
+            let cells = (room as f32 / font.char_width_px.max(1.0)) as usize;
             label(
                 draws,
                 font,
                 (width, height),
                 (field_rect.x + if compact { 4 } else { 10 }, text_y),
-                &self.field_text(field),
+                &self.shown_text(field, cells),
                 c.text,
-                field_rect.w.saturating_sub(if compact { 20 } else { 38 }),
+                room,
             );
             label(
                 draws,
@@ -1350,12 +1378,19 @@ impl AppearanceUi {
 }
 /// Row titles; compact ones fit seven 8-pixel cells.
 fn field_title(field: usize, compact: bool) -> &'static str {
-    const COMPACT: [&str; FIELDS] = [
-        "Theme", "Screen", "Font", "Size", "Spacing", "Cursor", "Preset", "FPS", "Time", "Bright",
-        "Curve", "Aberr", "Glow", "Noise", "Flicker", "Scan", "Shadow", "Shad X", "Shad Y",
-        "Border", "Corner", "Inset X", "Inset Y",
+    if (FIRST_EFFECT..SHADOW).contains(&field) {
+        let effect = Effect::ALL[field - FIRST_EFFECT];
+        return if compact {
+            effect.short()
+        } else {
+            effect.title()
+        };
+    }
+    const COMPACT: [&str; FIELDS - Effect::ALL.len()] = [
+        "Theme", "Screen", "Font", "Size", "Spacing", "Cursor", "Preset", "FPS", "Time", "Shadow",
+        "Shad X", "Shad Y", "Border", "Corner", "Inset X", "Inset Y",
     ];
-    const FULL: [&str; FIELDS] = [
+    const FULL: [&str; FIELDS - Effect::ALL.len()] = [
         "Theme",
         "Resolution",
         "Editor font",
@@ -1365,13 +1400,6 @@ fn field_title(field: usize, compact: bool) -> &'static str {
         "Preset",
         "Frame rate",
         "Time of day",
-        "Brightness",
-        "Curvature",
-        "Aberration",
-        "Afterglow",
-        "Noise",
-        "Flicker",
-        "Scanlines",
         "Shadow",
         "Shadow X",
         "Shadow Y",
@@ -1380,10 +1408,15 @@ fn field_title(field: usize, compact: bool) -> &'static str {
         "Inset X",
         "Inset Y",
     ];
-    if compact {
-        COMPACT[field]
+    let index = if field >= SHADOW {
+        field - Effect::ALL.len()
     } else {
-        FULL[field]
+        field
+    };
+    if compact {
+        COMPACT[index]
+    } else {
+        FULL[index]
     }
 }
 fn label(
@@ -1682,13 +1715,99 @@ mod tests {
         assert_eq!(ui.field_text(TIME), "13:00:00");
     }
     #[test]
+    fn pixel_ssh_looks_set_only_the_effects_and_show_in_the_preset_row() {
+        use texted_app::visuals::Look;
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        let names: Vec<String> = ui.choices(PRESET).iter().map(|c| c.label.clone()).collect();
+        assert_eq!(
+            names,
+            [
+                "Off",
+                "ZX Spectrum",
+                "Atari ST",
+                "Mac System 2.0",
+                "Game Boy",
+                "Pixel SSH",
+                "CRT",
+                "Arcade",
+                "Bloom",
+                "Glitch"
+            ]
+        );
+        pick(&mut ui, PRESET, "Atari ST");
+        pick(&mut ui, TIME, "13:00");
+        pick(&mut ui, PRESET, "Arcade");
+        let v = ui.settings.visuals();
+        assert_eq!(v.effects, Look::Arcade.effects());
+        assert_eq!(
+            (v.fps, v.time, v.shadow, v.inset_x),
+            (14, Some(13 * 3600), true, 2),
+            "timing and chrome stay"
+        );
+        assert_eq!(ui.field_text(PRESET), "Arcade");
+        pick(&mut ui, PRESET, "Off");
+        assert!(ui.settings.visuals().effects.is_neutral());
+        assert_eq!(ui.field_text(PRESET), "Off");
+    }
+    #[test]
+    fn separation_rows_offer_dithergl_modes_and_matrix_settings() {
+        use texted_app::visuals::{MatrixBackground, Separation};
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        let separation = FIRST_EFFECT + Effect::Separation as usize;
+        let names: Vec<String> = ui
+            .choices(separation)
+            .iter()
+            .map(|c| c.label.clone())
+            .collect();
+        assert_eq!(names, Separation::ALL.map(|m| m.name().to_string()));
+        pick(&mut ui, separation, "LED Matrix");
+        pick(
+            &mut ui,
+            FIRST_EFFECT + Effect::MatrixSpacing as usize,
+            "0.250",
+        );
+        pick(&mut ui, FIRST_EFFECT + Effect::InnerSquare as usize, "Off");
+        pick(
+            &mut ui,
+            FIRST_EFFECT + Effect::MatrixBackground as usize,
+            "Theme",
+        );
+        let e = ui.settings.visuals().effects;
+        assert_eq!(
+            (
+                e.separation,
+                e.matrix_spacing,
+                e.inner_square,
+                e.matrix_background
+            ),
+            (Separation::LedMatrix, 0.25, 0.0, MatrixBackground::Theme)
+        );
+        assert_eq!(ui.field_text(separation), "LED Matrix");
+    }
+    #[test]
+    fn effect_rows_draw_a_gauge_where_it_fits() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        let scan = FIRST_EFFECT + Effect::Scanlines as usize;
+        pick(&mut ui, scan, "0.35");
+        assert_eq!(ui.field_text(scan), "0.35");
+        assert_eq!(ui.shown_text(scan, 30), "█▓░░░ 0.35");
+        // A Game Boy row has room for the number only.
+        assert_eq!(ui.shown_text(scan, 6), "0.35");
+        let separation = FIRST_EFFECT + Effect::Separation as usize;
+        assert_eq!(ui.shown_text(separation, 30), "Off");
+        assert_eq!(ui.shown_text(PRESET, 30), "Custom");
+    }
+    #[test]
     fn a_theme_brings_its_visuals_and_reset_restores_them_without_touching_style() {
         let mut ui = AppearanceUi::new(Appearance::default());
         ui.set_open(true);
         pick(&mut ui, 0, Theme::ZxSpectrum.name());
         assert_eq!(ui.settings.visuals(), Machine::ZxSpectrum.visuals());
-        pick(&mut ui, FIRST_EFFECT + 4, "0.10");
-        ui.set_focus(FIRST_EFFECT + 4);
+        pick(&mut ui, FIRST_EFFECT + Effect::Noise as usize, "0.10");
+        ui.set_focus(FIRST_EFFECT + Effect::Noise as usize);
         ui.reset();
         assert_eq!(ui.settings.visuals(), Machine::ZxSpectrum.visuals());
         assert_eq!(ui.settings.theme, Theme::ZxSpectrum);

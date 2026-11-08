@@ -232,7 +232,10 @@ impl App {
                 visuals.effect_time(texted_app::visuals::local_seconds_since_midnight());
         }
         let pixel = self.font.pixel_px() * mapping.scale().0;
-        mapping.with_effects(visuals.effects, self.effect_time, pixel)
+        let phosphor = texted_app::visuals::Phosphor::for_theme(self.appearance.settings.theme);
+        mapping
+            .with_effects(visuals.effects, self.effect_time, pixel)
+            .with_glass(phosphor, self.appearance.palette.bg)
     }
     fn resolution(&self) -> Option<(u32, u32)> {
         if self.window.is_cells() {
