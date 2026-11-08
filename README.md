@@ -58,7 +58,7 @@ Development builds include native **Texted / File / Edit / Search / View / Windo
 | Show / hide F-key panel | F1; View → Function Key Commands |
 | Diagnostics | View → Diagnostics |
 
-Physical letter keys keep shortcuts working with Ukrainian keyboard layouts. Wrapping currently breaks at character-cell boundaries. Text uses character columns rather than grapheme clusters or shaped display cells; complex-script shaping and IME composition remain future work. No-wrap mode supports the trackpad horizontal axis, Shift+wheel, scrollbar dragging and page clicks. Navigation and typing keep the caret visible; manual scrolling leaves its document position unchanged.
+Physical letter keys keep shortcuts working with Ukrainian keyboard layouts. Wrapping breaks rows after spaces; a word longer than a row is split at the edge, and lines over 64 Ki characters wrap at character cells so deep scrolling stays cheap. Text uses character columns rather than grapheme clusters or shaped display cells; complex-script shaping and IME composition remain future work. No-wrap mode supports the trackpad horizontal axis, Shift+wheel, scrollbar dragging and page clicks. Navigation and typing keep the caret visible; manual scrolling leaves its document position unchanged.
 
 The bottom of the window has one command-button row. There is no separate status strip. Hold **Control** to reveal scale and document values in the existing F-key cells:
 
