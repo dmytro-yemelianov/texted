@@ -11,6 +11,7 @@ mod horizontal_scroll;
 mod menus;
 mod mouse;
 mod native_macos;
+mod presentation;
 mod search_ui;
 mod transfers;
 mod viewport;

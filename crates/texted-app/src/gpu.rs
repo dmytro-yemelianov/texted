@@ -449,6 +449,7 @@ pub(crate) struct Renderer {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     painter: Painter,
+    presenter: crate::presentation::PixelPresenter,
     failure: Arc<Mutex<Option<String>>>,
     pub description: String,
 }
@@ -498,6 +499,7 @@ impl Renderer {
         config.desired_maximum_frame_latency = 2;
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let painter = Painter::new(device.clone(), queue, config.format);
+        let presenter = crate::presentation::PixelPresenter::new(&device, config.format);
         if let Some(error) = device.pop_error_scope().await {
             return Err(format!("GPU pipeline validation failed: {error}"));
         }
@@ -507,11 +509,18 @@ impl Renderer {
             surface,
             config,
             painter,
+            presenter,
             failure,
             description,
         })
     }
-    pub fn render(&mut self, list: &DrawList, width: u32, height: u32) -> Result<bool, String> {
+    pub fn render(
+        &mut self,
+        list: &DrawList,
+        width: u32,
+        height: u32,
+        mapping: texted_app::framebuffer::ScreenMapping,
+    ) -> Result<bool, String> {
         if width == 0 || height == 0 {
             return Ok(false);
         }
@@ -542,7 +551,8 @@ impl Renderer {
             Err(wgpu::SurfaceError::Timeout | wgpu::SurfaceError::Other) => return Ok(false),
             Err(wgpu::SurfaceError::OutOfMemory) => return Err("GPU memory exhausted".into()),
         };
-        self.painter.prepare(list, width, height)?;
+        self.painter
+            .prepare(list, mapping.source.0, mapping.source.1)?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -552,7 +562,14 @@ impl Renderer {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Texted frame"),
                 });
-        self.painter.encode(&mut encoder, &view, list.clear);
+        if mapping.pixelated {
+            let source = self.presenter.source(&self.painter.device, mapping.source);
+            self.painter.encode(&mut encoder, source, list.clear);
+            self.presenter.encode(&mut encoder, &view, mapping);
+        } else {
+            self.presenter.release();
+            self.painter.encode(&mut encoder, &view, list.clear);
+        }
         self.painter.queue.submit([encoder.finish()]);
         output.present();
         Ok(true)
@@ -583,6 +600,106 @@ mod tests {
             (before.x, before.y, before.height)
         );
         assert_eq!(shelf.allocate(ATLAS_SIZE - 1, 4), Some((0, 21)));
+    }
+    #[test]
+    #[ignore = "Requires a real Metal GPU; run explicitly on a Mac"]
+    fn metal_framebuffer_preserves_exact_texels_and_letterboxing() {
+        pollster::block_on(async {
+            use texted_app::framebuffer::ScreenMapping;
+            let adapter = instance()
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .unwrap();
+            assert_ne!(adapter.get_info().device_type, wgpu::DeviceType::Cpu);
+            let (device, queue) = device(&adapter).await.unwrap();
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let format = wgpu::TextureFormat::Rgba8Unorm;
+            let mut painter = Painter::new(device.clone(), queue, format);
+            let mut presenter = crate::presentation::PixelPresenter::new(&device, format);
+            let mut list = DrawList::default();
+            list.reset(0xff0000);
+            crate::graphics::draw_rect(&mut list, 2, 2, 1, 0, 1, 1, 0x00ff00);
+            crate::graphics::draw_rect(&mut list, 2, 2, 0, 1, 1, 1, 0x0000ff);
+            crate::graphics::draw_rect(&mut list, 2, 2, 1, 1, 1, 1, 0xffffff);
+            painter.prepare(&list, 2, 2).unwrap();
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("presentation readback"),
+                size: wgpu::Extent3d {
+                    width: 64,
+                    height: 32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 64 * 32 * 4,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            let source = presenter.source(&device, (2, 2));
+            painter.encode(&mut encoder, source, list.clear);
+            presenter.encode(
+                &mut encoder,
+                &target.create_view(&Default::default()),
+                ScreenMapping::new((64, 32), Some((2, 2))),
+            );
+            encoder.copy_texture_to_buffer(
+                target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(32),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 64,
+                    height: 32,
+                    depth_or_array_layers: 1,
+                },
+            );
+            painter.queue.submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            rx.recv().unwrap().unwrap();
+            let bytes = readback.slice(..).get_mapped_range();
+            for y in 0..32 {
+                for x in 0..64 {
+                    let expected = if !(16..48).contains(&x) {
+                        [0, 0, 0, 255]
+                    } else {
+                        match (x >= 32, y >= 16) {
+                            (false, false) => [255, 0, 0, 255],
+                            (true, false) => [0, 255, 0, 255],
+                            (false, true) => [0, 0, 255, 255],
+                            (true, true) => [255, 255, 255, 255],
+                        }
+                    };
+                    let at = (y * 64 + x) * 4;
+                    assert_eq!(
+                        &bytes[at..at + 4],
+                        &expected,
+                        "exact source texel at ({x},{y})"
+                    );
+                }
+            }
+            // Replacing the cached target and returning to Native are valid resource transitions.
+            presenter.source(&device, (256, 192));
+            presenter.source(&device, (320, 200));
+            presenter.release();
+            assert!(device.pop_error_scope().await.is_none());
+        });
     }
     #[test]
     #[ignore = "Requires a real Metal GPU; run explicitly on a Mac"]
