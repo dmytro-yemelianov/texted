@@ -8,6 +8,7 @@ use texted_app::{
     appearance::{Appearance, FontFamily, MouseCursor, Palette, Theme},
     framebuffer::Framebuffer,
     input::KeyInput,
+    visuals::{Effect, Machine, Visuals},
 };
 use winit::keyboard::{Key, NamedKey};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +27,15 @@ impl Rect {
     }
 }
 
+/// Style fields: theme, screen, font, size, spacing and cursor.
+const STYLE_FIELDS: usize = 6;
+/// Visuals fields, as in ShaderWallpaper: machine preset, frame rate, time, then the effects.
+const PRESET: usize = STYLE_FIELDS;
+const FRAME_RATE: usize = STYLE_FIELDS + 1;
+const TIME: usize = STYLE_FIELDS + 2;
+const FIRST_EFFECT: usize = STYLE_FIELDS + 3;
+const FIELDS: usize = FIRST_EFFECT + Effect::ALL.len();
+/// Rows shown at once; the Visuals page scrolls through its fields.
 const ROWS: usize = 7;
 struct Panel {
     rect: Rect,
@@ -94,12 +104,27 @@ impl Panel {
             h: self.row_h,
         }
     }
+    /// The Style and Visuals page tabs in the title row.
+    fn tab(&self, visuals: bool) -> Rect {
+        let compact = self.pad == 8;
+        let (style_w, visuals_w, h) = if compact { (48, 64, 16) } else { (72, 96, 28) };
+        Rect {
+            x: self.rect.x + self.pad + if visuals { style_w } else { 0 },
+            y: self.rect.y + if compact { 2 } else { 10 },
+            w: if visuals { visuals_w } else { style_w },
+            h,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hit {
     Close,
     Reset,
+    /// A row slot; the page and its scroll decide which field it shows.
     Field(usize),
+    Page {
+        visuals: bool,
+    },
 }
 #[cfg(test)]
 fn hit(width: usize, height: usize, x: f32, y: f32, compact: bool) -> Option<Hit> {
@@ -111,6 +136,11 @@ fn hit_panel(p: &Panel, x: f32, y: f32) -> Option<Hit> {
             && x > (p.rect.x + p.rect.w.saturating_sub(28)) as f32)
     {
         return Some(Hit::Close);
+    }
+    for visuals in [false, true] {
+        if p.tab(visuals).contains(x, y) {
+            return Some(Hit::Page { visuals });
+        }
     }
     for row in 0..ROWS {
         let r = p.row(row);
@@ -134,7 +164,13 @@ enum Value {
     Size(u16),
     Spacing(u16),
     Cursor(MouseCursor),
-    Crt(texted_app::framebuffer::CrtEffect),
+    Preset(Option<Machine>),
+    /// Effects that match no machine; no list entry equals it.
+    Custom,
+    Fps(u8),
+    Time(Option<u32>),
+    /// An effect by its Effect::ALL index, at a step of its range.
+    Effect(usize, u16),
 }
 struct Choice {
     label: String,
@@ -158,6 +194,8 @@ pub(crate) struct AppearanceUi {
     terminal_graphics: bool,
     pub save_status: String,
     focus: usize,
+    /// The first Visuals field shown in the top row.
+    scroll: usize,
     dropdown: Option<Dropdown>,
     font_query: String,
     origin: Option<Appearance>,
@@ -183,6 +221,7 @@ impl AppearanceUi {
             terminal_graphics: false,
             save_status: "Changes save automatically".into(),
             focus: 0,
+            scroll: 0,
             dropdown: None,
             font_query: String::new(),
             origin: None,
@@ -243,6 +282,53 @@ impl AppearanceUi {
         self.set_terminal_graphics(terminal_graphics);
         self.open = open;
         self.save_status = status;
+    }
+    fn visuals_page(&self) -> bool {
+        self.focus >= STYLE_FIELDS
+    }
+    /// The field a row slot shows on the current page.
+    fn field_at(&self, slot: usize) -> Option<usize> {
+        let (start, end, offset) = if self.visuals_page() {
+            (STYLE_FIELDS, FIELDS, self.scroll)
+        } else {
+            (0, STYLE_FIELDS, 0)
+        };
+        let field = start + offset + slot;
+        (slot < ROWS && field < end).then_some(field)
+    }
+    fn slot_of(&self, field: usize) -> Option<usize> {
+        (0..ROWS).find(|&slot| self.field_at(slot) == Some(field))
+    }
+    /// Focuses a field, turning to its page and scrolling it into view.
+    fn set_focus(&mut self, field: usize) {
+        self.focus = field.min(FIELDS - 1);
+        if let Some(index) = self.focus.checked_sub(STYLE_FIELDS) {
+            if index < self.scroll {
+                self.scroll = index;
+            } else if index >= self.scroll + ROWS {
+                self.scroll = index + 1 - ROWS;
+            }
+        }
+    }
+    fn step_focus(&mut self, back: bool) {
+        self.set_focus((self.focus + if back { FIELDS - 1 } else { 1 }) % FIELDS);
+    }
+    fn visuals_mut(&mut self) -> &mut Visuals {
+        let current = self.settings.visuals();
+        self.settings.visuals.get_or_insert(current)
+    }
+    /// On the Visuals page, the theme's visuals; elsewhere, every appearance default.
+    pub fn reset(&mut self) {
+        if self.visuals_page() {
+            self.cancel_preview();
+            let time = self.settings.visuals().time;
+            self.settings.visuals = Some(Visuals {
+                time,
+                ..Visuals::for_theme(self.settings.theme)
+            });
+        } else {
+            self.reset_defaults();
+        }
     }
     pub fn browse(&mut self, forward: bool, width: usize, height: usize, compact: bool) {
         if self.dropdown.is_none() {
@@ -320,14 +406,75 @@ impl AppearanceUi {
             3 => Value::Size(t.scale_percent()),
             4 => Value::Spacing(t.line_spacing),
             5 => Value::Cursor(self.settings.mouse_cursor),
-            _ => Value::Crt(self.settings.crt),
+            PRESET => {
+                let v = self.settings.visuals();
+                match v.machine() {
+                    Some(machine) => Value::Preset(Some(machine)),
+                    None if v.effects.is_neutral() => Value::Preset(None),
+                    None => Value::Custom,
+                }
+            }
+            FRAME_RATE => Value::Fps(self.settings.visuals().fps),
+            TIME => Value::Time(self.settings.visuals().time),
+            field => {
+                let index = field - FIRST_EFFECT;
+                let effect = Effect::ALL[index];
+                let amount = effect.get(&self.settings.visuals().effects);
+                Value::Effect(index, effect.step_of(amount))
+            }
+        }
+    }
+    /// A row's value text, including what terminals manage themselves.
+    fn field_text(&self, field: usize) -> String {
+        if field >= STYLE_FIELDS && (self.cell_backend || self.terminal_graphics) {
+            return "Window only".into();
+        }
+        if self.cell_backend && field != 0 {
+            return "Terminal setting".into();
+        }
+        if self.terminal_graphics && field == 5 {
+            return "Terminal pointer".into();
+        }
+        let t = self.settings.editor_typography();
+        match field {
+            0 => self.settings.theme.name().into(),
+            1 if self.settings.framebuffer == Framebuffer::Auto => self
+                .settings
+                .resolution()
+                .map_or("Auto: Native".into(), |(w, h)| format!("Auto: {w}x{h}")),
+            1 => self.settings.framebuffer.name().into(),
+            2 => t.family.name().into(),
+            3 => format!("{}%", t.scale_percent()),
+            4 => format!("{}%", t.line_spacing),
+            5 => self.settings.mouse_cursor.name().into(),
+            field => self.value_text(field),
+        }
+    }
+    /// What a Visuals row shows for its current value.
+    fn value_text(&self, field: usize) -> String {
+        let v = self.settings.visuals();
+        match self.selected(field) {
+            Value::Preset(machine) => machine.map_or("Off", Machine::name).into(),
+            Value::Custom => "Custom".into(),
+            Value::Fps(fps) => format!("{fps} FPS"),
+            Value::Time(None) => "Live".into(),
+            Value::Time(Some(t)) => format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60),
+            Value::Effect(index, _) => {
+                let effect = Effect::ALL[index];
+                effect.label(effect.get(&v.effects))
+            }
+            _ => String::new(),
         }
     }
     fn choices(&self, row: usize) -> Arc<Vec<Choice>> {
-        // Terminals draw their own pointer, and their pictures skip the CRT pass.
+        // Terminals draw their own pointer, and their pictures skip the effect pass.
         if (self.cell_backend && row != 0) || (self.terminal_graphics && row >= 5) {
             return Arc::new(vec![Choice {
-                label: "Managed by the terminal emulator".into(),
+                label: if row >= STYLE_FIELDS {
+                    "Window only".into()
+                } else {
+                    "Managed by the terminal emulator".into()
+                },
                 value: self.selected(row),
                 enabled: false,
             }]);
@@ -392,10 +539,33 @@ impl AppearanceUi {
                 .into_iter()
                 .map(|c| Choice::new(c.name().into(), Value::Cursor(c)))
                 .collect(),
-            6 => texted_app::framebuffer::CrtEffect::ALL
-                .into_iter()
-                .map(|c| Choice::new(c.name().into(), Value::Crt(c)))
+            PRESET => std::iter::once(Choice::new("Off".into(), Value::Preset(None)))
+                .chain(
+                    Machine::ALL
+                        .into_iter()
+                        .map(|m| Choice::new(m.name().into(), Value::Preset(Some(m)))),
+                )
                 .collect(),
+            FRAME_RATE => (4..=30)
+                .map(|fps| Choice::new(format!("{fps} FPS"), Value::Fps(fps)))
+                .collect(),
+            TIME => std::iter::once(Choice::new("Live".into(), Value::Time(None)))
+                .chain((0..24).map(|hour| {
+                    Choice::new(format!("{hour:02}:00"), Value::Time(Some(hour * 3600)))
+                }))
+                .collect(),
+            field if field >= FIRST_EFFECT => {
+                let index = field - FIRST_EFFECT;
+                let effect = Effect::ALL[index];
+                (0..=effect.steps())
+                    .map(|step| {
+                        Choice::new(
+                            effect.label(effect.value_at(step)),
+                            Value::Effect(index, step),
+                        )
+                    })
+                    .collect()
+            }
             row => {
                 let t = self.settings.editor_typography();
                 let mut numbers: Vec<u16> = if row == 3 {
@@ -435,10 +605,35 @@ impl AppearanceUi {
                 if self.settings.theme != theme {
                     self.settings.theme = theme;
                     self.settings.colors.clear();
+                    // Like applying a machine in ShaderWallpaper, a theme brings its visuals.
+                    let time = self.settings.visuals().time;
+                    self.settings.visuals = Some(Visuals {
+                        time,
+                        ..Visuals::for_theme(theme)
+                    });
                 }
             }
             Value::Screen(screen) => self.settings.framebuffer = screen,
-            Value::Crt(crt) => self.settings.crt = crt,
+            Value::Preset(machine) => {
+                let v = self.visuals_mut();
+                *v = match machine {
+                    Some(machine) => Visuals {
+                        time: v.time,
+                        ..machine.visuals()
+                    },
+                    None => Visuals {
+                        effects: Default::default(),
+                        ..*v
+                    },
+                };
+            }
+            Value::Custom => {}
+            Value::Fps(fps) => self.visuals_mut().fps = fps,
+            Value::Time(time) => self.visuals_mut().time = time,
+            Value::Effect(index, step) => {
+                let effect = Effect::ALL[index];
+                effect.set(&mut self.visuals_mut().effects, effect.value_at(step));
+            }
             Value::Font(font) => {
                 let t = self.settings.editor_typography_mut();
                 let zoom = t.scale_percent();
@@ -476,7 +671,8 @@ impl AppearanceUi {
                 .unwrap_or(0)
         };
         Popup::new(
-            self.panel(width, height, compact).row(d.field),
+            self.panel(width, height, compact)
+                .row(self.slot_of(d.field).unwrap_or(0)),
             (width, height),
             compact,
             choices.len(),
@@ -492,10 +688,10 @@ impl AppearanceUi {
             .iter()
             .position(|c| c.value == self.selected(row))
             .unwrap_or(0);
+        self.set_focus(row);
         let mut d = Dropdown::new(row, selected);
         let popup = self.popup(d, width, height, compact, &choices);
         d.reveal(popup.visible, choices.len());
-        self.focus = row;
         self.dropdown = Some(d);
     }
     pub fn hover(&mut self, width: usize, height: usize, x: f32, y: f32, compact: bool) -> bool {
@@ -522,7 +718,22 @@ impl AppearanceUi {
     }
     pub fn wheel(&mut self, rows: f64, width: usize, height: usize, compact: bool) -> bool {
         let Some(mut d) = self.dropdown else {
-            return false;
+            if !self.visuals_page() || rows == 0.0 {
+                return false;
+            }
+            let before = self.scroll;
+            let most = FIELDS - STYLE_FIELDS - ROWS;
+            self.scroll = if rows > 0.0 {
+                self.scroll.saturating_sub(1)
+            } else {
+                (self.scroll + 1).min(most)
+            };
+            // Keep the focus on a row that is still shown.
+            if self.slot_of(self.focus).is_none() {
+                let edge = if rows > 0.0 { ROWS - 1 } else { 0 };
+                self.focus = self.field_at(edge).unwrap_or(self.focus);
+            }
+            return self.scroll != before;
         };
         let choices = self.choices(d.field);
         let popup = self.popup(d, width, height, compact, &choices);
@@ -563,6 +774,15 @@ impl AppearanceUi {
             self.open = false;
             return;
         }
+        // A tab turns the page; the title row still drags the panel from anywhere.
+        if !over_popup {
+            for visuals in [false, true] {
+                if panel.tab(visuals).contains(x, y) && visuals != self.visuals_page() {
+                    self.cancel_preview();
+                    self.set_focus(if visuals { PRESET } else { 0 });
+                }
+            }
+        }
         if !over_popup
             && panel.rect.contains(x, y)
             && y < (panel.rect.y + if compact { 24 } else { 36 }) as f32
@@ -594,20 +814,22 @@ impl AppearanceUi {
                 return;
             }
             self.cancel_preview();
-            if let Some(Hit::Field(row)) = hit_panel(&self.panel(width, height, compact), x, y) {
-                if row != d.field {
-                    self.open_dropdown(row, width, height, compact);
+            if let Some(Hit::Field(slot)) = hit_panel(&self.panel(width, height, compact), x, y) {
+                if let Some(field) = self.field_at(slot).filter(|&f| f != d.field) {
+                    self.open_dropdown(field, width, height, compact);
                 }
             }
             return;
         }
         match hit_panel(&self.panel(width, height, compact), x, y) {
             Some(Hit::Close) => self.set_open(false),
-            Some(Hit::Reset) => {
-                self.reset_defaults();
+            Some(Hit::Reset) => self.reset(),
+            Some(Hit::Field(slot)) => {
+                if let Some(field) = self.field_at(slot) {
+                    self.open_dropdown(field, width, height, compact);
+                }
             }
-            Some(Hit::Field(row)) => self.open_dropdown(row, width, height, compact),
-            None => {}
+            Some(Hit::Page { .. }) | None => {}
         }
     }
     pub fn key(&mut self, input: &KeyInput<'_>, width: usize, height: usize, compact: bool) {
@@ -659,13 +881,7 @@ impl AppearanceUi {
                 }
                 Key::Named(NamedKey::Tab) => {
                     self.cancel_preview();
-                    self.focus = (self.focus
-                        + if input.modifiers.shift_key() {
-                            ROWS - 1
-                        } else {
-                            1
-                        })
-                        % ROWS;
+                    self.step_focus(input.modifiers.shift_key());
                     return;
                 }
                 Key::Named(NamedKey::ArrowUp) => d.navigate(-1, &enabled),
@@ -710,15 +926,7 @@ impl AppearanceUi {
         }
         match input.logical {
             Key::Named(NamedKey::Escape) => self.set_open(false),
-            Key::Named(NamedKey::Tab) => {
-                self.focus = (self.focus
-                    + if input.modifiers.shift_key() {
-                        ROWS - 1
-                    } else {
-                        1
-                    })
-                    % ROWS
-            }
+            Key::Named(NamedKey::Tab) => self.step_focus(input.modifiers.shift_key()),
             Key::Named(
                 NamedKey::ArrowUp
                 | NamedKey::ArrowDown
@@ -758,15 +966,24 @@ impl AppearanceUi {
             c.panel_border,
         );
         let top = if compact { 4 } else { 16 };
-        label(
-            draws,
-            font,
-            (width, height),
-            (r.x + p.pad, r.y + top),
-            "Appearance",
-            c.text,
-            r.w.saturating_sub(40),
-        );
+        for (visuals, name) in [(false, "Style"), (true, "Visuals")] {
+            let tab = p.tab(visuals);
+            let active = visuals == self.visuals_page();
+            label(
+                draws,
+                font,
+                (width, height),
+                (tab.x, r.y + top),
+                name,
+                if active { c.text } else { c.status_text },
+                tab.w,
+            );
+            if active {
+                let under = r.y + top + if compact { 9 } else { 18 };
+                let w = name.chars().count() * if compact { 8 } else { 9 };
+                draw_rect(draws, width, height, tab.x, under, w, 1, c.status_accent);
+            }
+        }
         label(
             draws,
             font,
@@ -790,6 +1007,18 @@ impl AppearanceUi {
                         &self.font_query
                     }
                 )
+            } else if self.visuals_page() {
+                let first = self.scroll + 1;
+                let last = (self.scroll + ROWS).min(FIELDS - STYLE_FIELDS);
+                format!(
+                    "Rows {first}-{last} of {}{}",
+                    FIELDS - STYLE_FIELDS,
+                    if compact {
+                        ""
+                    } else {
+                        "  Tab: field  Enter: list"
+                    }
+                )
             } else if compact {
                 "Tab: field  Enter: list".into()
             } else {
@@ -798,56 +1027,18 @@ impl AppearanceUi {
             c.status_text,
             r.w.saturating_sub(2 * p.pad),
         );
-        let t = self.settings.editor_typography();
-        let screen = if self.settings.framebuffer == texted_app::framebuffer::Framebuffer::Auto {
-            self.settings
-                .resolution()
-                .map_or("Auto: Native".into(), |(w, h)| format!("Auto: {w}x{h}"))
-        } else {
-            self.settings.framebuffer.name().into()
-        };
-        let mut values = [
-            self.settings.theme.name().to_owned(),
-            screen,
-            t.family.name().into(),
-            format!("{}%", t.scale_percent()),
-            format!("{}%", t.line_spacing),
-            self.settings.mouse_cursor.name().into(),
-            self.settings.crt.name().into(),
-        ];
-        if self.cell_backend {
-            for value in &mut values[1..] {
-                *value = "Terminal setting".into();
-            }
-        }
-        if self.terminal_graphics {
-            values[5] = "Terminal pointer".into();
-            values[6] = "Window only".into();
-        }
-        let titles = if compact {
-            [
-                "Theme", "Screen", "Font", "Size", "Spacing", "Cursor", "CRT",
-            ]
-        } else {
-            [
-                "Theme",
-                "Resolution",
-                "Editor font",
-                "Text scale",
-                "Line height",
-                "Mouse cursor",
-                "CRT effect",
-            ]
-        };
-        for (row, (title, value)) in titles.iter().zip(values).enumerate() {
-            let field = p.row(row);
-            let text_y = field.y + if compact { 4 } else { 5 };
+        for slot in 0..ROWS {
+            let Some(field) = self.field_at(slot) else {
+                break;
+            };
+            let field_rect = p.row(slot);
+            let text_y = field_rect.y + if compact { 4 } else { 5 };
             label(
                 draws,
                 font,
                 (width, height),
                 (r.x + p.pad, text_y),
-                title,
+                field_title(field, compact),
                 c.text,
                 p.input.saturating_sub(2 * p.pad),
             );
@@ -855,12 +1046,12 @@ impl AppearanceUi {
                 draws,
                 width,
                 height,
-                field.x,
-                field.y,
-                field.w,
-                field.h,
+                field_rect.x,
+                field_rect.y,
+                field_rect.w,
+                field_rect.h,
                 c.input_bg,
-                if self.focus == row {
+                if self.focus == field {
                     c.input_active
                 } else {
                     c.input_border
@@ -870,17 +1061,17 @@ impl AppearanceUi {
                 draws,
                 font,
                 (width, height),
-                (field.x + if compact { 4 } else { 10 }, text_y),
-                &value,
+                (field_rect.x + if compact { 4 } else { 10 }, text_y),
+                &self.field_text(field),
                 c.text,
-                field.w.saturating_sub(if compact { 20 } else { 38 }),
+                field_rect.w.saturating_sub(if compact { 20 } else { 38 }),
             );
             label(
                 draws,
                 font,
                 (width, height),
                 (
-                    field.x + field.w.saturating_sub(if compact { 12 } else { 24 }),
+                    field_rect.x + field_rect.w.saturating_sub(if compact { 12 } else { 24 }),
                     text_y,
                 ),
                 "v",
@@ -888,10 +1079,12 @@ impl AppearanceUi {
                 16,
             );
         }
-        for (rect, text) in [
-            (p.reset(), if compact { "Reset" } else { "Reset defaults" }),
-            (p.done(), "Done"),
-        ] {
+        let reset = match (compact, self.visuals_page()) {
+            (true, _) => "Reset",
+            (false, false) => "Reset defaults",
+            (false, true) => "Theme visuals",
+        };
+        for (rect, text) in [(p.reset(), reset), (p.done(), "Done")] {
             draw_box(
                 draws,
                 width,
@@ -1077,6 +1270,36 @@ impl AppearanceUi {
                 c.gutter_text,
             );
         }
+    }
+}
+/// Row titles; compact ones fit seven 8-pixel cells.
+fn field_title(field: usize, compact: bool) -> &'static str {
+    const COMPACT: [&str; FIELDS] = [
+        "Theme", "Screen", "Font", "Size", "Spacing", "Cursor", "Preset", "FPS", "Time", "Bright",
+        "Curve", "Aberr", "Glow", "Noise", "Flicker", "Scan",
+    ];
+    const FULL: [&str; FIELDS] = [
+        "Theme",
+        "Resolution",
+        "Editor font",
+        "Text scale",
+        "Line height",
+        "Mouse cursor",
+        "Preset",
+        "Frame rate",
+        "Time of day",
+        "Brightness",
+        "Curvature",
+        "Aberration",
+        "Afterglow",
+        "Noise",
+        "Flicker",
+        "Scanlines",
+    ];
+    if compact {
+        COMPACT[field]
+    } else {
+        FULL[field]
     }
 }
 fn label(
@@ -1288,23 +1511,110 @@ mod tests {
             ));
         }
     }
-    #[test]
-    fn the_crt_row_offers_three_strengths_and_keeps_the_choice() {
-        use texted_app::framebuffer::CrtEffect;
-        let mut ui = AppearanceUi::new(Appearance {
-            theme: Theme::C64,
-            ..Default::default()
-        });
-        let labels: Vec<_> = ui.choices(6).iter().map(|c| c.label.clone()).collect();
-        assert_eq!(labels, ["Off", "Subtle", "Strong", "Wallpaper", "Custom"]);
-        ui.set_open(true);
-        ui.open_dropdown(6, 320, 200, true);
+    fn key_input(key: NamedKey, shift: bool) -> KeyInput<'static> {
+        let logical: &'static Key = Box::leak(Box::new(Key::Named(key)));
+        KeyInput {
+            physical: winit::keyboard::PhysicalKey::Unidentified(
+                winit::keyboard::NativeKeyCode::Unidentified,
+            ),
+            logical,
+            text: None,
+            modifiers: if shift {
+                winit::keyboard::ModifiersState::SHIFT
+            } else {
+                winit::keyboard::ModifiersState::empty()
+            },
+        }
+    }
+    fn pick(ui: &mut AppearanceUi, field: usize, label: &str) {
+        let (w, h) = (320, 200);
+        ui.open_dropdown(field, w, h, true);
         let d = ui.dropdown.unwrap();
-        let choices = ui.choices(6);
-        let popup = ui.popup(d, 320, 200, true, &choices);
-        let row = popup.row(2, d.first).unwrap();
-        ui.click(320, 200, (row.x + 10) as f32, (row.y + 4) as f32, true);
-        assert_eq!(ui.settings.crt, CrtEffect::Strong);
+        let choices = ui.choices(field);
+        let index = choices.iter().position(|c| c.label == label).unwrap();
+        let mut d = d;
+        d.highlighted = index;
+        let popup = ui.popup(d, w, h, true, &choices);
+        d.reveal(popup.visible, choices.len());
+        ui.dropdown = Some(d);
+        let row = popup.row(index, d.first).unwrap();
+        ui.click(w, h, (row.x + 10) as f32, (row.y + 4) as f32, true);
+        assert!(ui.dropdown.is_none(), "{label} was not chosen");
+    }
+    #[test]
+    fn tab_walks_from_the_style_page_into_the_scrolling_visuals_page_and_back() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        ui.set_focus(5);
+        assert!(!ui.visuals_page());
+        ui.key(&key_input(NamedKey::Tab, false), 320, 200, true);
+        assert_eq!((ui.focus, ui.visuals_page()), (PRESET, true));
+        assert_eq!(ui.field_at(0), Some(PRESET));
+        for _ in PRESET..FIELDS - 1 {
+            ui.key(&key_input(NamedKey::Tab, false), 320, 200, true);
+            assert!(
+                ui.slot_of(ui.focus).is_some(),
+                "field {} is off screen",
+                ui.focus
+            );
+        }
+        assert_eq!(ui.field_at(ROWS - 1), Some(FIELDS - 1));
+        ui.key(&key_input(NamedKey::Tab, false), 320, 200, true);
+        assert_eq!((ui.focus, ui.visuals_page()), (0, false));
+        ui.key(&key_input(NamedKey::Tab, true), 320, 200, true);
+        assert_eq!(ui.focus, FIELDS - 1);
+    }
+    #[test]
+    fn the_visuals_tab_turns_the_page_with_the_mouse() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        let tab = Panel::new(320, 200, true).tab(true);
+        ui.click(320, 200, (tab.x + 4) as f32, (tab.y + 4) as f32, true);
+        assert!(ui.visuals_page());
+        ui.end_drag();
+        let style = Panel::new(320, 200, true).tab(false);
+        ui.click(320, 200, (style.x + 4) as f32, (style.y + 4) as f32, true);
+        assert!(!ui.visuals_page());
+    }
+    #[test]
+    fn a_machine_preset_fills_frame_rate_and_every_effect_and_rows_set_exact_steps() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        pick(&mut ui, PRESET, "Atari ST");
+        assert_eq!(ui.settings.visuals(), Machine::AtariSt.visuals());
+        assert_eq!(ui.field_text(PRESET), "Atari ST");
+        pick(&mut ui, FIRST_EFFECT, "0.95");
+        assert_eq!(
+            ui.settings.visuals().effects.brightness,
+            Effect::Brightness.value_at(9)
+        );
+        assert_eq!(ui.field_text(PRESET), "Custom");
+        pick(&mut ui, FRAME_RATE, "30 FPS");
+        pick(&mut ui, TIME, "13:00");
+        assert_eq!(
+            (ui.settings.visuals().fps, ui.settings.visuals().time),
+            (30, Some(13 * 3600))
+        );
+        assert_eq!(ui.field_text(TIME), "13:00:00");
+    }
+    #[test]
+    fn a_theme_brings_its_visuals_and_reset_restores_them_without_touching_style() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        pick(&mut ui, 0, Theme::ZxSpectrum.name());
+        assert_eq!(ui.settings.visuals(), Machine::ZxSpectrum.visuals());
+        pick(&mut ui, FIRST_EFFECT + 4, "0.10");
+        ui.set_focus(FIRST_EFFECT + 4);
+        ui.reset();
+        assert_eq!(ui.settings.visuals(), Machine::ZxSpectrum.visuals());
+        assert_eq!(ui.settings.theme, Theme::ZxSpectrum);
+    }
+    #[test]
+    fn terminals_show_visuals_as_window_only() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_cell_backend(true);
+        assert!(ui.choices(PRESET).iter().all(|c| !c.enabled));
+        assert_eq!(ui.field_text(FIRST_EFFECT), "Window only");
     }
     #[test]
     fn compact_lists_commit_clicked_values_and_outside_clicks_dismiss_only_the_list() {

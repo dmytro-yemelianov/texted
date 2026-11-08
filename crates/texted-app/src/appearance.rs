@@ -368,11 +368,14 @@ pub struct Appearance {
     pub mouse_cursor: MouseCursor,
     pub typography: Typography,
     pub framebuffer: Framebuffer,
-    /// Screen effect preset; older files without it load as Off.
-    pub crt: crate::framebuffer::CrtEffect,
-    /// Amounts used when `crt` is Custom, edited in the file like custom colors.
-    #[serde(skip_serializing_if = "crate::framebuffer::VisualEffects::is_neutral")]
-    pub effects: crate::framebuffer::VisualEffects,
+    /// The Visuals page; files without it have no screen effects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visuals: Option<crate::visuals::Visuals>,
+    /// Read from files written before the Visuals page, then folded into `visuals`.
+    #[serde(skip_serializing)]
+    pub crt: Option<crate::visuals::CrtEffect>,
+    #[serde(skip_serializing)]
+    pub effects: Option<crate::visuals::VisualEffects>,
     pub pixel_typography: Typography,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub colors: BTreeMap<String, String>,
@@ -385,8 +388,9 @@ impl Default for Appearance {
             mouse_cursor: MouseCursor::System,
             typography: Typography::default(),
             framebuffer: Framebuffer::default(),
-            crt: Default::default(),
-            effects: Default::default(),
+            visuals: None,
+            crt: None,
+            effects: None,
             pixel_typography: Typography {
                 family: FontFamily::Bios,
                 size_px: 8,
@@ -398,9 +402,14 @@ impl Default for Appearance {
     }
 }
 impl Appearance {
-    /// The screen effects to draw: a preset, or the Custom amounts.
-    pub fn visual_effects(&self) -> crate::framebuffer::VisualEffects {
-        self.crt.effects(self.effects)
+    /// The Visuals page settings, including what an older `crt` key meant.
+    pub fn visuals(&self) -> crate::visuals::Visuals {
+        self.visuals
+            .or_else(|| {
+                self.crt
+                    .map(|crt| crt.visuals(self.effects.unwrap_or_default()))
+            })
+            .unwrap_or_default()
     }
     pub fn resolution(&self) -> Option<(u32, u32)> {
         self.framebuffer.resolve(self.theme)
@@ -424,6 +433,10 @@ impl Appearance {
         if self.version != 1 {
             return Err(format!("Unsupported appearance version {}", self.version));
         }
+        if self.visuals.is_some() || self.crt.is_some() {
+            self.visuals = Some(self.visuals().normalized());
+        }
+        (self.crt, self.effects) = (None, None);
         self.typography.normalize();
         self.pixel_typography.normalize();
         self.palette()?;
@@ -540,39 +553,22 @@ mod tests {
         );
     }
     #[test]
-    fn crt_effect_is_saved_and_older_files_load_without_it() {
-        use crate::framebuffer::CrtEffect;
-        let old: Appearance = serde_json::from_str(r#"{"theme":"c64"}"#).unwrap();
-        assert_eq!(old.crt, CrtEffect::Off);
-        let a = Appearance {
-            crt: CrtEffect::Strong,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&a).unwrap();
-        assert!(json.contains(r#""crt":"strong""#), "{json}");
-        assert_eq!(serde_json::from_str::<Appearance>(&json).unwrap(), a);
-    }
-    #[test]
-    fn custom_effects_come_from_the_file_and_neutral_ones_are_not_written() {
-        use crate::framebuffer::{CrtEffect, VisualEffects};
-        let file = r#"{"crt":"custom","effects":{"curvature":0.05,"noise":0.3}}"#;
-        let a: Appearance = serde_json::from_str(file).unwrap();
-        assert_eq!(a.crt, CrtEffect::Custom);
-        let effects = a.visual_effects();
-        assert_eq!(
-            (effects.curvature, effects.noise, effects.brightness),
-            (0.05, 0.3, 1.0)
-        );
-        let wallpaper = Appearance {
-            crt: CrtEffect::Wallpaper,
-            ..Default::default()
-        };
-        assert_eq!(wallpaper.visual_effects(), VisualEffects::WALLPAPER);
-        let json = serde_json::to_string(&wallpaper).unwrap();
+    fn visuals_are_saved_and_older_crt_files_migrate() {
+        use crate::visuals::Machine;
+        let old: Appearance =
+            serde_json::from_str(r#"{"theme":"green_crt","crt":"wallpaper"}"#).unwrap();
+        assert_eq!(old.visuals(), Machine::AtariSt.visuals());
+        let mut migrated = old.clone();
+        migrated.normalize().unwrap();
+        let json = serde_json::to_string(&migrated).unwrap();
         assert!(
-            json.contains(r#""crt":"wallpaper""#) && !json.contains("effects"),
+            json.contains(r#""visuals""#) && !json.contains(r#""crt""#),
             "{json}"
         );
+        let again: Appearance = serde_json::from_str(&json).unwrap();
+        assert_eq!(again.visuals(), Machine::AtariSt.visuals());
+        let plain: Appearance = serde_json::from_str(r#"{"theme":"zx_spectrum"}"#).unwrap();
+        assert!(plain.visuals().effects.is_neutral());
     }
     #[test]
     fn future_versions_unknown_colors_and_invalid_rgb_are_rejected() {

@@ -83,9 +83,9 @@ pub(crate) struct App {
     key_function: Option<usize>,
     mouse_function: Option<usize>,
     command_flash: Option<(usize, Instant)>,
-    /// Start of animated screen effects, and the time last drawn; it stops while unfocused.
-    effect_clock: Instant,
+    /// The effect time last drawn, which holds while unfocused, and when the next frame is due.
     effect_time: f32,
+    next_effect_frame: Option<Instant>,
     // Destroy the main-thread window last, after the renderer and document state.
     // Worker callbacks must notify `wake`, never capture this native window.
     window: Arc<Host>,
@@ -215,8 +215,8 @@ impl App {
             key_function: None,
             mouse_function: None,
             command_flash: None,
-            effect_clock: Instant::now(),
             effect_time: 0.0,
+            next_effect_frame: None,
         }
     }
     /// Screen effects belong to the window backend; terminals draw the flat picture.
@@ -224,15 +224,15 @@ impl App {
         if self.window.is_terminal() {
             return mapping;
         }
-        let effects = self.appearance.settings.visual_effects();
-        if !effects.animated() {
-            self.effect_time = 0.0;
+        let visuals = self.appearance.settings.visuals();
+        if !visuals.animated() {
+            self.effect_time = visuals.effect_time(0.0);
         } else if self.focused {
-            // Wrapped so f32 keeps sub-millisecond precision for the fast flicker term.
-            self.effect_time = self.effect_clock.elapsed().as_secs_f32() % 3600.0;
+            self.effect_time =
+                visuals.effect_time(texted_app::visuals::local_seconds_since_midnight());
         }
         let pixel = self.font.pixel_px() * mapping.scale().0;
-        mapping.with_effects(effects, self.effect_time, pixel)
+        mapping.with_effects(visuals.effects, self.effect_time, pixel)
     }
     fn resolution(&self) -> Option<(u32, u32)> {
         if self.window.is_cells() {
@@ -694,19 +694,24 @@ impl App {
         event: Event<AppEvent>,
         target: &EventLoopWindowTarget<AppEvent>,
     ) -> bool {
+        let effect_frame = self.next_effect_frame;
         target.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now()
-                + Duration::from_millis(
-                    if self.command_flash.is_some()
-                        || self.panel_help.pending_tip()
-                        || self.session.buffer.client.latest().busy.is_some()
-                        || self.session.search.state.pending
-                        || self.session.transfers.busy()
-                    {
-                        16
-                    } else {
-                        500
-                    },
+            effect_frame
+                .map_or(Instant::now() + Duration::from_secs(1), |at| at)
+                .min(
+                    Instant::now()
+                        + Duration::from_millis(
+                            if self.command_flash.is_some()
+                                || self.panel_help.pending_tip()
+                                || self.session.buffer.client.latest().busy.is_some()
+                                || self.session.search.state.pending
+                                || self.session.transfers.busy()
+                            {
+                                16
+                            } else {
+                                500
+                            },
+                        ),
                 ),
         ));
         match event {
@@ -1105,7 +1110,7 @@ impl App {
                 let before = self.appearance.settings.clone();
                 match intent {
                     Intent::AcceptAppearance => self.appearance.accept_and_close(),
-                    Intent::ResetAppearance => self.appearance.reset_defaults(),
+                    Intent::ResetAppearance => self.appearance.reset(),
                     Intent::BrowseAppearance { forward } => self.appearance.browse(
                         forward,
                         self.display.source.0 as usize,
@@ -1643,6 +1648,13 @@ impl App {
         );
     }
     pub(crate) fn tick(&mut self) -> bool {
+        if self
+            .next_effect_frame
+            .is_some_and(|at| at <= Instant::now())
+        {
+            self.next_effect_frame = None;
+            self.window.request_redraw();
+        }
         self.poll_dialogs();
         if let Some(result) = self.preferences.as_mut().and_then(Preferences::poll) {
             match result {
@@ -1972,10 +1984,12 @@ impl App {
                     .geometry()
                     .document_point(self.display.to_source_clamped(self.pointer_physical));
                 self.update_cursor();
-                // Noise and flicker move every frame, but only while the window is in use.
-                if display.effects.animated() && self.focused {
-                    self.window.request_redraw();
-                }
+                // Moving effects advance at the Visuals frame rate while the window is in use.
+                let visuals = self.appearance.settings.visuals();
+                self.next_effect_frame = (visuals.animated()
+                    && self.focused
+                    && !self.window.is_terminal())
+                .then(|| Instant::now() + Duration::from_secs_f64(1.0 / f64::from(visuals.fps)));
             }
             Ok(false) => self.window.request_redraw(),
             Err(error) => {

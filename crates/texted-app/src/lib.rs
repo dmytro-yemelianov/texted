@@ -14,6 +14,7 @@ pub mod input;
 pub mod preferences;
 pub mod search;
 pub mod selection;
+pub mod visuals;
 
 pub(crate) mod app;
 pub(crate) mod appearance_ui;
