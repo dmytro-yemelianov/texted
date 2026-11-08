@@ -27,12 +27,13 @@ use texted_app::{
 };
 use winit::{
     event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ControlFlow, EventLoopWindowTarget},
+    event_loop::{ControlFlow, EventLoopProxy, EventLoopWindowTarget},
     keyboard::ModifiersState,
     window::Window,
 };
 pub(crate) struct App {
     session: crate::session::Session,
+    wake: crate::Wake,
     // The active slot is None because its complete state is owned by `session`.
     tabs: Vec<Option<crate::session::Session>>,
     active: usize,
@@ -42,7 +43,6 @@ pub(crate) struct App {
     pending_open: std::collections::VecDeque<Action>,
     closing: bool,
     quitting: bool,
-    window: Arc<Window>,
     renderer: gpu::Renderer,
     failed: bool,
     font: FontEngine,
@@ -65,6 +65,9 @@ pub(crate) struct App {
     key_function: Option<usize>,
     mouse_function: Option<usize>,
     command_flash: Option<(usize, Instant)>,
+    // Destroy the main-thread window last, after the renderer and document state.
+    // Worker callbacks must notify `wake`, never capture this native window.
+    window: Arc<Window>,
 }
 impl App {
     pub fn new(
@@ -72,8 +75,18 @@ impl App {
         renderer: gpu::Renderer,
         initial: Vec<std::path::PathBuf>,
         menus: NativeMenus,
+        proxy: EventLoopProxy<AppEvent>,
     ) -> Self {
-        let mut session = crate::session::Session::new(&window, 1);
+        // EventLoopProxy is safe to notify after the loop stops; Window's macOS
+        // request_redraw dispatches synchronously and cannot be called by joined workers.
+        let proxy = std::sync::Mutex::new(proxy);
+        let wake: crate::Wake = Arc::new(move || {
+            let _ = proxy
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .send_event(AppEvent::Wake);
+        });
+        let mut session = crate::session::Session::new(wake.clone(), 1);
         let mut initial = initial.into_iter();
         if let Some(path) = initial.next() {
             let _ = session.files.enqueue(Action::OpenPath(path));
@@ -82,9 +95,9 @@ impl App {
         let path = preferences::default_path();
         let (settings,warning)=match path.as_deref().map(preferences::load) {Some(Ok(settings))=>(settings,None),Some(Err(error))=>(Appearance::default(),Some(format!("Appearance preferences could not be loaded: {error}. Changes apply for this session."))),None=>(Appearance::default(),Some("Appearance preferences path is unavailable; changes apply for this session.".into()))};
         let mut appearance = AppearanceUi::new(settings);
-        let w = window.clone();
+        let w = wake.clone();
         let preferences = if warning.is_none() {
-            path.map(|path| Preferences::new(path, move || w.request_redraw()))
+            path.map(|path| Preferences::new(path, move || w()))
         } else {
             appearance.save_status = "Session only: preferences could not be loaded".into();
             None
@@ -94,11 +107,12 @@ impl App {
         let size = window.inner_size();
         let display =
             ScreenMapping::new((size.width, size.height), appearance.settings.resolution());
-        let w = window.clone();
-        let stats = texted_app::document_stats::DocumentStats::new(move || w.request_redraw());
+        let w = wake.clone();
+        let stats = texted_app::document_stats::DocumentStats::new(move || w());
         session.message = warning;
         Self {
             session,
+            wake,
             tabs: vec![None],
             active: 0,
             next_tab_id: 2,
@@ -326,7 +340,7 @@ impl App {
                 == 0
             && !matches!(action, Action::New);
         if !reuse {
-            let next = crate::session::Session::new(&self.window, self.next_tab_id);
+            let next = crate::session::Session::new(self.wake.clone(), self.next_tab_id);
             self.next_tab_id += 1;
             let old = std::mem::replace(&mut self.session, next);
             self.tabs[self.active] = Some(old);
@@ -353,6 +367,9 @@ impl App {
         }
     }
     fn begin_quit(&mut self) {
+        if self.session.files.locked() {
+            crate::documents::reveal_for_dialog(&self.window);
+        }
         self.quitting = true;
         self.begin_close();
     }
@@ -408,6 +425,7 @@ impl App {
             Event::UserEvent(AppEvent::Menu(command)) => self.menu_command(command),
             Event::UserEvent(AppEvent::Document(action)) => self.file_action(action),
             Event::UserEvent(AppEvent::Quit) => self.begin_quit(),
+            Event::UserEvent(AppEvent::Wake) => self.window.request_redraw(),
             Event::WindowEvent { window_id, event } if window_id == self.window.id() => {
                 self.window_event(event)
             }

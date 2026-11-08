@@ -14,9 +14,9 @@ pub(crate) struct FileFlow {
     pub reset: bool,
 }
 impl FileFlow {
-    pub fn new(content: ropey::Rope) -> Self {
+    pub fn new(content: ropey::Rope, wake: crate::Wake) -> Self {
         Self {
-            documents: Documents::new(content, None, false, LineEnding::Lf),
+            documents: Documents::new(content, None, false, LineEnding::Lf, wake),
             queue: VecDeque::new(),
             install: None,
             reset: false,
@@ -93,7 +93,7 @@ mod tests {
             let _ = wake.try_send(());
         });
         let client = &service.client;
-        let mut flow = FileFlow::new(client.latest().snapshot.content.clone());
+        let mut flow = FileFlow::new(client.latest().snapshot.content.clone(), Arc::new(|| {}));
         client
             .submit(Command::Edit(EditorCommand::Insert("prior".into())))
             .unwrap_or_else(|_| panic!("rejected"));
@@ -149,7 +149,7 @@ mod tests {
     fn initial_saved_root_is_the_actual_published_root() {
         let service = texted_app::buffer_service::BufferService::new(|| {});
         let p = service.client.latest();
-        let flow = FileFlow::new(p.snapshot.content.clone());
+        let flow = FileFlow::new(p.snapshot.content.clone(), Arc::new(|| {}));
         assert!(!flow.documents.dirty(&p.snapshot));
     }
 }

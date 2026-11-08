@@ -12,6 +12,12 @@ use texted_app::buffer_service::{BufferClient, Command};
 use texted_buffer::BufferSnapshot;
 use texted_io::{IoManager, LineEnding, LoadedDocument};
 use winit::window::Window;
+/// A user-requested file operation must not wait on a hidden or minimized sheet.
+pub(crate) fn reveal_for_dialog(window: &Window) {
+    window.set_visible(true);
+    window.set_minimized(false);
+    window.focus_window();
+}
 #[derive(Debug, Clone)]
 pub enum Action {
     OpenDialog,
@@ -45,17 +51,17 @@ enum Job {
     },
     Error(NativeFuture<rfd::MessageDialogResult>),
 }
-struct WindowWake(Arc<Window>);
-impl Wake for WindowWake {
+struct DialogWake(crate::Wake);
+impl Wake for DialogWake {
     fn wake(self: Arc<Self>) {
-        self.0.request_redraw();
+        (self.0)();
     }
     fn wake_by_ref(self: &Arc<Self>) {
-        self.0.request_redraw();
+        (self.0)();
     }
 }
-fn poll_native<T>(future: &mut NativeFuture<T>, window: &Arc<Window>) -> Poll<T> {
-    let waker = Waker::from(Arc::new(WindowWake(window.clone())));
+fn poll_native<T>(future: &mut NativeFuture<T>, wake: &crate::Wake) -> Poll<T> {
+    let waker = Waker::from(Arc::new(DialogWake(wake.clone())));
     future.as_mut().poll(&mut Context::from_waker(&waker))
 }
 pub struct Documents {
@@ -63,16 +69,24 @@ pub struct Documents {
     pub bom: bool,
     pub ending: LineEnding,
     saved_text: Rope,
+    wake: crate::Wake,
     job: Option<Job>,
     next: Option<Action>,
 }
 impl Documents {
-    pub fn new(text: Rope, path: Option<PathBuf>, bom: bool, ending: LineEnding) -> Self {
+    pub fn new(
+        text: Rope,
+        path: Option<PathBuf>,
+        bom: bool,
+        ending: LineEnding,
+        wake: crate::Wake,
+    ) -> Self {
         Self {
             path,
             bom,
             ending,
             saved_text: text,
+            wake,
             job: None,
             next: None,
         }
@@ -114,6 +128,7 @@ impl Documents {
         self.saved_text = document.content.clone();
     }
     fn error(&mut self, window: &Arc<Window>, message: &str) {
+        reveal_for_dialog(window);
         eprintln!("{message}");
         self.next = None;
         self.job = Some(Job::Error(Box::pin(
@@ -148,6 +163,7 @@ impl Documents {
             return Effect::None;
         }
         if self.dirty(snapshot) {
+            reveal_for_dialog(window);
             let future = Box::pin(
                 rfd::AsyncMessageDialog::new()
                     .set_parent(window.as_ref())
@@ -177,6 +193,7 @@ impl Documents {
                 byte_size: 0,
             }),
             Action::OpenDialog => {
+                reveal_for_dialog(window);
                 let mut dialog = rfd::AsyncFileDialog::new()
                     .set_parent(window.as_ref())
                     .set_title("Open plain-text file");
@@ -198,12 +215,12 @@ impl Documents {
         let (tx, rx) = mpsc::channel();
         self.job = Some(Job::Load(rx));
         window.request_redraw();
-        let window = window.clone();
+        let wake = self.wake.clone();
         thread::spawn(move || {
             let result = IoManager::open_file(&path)
                 .map_err(|e| format!("Could not open {}: {e}", path.display()));
             let _ = tx.send(result);
-            window.request_redraw();
+            wake();
         });
     }
     fn save(
@@ -221,6 +238,7 @@ impl Documents {
             return;
         }
         if save_as || self.path.is_none() {
+            reveal_for_dialog(window);
             let mut dialog = rfd::AsyncFileDialog::new()
                 .set_parent(window.as_ref())
                 .set_title("Save plain-text file")
@@ -250,7 +268,7 @@ impl Documents {
         let content = snapshot.content.clone();
         let bom = self.bom;
         let ending = self.ending;
-        let window = window.clone();
+        let wake = self.wake.clone();
         thread::spawn(move || {
             let result = IoManager::save_rope(&path, &content, bom, ending)
                 .map_err(|e| format!("Could not save {}: {e}", path.display()))
@@ -259,7 +277,7 @@ impl Documents {
                     text: content,
                 });
             let _ = tx.send(result);
-            window.request_redraw();
+            wake();
         });
     }
     pub fn poll(
@@ -306,7 +324,7 @@ impl Documents {
                 Job::ChooseSave {
                     future,
                     snapshot: written,
-                } => match poll_native(future, window) {
+                } => match poll_native(future, &self.wake) {
                     Poll::Ready(Some(file)) => {
                         self.write(written, file.path().into(), window);
                         return Effect::None;
@@ -319,7 +337,7 @@ impl Documents {
                         return Effect::None;
                     }
                 },
-                Job::ChooseOpen(future) => match poll_native(future, window) {
+                Job::ChooseOpen(future) => match poll_native(future, &self.wake) {
                     Poll::Ready(Some(file)) => {
                         self.open(file.path().into(), window);
                         return Effect::None;
@@ -330,7 +348,7 @@ impl Documents {
                         return Effect::None;
                     }
                 },
-                Job::Confirm { future, action } => match poll_native(future, window) {
+                Job::Confirm { future, action } => match poll_native(future, &self.wake) {
                     Poll::Ready(choice) => {
                         if choice == rfd::MessageDialogResult::Yes
                             || choice == rfd::MessageDialogResult::Custom("Save".into())
@@ -351,7 +369,7 @@ impl Documents {
                         return Effect::None;
                     }
                 },
-                Job::Error(future) => match poll_native(future, window) {
+                Job::Error(future) => match poll_native(future, &self.wake) {
                     Poll::Ready(_) => {}
                     Poll::Pending => {
                         self.job = Some(job);
@@ -371,8 +389,35 @@ mod tests {
     use super::*;
     use texted_buffer::TextBuffer;
     #[test]
+    fn native_dialog_completion_wakes_an_undispatched_ui_queue() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (send, received) = mpsc::channel();
+        let wake: crate::Wake = Arc::new(move || {
+            let _ = send.send(());
+        });
+        let done = Arc::new(AtomicBool::new(false));
+        let state = done.clone();
+        let mut future: NativeFuture<()> = Box::pin(std::future::poll_fn(move |cx| {
+            if state.load(Ordering::Acquire) {
+                return Poll::Ready(());
+            }
+            let state = state.clone();
+            let waker = cx.waker().clone();
+            thread::spawn(move || {
+                state.store(true, Ordering::Release);
+                waker.wake();
+            });
+            Poll::Pending
+        }));
+        assert!(poll_native(&mut future, &wake).is_pending());
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(poll_native(&mut future, &wake).is_ready());
+    }
+    #[test]
     fn actions_wait_for_file_work_and_its_continuation() {
-        let mut doc = Documents::new(Rope::new(), None, false, LineEnding::Lf);
+        let mut doc = Documents::new(Rope::new(), None, false, LineEnding::Lf, Arc::new(|| {}));
         assert!(doc.is_idle());
         let (_tx, rx) = mpsc::channel();
         doc.job = Some(Job::Save(rx));
@@ -386,7 +431,13 @@ mod tests {
     #[test]
     fn undo_to_saved_root_is_clean_and_cursor_changes_are_not_edits() {
         let mut b = TextBuffer::from_string("original".into());
-        let doc = Documents::new(b.create_snapshot().content, None, false, LineEnding::Lf);
+        let doc = Documents::new(
+            b.create_snapshot().content,
+            None,
+            false,
+            LineEnding::Lf,
+            Arc::new(|| {}),
+        );
         b.set_cursor_offset(3);
         assert!(!doc.dirty(&b.create_snapshot()));
         b.insert(3, "ї");
@@ -400,7 +451,13 @@ mod tests {
         b.insert(0, "first");
         let written = b.create_snapshot().content;
         b.insert(5, "second");
-        let doc = Documents::new(written, Some("file.txt".into()), false, LineEnding::Lf);
+        let doc = Documents::new(
+            written,
+            Some("file.txt".into()),
+            false,
+            LineEnding::Lf,
+            Arc::new(|| {}),
+        );
         assert!(doc.dirty(&b.create_snapshot()));
     }
 }

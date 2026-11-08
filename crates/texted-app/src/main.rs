@@ -23,11 +23,14 @@ mod viewport;
 use documents::Action;
 use std::{path::PathBuf, sync::Arc};
 use winit::{event_loop::EventLoopBuilder, window::WindowBuilder};
+pub(crate) type Wake = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     Document(Action),
     Menu(menus::MenuCommand),
     Quit,
+    Wake,
 }
 fn main() {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
@@ -111,6 +114,7 @@ fn main() {
         renderer,
         arguments.into_iter().map(PathBuf::from).collect(),
         menus,
+        event_loop.create_proxy(),
     );
     let _ = event_loop.run(move |event, target| app.event(event, target));
 }
