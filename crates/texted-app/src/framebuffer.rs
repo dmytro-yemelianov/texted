@@ -15,9 +15,11 @@ pub enum Framebuffer {
     C64,
     ZxSpectrum,
     MonoText,
+    MacSystem2,
+    GameBoy,
 }
 impl Framebuffer {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::Auto,
         Self::Native,
         Self::Vga,
@@ -27,6 +29,8 @@ impl Framebuffer {
         Self::C64,
         Self::ZxSpectrum,
         Self::MonoText,
+        Self::MacSystem2,
+        Self::GameBoy,
     ];
     pub fn step(self, delta: i32) -> Self {
         let i = Self::ALL.iter().position(|v| *v == self).unwrap() as i32;
@@ -43,6 +47,8 @@ impl Framebuffer {
             Self::C64 => "C64 320x200",
             Self::ZxSpectrum => "ZX 256x192",
             Self::MonoText => "Mono 720x350",
+            Self::MacSystem2 => "Mac 512x342",
+            Self::GameBoy => "Game Boy 160x144",
         }
     }
     pub fn resolve(self, theme: Theme) -> Option<(u32, u32)> {
@@ -56,6 +62,8 @@ impl Framebuffer {
                 Theme::C64 => Self::C64.resolve(theme),
                 Theme::ZxSpectrum => Self::ZxSpectrum.resolve(theme),
                 Theme::Amber | Theme::GreenCrt => Self::MonoText.resolve(theme),
+                Theme::MacSystem2 => Self::MacSystem2.resolve(theme),
+                Theme::GameBoy => Self::GameBoy.resolve(theme),
             },
             Self::Native => None,
             Self::Vga => Some((640, 480)),
@@ -64,6 +72,8 @@ impl Framebuffer {
             Self::DosText => Some((720, 400)),
             Self::ZxSpectrum => Some((256, 192)),
             Self::MonoText => Some((720, 350)),
+            Self::MacSystem2 => Some((512, 342)),
+            Self::GameBoy => Some((160, 144)),
         }
     }
 }
@@ -196,6 +206,16 @@ mod tests {
             Some((256, 192))
         );
         assert_eq!(Framebuffer::Auto.resolve(Theme::C64), Some((320, 200)));
+    }
+    #[test]
+    fn the_wallpaper_machines_bring_their_screens() {
+        assert_eq!(
+            Framebuffer::Auto.resolve(Theme::MacSystem2),
+            Some((512, 342))
+        );
+        assert_eq!(Framebuffer::Auto.resolve(Theme::GameBoy), Some((160, 144)));
+        assert_eq!(Framebuffer::MacSystem2.name(), "Mac 512x342");
+        assert_eq!(Framebuffer::GameBoy.name(), "Game Boy 160x144");
     }
     #[test]
     fn presentation_and_input_share_aspect_fit_scaling_and_letterbox_rejection() {

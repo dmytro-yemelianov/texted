@@ -16,9 +16,12 @@ pub enum Theme {
     ZxSpectrum,
     Amber,
     GreenCrt,
+    /// ShaderWallpaper's Mac System 2.0 and Game Boy machines.
+    MacSystem2,
+    GameBoy,
 }
 impl Theme {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::ModernDark,
         Self::ModernLight,
         Self::Vga,
@@ -29,6 +32,8 @@ impl Theme {
         Self::ZxSpectrum,
         Self::Amber,
         Self::GreenCrt,
+        Self::MacSystem2,
+        Self::GameBoy,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -42,6 +47,8 @@ impl Theme {
             Self::ZxSpectrum => "ZX Spectrum",
             Self::Amber => "Amber",
             Self::GreenCrt => "Green CRT",
+            Self::MacSystem2 => "Mac System 2.0",
+            Self::GameBoy => "Game Boy",
         }
     }
     pub fn step(self, delta: i32) -> Self {
@@ -80,6 +87,13 @@ impl Theme {
             Self::GreenCrt => (
                 0x061108, 0x90e69c, 0x0d2012, 0x68ac74, 0xc0ffd0, 0x234f2c, 0x375126, 0x536b2b,
             ),
+            // Background, clock text, details and accent from ShaderWallpaper's palettes.
+            Self::MacSystem2 => (
+                0xe3e0d1, 0x141414, 0xd4d1c2, 0x2e2e2e, 0x050505, 0xb8b5a8, 0xcfccbf, 0xa3a094,
+            ),
+            Self::GameBoy => (
+                0x9cad75, 0x2e3d1f, 0x8e9f68, 0x47592e, 0x1a2412, 0x7d8e57, 0xb5c48f, 0x6e7f4a,
+            ),
             Self::ModernDark => unreachable!(),
         };
         Palette {
@@ -105,10 +119,11 @@ impl Theme {
             status_text: fg,
             status_accent: accent,
             // ShaderWallpaper's machines shadow with black; a light screen needs grey.
-            shadow: if self == Self::ModernLight {
-                0xb0b0b0
-            } else {
-                0x000000
+            shadow: match self {
+                Self::ModernLight => 0xb0b0b0,
+                Self::MacSystem2 => 0x1f1f1f,
+                Self::GameBoy => 0x2b361f,
+                _ => 0x000000,
             },
         }
     }
@@ -563,12 +578,40 @@ mod tests {
         );
     }
     #[test]
+    fn shaderwallpaper_machines_are_themes_with_their_palettes() {
+        for (theme, id, name, bg, text, shadow) in [
+            (
+                Theme::MacSystem2,
+                "mac_system2",
+                "Mac System 2.0",
+                0xe3e0d1,
+                0x141414,
+                0x1f1f1f,
+            ),
+            (
+                Theme::GameBoy,
+                "game_boy",
+                "Game Boy",
+                0x9cad75,
+                0x2e3d1f,
+                0x2b361f,
+            ),
+        ] {
+            let p = theme.palette();
+            assert_eq!((p.bg, p.text, p.shadow), (bg, text, shadow), "{name}");
+            assert_eq!(theme.name(), name);
+            assert_eq!(serde_json::to_string(&theme).unwrap(), format!("\"{id}\""));
+            assert!(Theme::ALL.contains(&theme));
+        }
+    }
+    #[test]
     fn every_theme_has_a_shadow_color_and_it_can_be_overridden() {
         for theme in Theme::ALL {
-            let expected = if theme == Theme::ModernLight {
-                0xb0b0b0
-            } else {
-                0x000000
+            let expected = match theme {
+                Theme::ModernLight => 0xb0b0b0,
+                Theme::MacSystem2 => 0x1f1f1f,
+                Theme::GameBoy => 0x2b361f,
+                _ => 0x000000,
             };
             assert_eq!(theme.palette().shadow, expected, "{theme:?}");
         }

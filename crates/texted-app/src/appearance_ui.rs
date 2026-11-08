@@ -44,7 +44,7 @@ const CORNER: usize = BORDER + 1;
 const INSET_X: usize = BORDER + 2;
 const INSET_Y: usize = BORDER + 3;
 const FIELDS: usize = BORDER + 4;
-/// Rows shown at once; the Visuals page scrolls through its fields.
+/// The most rows shown at once; small screens show fewer, and pages scroll.
 const ROWS: usize = 7;
 struct Panel {
     rect: Rect,
@@ -54,14 +54,19 @@ struct Panel {
     row_h: usize,
     pad: usize,
     buttons: usize,
+    /// Field rows that fit this screen, 1 to ROWS.
+    rows: usize,
 }
 impl Panel {
     fn new(width: usize, height: usize, compact: bool) -> Self {
-        let (limit, h, margin, input, row_top, step, row_h, pad) = if compact {
-            (400, 176, 8, 72, 32, 16, 16, 8)
+        // `tail` holds the buttons and the status line below the rows.
+        let (limit, tail, margin, input, row_top, step, row_h, pad) = if compact {
+            (400, 32, 8, 72, 32, 16, 16, 8)
         } else {
-            (704, 368, 16, 152, 64, 32, 32, 16)
+            (704, 80, 16, 152, 64, 32, 32, 16)
         };
+        let rows = (height.saturating_sub(row_top + tail) / step).clamp(1, ROWS);
+        let h = row_top + rows * step + tail;
         let w = width.saturating_sub(margin).min(limit) / 8 * 8;
         Self {
             rect: Rect {
@@ -76,7 +81,8 @@ impl Panel {
             step,
             row_h,
             pad,
-            buttons: row_top + ROWS * step + if compact { 0 } else { 16 },
+            buttons: row_top + rows * step + if compact { 0 } else { 16 },
+            rows,
         }
     }
     fn placed(width: usize, height: usize, compact: bool, position: Option<(f32, f32)>) -> Self {
@@ -106,10 +112,13 @@ impl Panel {
         }
     }
     fn reset(&self) -> Rect {
+        let x = self.rect.x + self.pad;
+        // Narrow screens shrink Reset so it stops a pad short of Done.
+        let room = self.done().x.saturating_sub(x + self.pad);
         Rect {
-            x: self.rect.x + self.pad,
+            x,
             y: self.rect.y + self.buttons,
-            w: if self.pad == 8 { 96 } else { 168 },
+            w: (if self.pad == 8 { 96 } else { 168 }).min(room),
             h: self.row_h,
         }
     }
@@ -151,7 +160,7 @@ fn hit_panel(p: &Panel, x: f32, y: f32) -> Option<Hit> {
             return Some(Hit::Page { visuals });
         }
     }
-    for row in 0..ROWS {
+    for row in 0..p.rows {
         let r = p.row(row);
         if r.contains(x, y) {
             return Some(Hit::Field(row));
@@ -210,8 +219,10 @@ pub(crate) struct AppearanceUi {
     terminal_graphics: bool,
     pub save_status: String,
     focus: usize,
-    /// The first Visuals field shown in the top row.
+    /// The first field of the current page shown in the top row.
     scroll: usize,
+    /// Rows the panel showed last; small screens show fewer than ROWS.
+    rows: std::cell::Cell<usize>,
     dropdown: Option<Dropdown>,
     font_query: String,
     origin: Option<Appearance>,
@@ -238,6 +249,7 @@ impl AppearanceUi {
             save_status: "Changes save automatically".into(),
             focus: 0,
             scroll: 0,
+            rows: std::cell::Cell::new(ROWS),
             dropdown: None,
             font_query: String::new(),
             origin: None,
@@ -302,28 +314,35 @@ impl AppearanceUi {
     fn visuals_page(&self) -> bool {
         self.focus >= STYLE_FIELDS
     }
+    fn page(&self) -> (usize, usize) {
+        if self.visuals_page() {
+            (STYLE_FIELDS, FIELDS)
+        } else {
+            (0, STYLE_FIELDS)
+        }
+    }
     /// The field a row slot shows on the current page.
     fn field_at(&self, slot: usize) -> Option<usize> {
-        let (start, end, offset) = if self.visuals_page() {
-            (STYLE_FIELDS, FIELDS, self.scroll)
-        } else {
-            (0, STYLE_FIELDS, 0)
-        };
-        let field = start + offset + slot;
-        (slot < ROWS && field < end).then_some(field)
+        let (start, end) = self.page();
+        let field = start + self.scroll + slot;
+        (slot < self.rows.get() && field < end).then_some(field)
     }
     fn slot_of(&self, field: usize) -> Option<usize> {
-        (0..ROWS).find(|&slot| self.field_at(slot) == Some(field))
+        (0..self.rows.get()).find(|&slot| self.field_at(slot) == Some(field))
     }
     /// Focuses a field, turning to its page and scrolling it into view.
     fn set_focus(&mut self, field: usize) {
+        let page = self.visuals_page();
         self.focus = field.min(FIELDS - 1);
-        if let Some(index) = self.focus.checked_sub(STYLE_FIELDS) {
-            if index < self.scroll {
-                self.scroll = index;
-            } else if index >= self.scroll + ROWS {
-                self.scroll = index + 1 - ROWS;
-            }
+        if page != self.visuals_page() {
+            self.scroll = 0;
+        }
+        let rows = self.rows.get();
+        let index = self.focus - self.page().0;
+        if index < self.scroll {
+            self.scroll = index;
+        } else if index >= self.scroll + rows {
+            self.scroll = index + 1 - rows;
         }
     }
     fn step_focus(&mut self, back: bool) {
@@ -374,7 +393,9 @@ impl AppearanceUi {
         had
     }
     fn panel(&self, width: usize, height: usize, compact: bool) -> Panel {
-        Panel::placed(width, height, compact, self.position)
+        let p = Panel::placed(width, height, compact, self.position);
+        self.rows.set(p.rows);
+        p
     }
     pub fn cursor(
         &self,
@@ -770,11 +791,13 @@ impl AppearanceUi {
     }
     pub fn wheel(&mut self, rows: f64, width: usize, height: usize, compact: bool) -> bool {
         let Some(mut d) = self.dropdown else {
-            if !self.visuals_page() || rows == 0.0 {
+            let visible = self.panel(width, height, compact).rows;
+            let (start, end) = self.page();
+            if rows == 0.0 || end - start <= visible {
                 return false;
             }
             let before = self.scroll;
-            let most = FIELDS - STYLE_FIELDS - ROWS;
+            let most = end - start - visible;
             self.scroll = if rows > 0.0 {
                 self.scroll.saturating_sub(1)
             } else {
@@ -782,7 +805,7 @@ impl AppearanceUi {
             };
             // Keep the focus on a row that is still shown.
             if self.slot_of(self.focus).is_none() {
-                let edge = if rows > 0.0 { ROWS - 1 } else { 0 };
+                let edge = if rows > 0.0 { visible - 1 } else { 0 };
                 self.focus = self.field_at(edge).unwrap_or(self.focus);
             }
             return self.scroll != before;
@@ -885,6 +908,7 @@ impl AppearanceUi {
         }
     }
     pub fn key(&mut self, input: &KeyInput<'_>, width: usize, height: usize, compact: bool) {
+        self.panel(width, height, compact);
         let activate = matches!(input.logical, Key::Named(NamedKey::Enter))
             || matches!(input.logical,Key::Character(s) if s==" ");
         if let Some(mut d) = self.dropdown {
@@ -1059,12 +1083,12 @@ impl AppearanceUi {
                         &self.font_query
                     }
                 )
-            } else if self.visuals_page() {
+            } else if self.page().1 - self.page().0 > p.rows {
+                let total = self.page().1 - self.page().0;
                 let first = self.scroll + 1;
-                let last = (self.scroll + ROWS).min(FIELDS - STYLE_FIELDS);
+                let last = (self.scroll + p.rows).min(total);
                 format!(
-                    "Rows {first}-{last} of {}{}",
-                    FIELDS - STYLE_FIELDS,
+                    "Rows {first}-{last} of {total}{}",
                     if compact {
                         ""
                     } else {
@@ -1079,7 +1103,7 @@ impl AppearanceUi {
             c.status_text,
             r.w.saturating_sub(2 * p.pad),
         );
-        for slot in 0..ROWS {
+        for slot in 0..p.rows {
             let Some(field) = self.field_at(slot) else {
                 break;
             };
@@ -1534,7 +1558,7 @@ mod tests {
         assert!(ui.dropdown.is_some());
         assert_eq!(ui.settings, original);
         press(&mut ui, NamedKey::End, false);
-        assert_eq!(ui.dropdown.unwrap().highlighted, 9);
+        assert_eq!(ui.dropdown.unwrap().highlighted, Theme::ALL.len() - 1);
         assert_ne!(ui.settings, original); // Arrow navigation previews immediately.
         press(&mut ui, NamedKey::Escape, false);
         assert!(ui.open && ui.dropdown.is_none());
@@ -1545,7 +1569,7 @@ mod tests {
         press(&mut ui, NamedKey::Enter, false);
         press(&mut ui, NamedKey::End, false);
         press(&mut ui, NamedKey::Enter, false);
-        assert_eq!(ui.settings.theme, Theme::GreenCrt);
+        assert_eq!(Some(&ui.settings.theme), Theme::ALL.last());
         assert!(ui.settings.colors.is_empty());
         assert!(ui.dropdown.is_none());
     }
@@ -1739,6 +1763,22 @@ mod tests {
         press(&mut ui, NamedKey::Enter, true);
         assert_eq!(ui.settings.pixel_typography.scale_percent(), 800);
         assert!(ui.dropdown.is_none());
+    }
+    #[test]
+    fn the_panel_fits_a_game_boy_screen_and_scrolls_every_page() {
+        let (w, h) = (160, 144);
+        let p = Panel::new(w, h, true);
+        assert!(p.rect.y + p.rect.h <= h && p.rect.x + p.rect.w <= w);
+        assert!(p.rows >= 1 && p.rows < ROWS);
+        assert!(p.buttons + p.row_h + 4 + 8 <= p.rect.h);
+        assert!(p.reset().x + p.reset().w < p.done().x, "Reset runs into Done");
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        for _ in 0..FIELDS {
+            ui.key(&key_input(NamedKey::Tab, false), w, h, true);
+            let slot = ui.slot_of(ui.focus).expect("focused field is shown");
+            assert!(p.row(slot).y + p.row(slot).h <= p.rect.y + p.buttons);
+        }
     }
     #[test]
     fn the_status_line_stays_inside_the_panel_below_seven_rows() {

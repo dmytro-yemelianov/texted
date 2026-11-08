@@ -351,6 +351,8 @@ impl Visuals {
         match theme {
             Theme::ZxSpectrum => Machine::ZxSpectrum.visuals(),
             Theme::Atari => Machine::AtariSt.visuals(),
+            Theme::MacSystem2 => Machine::MacSystem2.visuals(),
+            Theme::GameBoy => Machine::GameBoy.visuals(),
             _ => Self::default(),
         }
     }
@@ -435,6 +437,14 @@ mod tests {
             Machine::ZxSpectrum.visuals()
         );
         assert_eq!(Visuals::for_theme(Theme::Atari), Machine::AtariSt.visuals());
+        assert_eq!(
+            Visuals::for_theme(Theme::MacSystem2),
+            Machine::MacSystem2.visuals()
+        );
+        assert_eq!(
+            Visuals::for_theme(Theme::GameBoy),
+            Machine::GameBoy.visuals()
+        );
         assert!(Visuals::for_theme(Theme::GreenCrt).effects.is_neutral());
     }
     #[test]
