@@ -32,6 +32,9 @@ ropey = { version = "1.6", default-features = false, features = ["simd"] }
 rfd = { version = "0.17.2", default-features = false }
 crossterm = "0.29"
 unicode-width = "0.2"
+base64 = "0.22"
+flate2 = "1"
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { version = "0.17.2", default-features = false }

@@ -154,6 +154,7 @@ pub(crate) struct AppearanceUi {
     pub palette: Palette,
     pub open: bool,
     cell_backend: bool,
+    terminal_graphics: bool,
     pub save_status: String,
     focus: usize,
     dropdown: Option<Dropdown>,
@@ -178,6 +179,7 @@ impl AppearanceUi {
             palette,
             open: false,
             cell_backend: false,
+            terminal_graphics: false,
             save_status: "Changes save automatically".into(),
             focus: 0,
             dropdown: None,
@@ -190,6 +192,9 @@ impl AppearanceUi {
             preview_clock: 0,
             font_choices: RefCell::new(None),
         }
+    }
+    pub fn set_terminal_graphics(&mut self, enabled: bool) {
+        self.terminal_graphics = enabled;
     }
     pub fn set_cell_backend(&mut self, enabled: bool) {
         self.cell_backend = enabled;
@@ -231,8 +236,10 @@ impl AppearanceUi {
         let open = self.open;
         let status = self.save_status.clone();
         let cell_backend = self.cell_backend;
+        let terminal_graphics = self.terminal_graphics;
         *self = Self::new(Appearance::default());
         self.set_cell_backend(cell_backend);
+        self.set_terminal_graphics(terminal_graphics);
         self.open = open;
         self.save_status = status;
     }
@@ -315,7 +322,7 @@ impl AppearanceUi {
         }
     }
     fn choices(&self, row: usize) -> Arc<Vec<Choice>> {
-        if self.cell_backend && row != 0 {
+        if (self.cell_backend && row != 0) || (self.terminal_graphics && row == 5) {
             return Arc::new(vec![Choice {
                 label: "Managed by the terminal emulator".into(),
                 value: self.selected(row),
@@ -803,6 +810,9 @@ impl AppearanceUi {
             for value in &mut values[1..] {
                 *value = "Terminal setting".into();
             }
+        }
+        if self.terminal_graphics {
+            values[5] = "Terminal pointer".into();
         }
         let titles = if compact {
             ["Theme", "Screen", "Font", "Size", "Spacing", "Cursor"]

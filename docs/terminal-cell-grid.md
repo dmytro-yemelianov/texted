@@ -2,7 +2,7 @@
 
 Both backends run the same library `App`, sessions, input commands, editor view, tabs, command panel, Appearance, search, details and dialog controllers. There is no separate terminal widget implementation.
 
-`graphics::DrawList` retains source Unicode scalars, colors, bounds, borders and cursor operations before native glyph rasterization. The window backend renders its existing one-bit masks with wgpu/Metal. `Renderer::Cells` projects that scene into a bounded `CellGrid`; `AnsiWriter` sends only changed cells and cursor state. Glyphs are not reconstructed from screenshots or bitmap masks. Terminal startup creates no winit window, NSApplication event loop or GPU device. Both executables currently share the same compiled dependency set.
+`graphics::DrawList` retains source Unicode scalars, colors, bounds, borders and cursor operations before native glyph rasterization. The window backend renders its existing one-bit masks with wgpu/Metal. A terminal graphics backend now rasterizes that same draw scene using our bitmap fonts; see [graphics delivery](terminal-graphics.md). `Renderer::Cells` projects that scene into a bounded `CellGrid`; `AnsiWriter` sends only changed cells and cursor state. Glyphs are not reconstructed from screenshots or bitmap masks. Both terminal transports create no winit window, NSApplication event loop or GPU device. Both executables currently share the same compiled dependency set.
 
 ## Run
 
@@ -19,7 +19,7 @@ F2 saves; F3 finds; F4 replaces; F5 opens; F6 creates a tab; F7/F8 switch tabs; 
 
 The transport requests the extended keyboard protocol for modifier/release events. Supporting terminals can update modifier layers while keys are held; legacy terminals show a short modifier preview on received combinations and then clear it. Some terminal/OS shortcuts are intercepted before reaching the application. Copy/paste through the application uses the existing macOS clipboard backend; terminal-emulator paste also works through bracketed paste.
 
-Theme colors apply live. Font, text scale, line spacing, framebuffer resolution and pointer shape are controlled by a plain terminal's emulator; the shared Appearance panel marks these settings accordingly and omits unavailable scale commands. Window font specimens, the full Verba bitmap library and GPU effects remain available in the window backend. Terminal preferences use `terminal-appearance.json` beside window preferences; an explicit `TEXTED_SETTINGS_PATH` overrides either path for isolated runs.
+Theme colors apply live. In the explicit ANSI mode, font, text scale, line spacing, framebuffer resolution and pointer shape are controlled by a plain terminal's emulator; the shared Appearance panel marks these settings accordingly and omits unavailable scale commands. The graphical terminal mode restores bitmap font specimens, the full Verba library, text scale, spacing and resolution controls using the same Appearance UI. Terminal preferences use `terminal-appearance.json` beside window preferences; an explicit `TEXTED_SETTINGS_PATH` overrides either path for isolated runs.
 
 ## One set of dialogs
 
@@ -57,3 +57,5 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 The PTY test edits Ukrainian text, saves an existing file, creates a second tab, cancels dirty close, saves through the common path form, opens the common context menu, resizes and quits. A parent process independently reads restored termios after the editor exits. Native GUI acceptance also covers Save As, Select All in the path field, Cancel on quit, Save on quit and actual process exit. CI runs the PTY test on both macOS architectures. Packages include and verify universal GUI and terminal executables, including a cell-grid smoke check after ZIP extraction.
+
+Graphics is now the automatic choice when confirmed. Use `--render=ansi` to force this character transport, or `--render=kitty` to require Texted bitmap rendering. See [terminal graphics](terminal-graphics.md) for negotiation, pixel mouse support, limits and validation.

@@ -3,11 +3,13 @@ use crate::{
     app::{App, Shell},
     input::KeyInput,
     surface::{Host, Renderer},
+    terminal_input::{Message, Reader},
+    terminal_probe::{self, Mode},
 };
 use crossterm::{
     cursor,
     event::{
-        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
         EnableFocusChange, EnableMouseCapture, Event, KeyCode as CKey, KeyEvent, KeyEventKind,
         KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -16,7 +18,7 @@ use crossterm::{
     terminal::{self, DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::{
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -30,32 +32,37 @@ use winit::{
 };
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
-struct TerminalGuard;
+struct TerminalGuard {
+    registry: crate::kitty::Registry,
+}
 impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
+    fn enter(registry: crate::kitty::Registry) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         ACTIVE.store(true, Ordering::Release);
-        let guard = Self;
+        let guard = Self { registry };
         execute!(
             io::stdout(),
             EnterAlternateScreen,
             DisableLineWrap,
             EnableMouseCapture,
+            crossterm::style::Print("\x1b[?1016l"),
             EnableBracketedPaste,
             EnableFocusChange,
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
             )
         )?;
         Ok(guard)
     }
 }
-fn restore() {
+fn restore(registry: &crate::kitty::Registry) {
     if !ACTIVE.swap(false, Ordering::AcqRel) {
         return;
     }
+    let _ = crate::kitty::cleanup(&mut io::stdout(), registry);
     let _ = execute!(
         io::stdout(),
         crossterm::style::ResetColor,
@@ -63,6 +70,7 @@ fn restore() {
         DisableFocusChange,
         DisableBracketedPaste,
         DisableMouseCapture,
+        crossterm::style::Print("\x1b[?1016l"),
         EnableLineWrap,
         cursor::Show,
         LeaveAlternateScreen
@@ -71,7 +79,7 @@ fn restore() {
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        restore();
+        restore(&self.registry);
     }
 }
 
@@ -206,16 +214,44 @@ fn application(
     output: Option<Box<dyn io::Write + Send>>,
     preferences: Option<PathBuf>,
 ) -> (Arc<Host>, App) {
+    application_with_graphics(
+        columns,
+        rows,
+        files,
+        output,
+        preferences,
+        None,
+        crate::kitty::Registry::default(),
+    )
+}
+fn application_with_graphics(
+    columns: u16,
+    rows: u16,
+    files: Vec<PathBuf>,
+    output: Option<Box<dyn io::Write + Send>>,
+    preferences: Option<PathBuf>,
+    graphics: Option<crate::kitty::Size>,
+    registry: crate::kitty::Registry,
+) -> (Arc<Host>, App) {
     let dirty = Arc::new(AtomicBool::new(true));
     let flag = dirty.clone();
     let wake: crate::Wake = Arc::new(move || {
         flag.store(true, Ordering::Release);
     });
-    let host = Host::cells(columns, rows, dirty);
+    let host = if let Some(size) = graphics {
+        Host::graphics(size, dirty).expect("validated terminal geometry")
+    } else {
+        Host::cells(columns, rows, dirty)
+    };
+    let renderer = if let Some(size) = graphics {
+        Renderer::kitty(size, output.expect("graphics output"), registry)
+    } else {
+        Renderer::cells(output)
+    };
     let app = App::from_shell(
         Shell {
             host: host.clone(),
-            renderer: Renderer::cells(output),
+            renderer,
             menus: None,
             wake,
             preferences,
@@ -224,15 +260,41 @@ fn application(
     );
     (host, app)
 }
+fn resize_notice() -> Result<(), String> {
+    execute!(
+        io::stdout(),
+        terminal::Clear(terminal::ClearType::All),
+        cursor::MoveTo(0, 0),
+        cursor::Hide,
+        crossterm::style::Print("Resize terminal: min 40x24, max 16MP")
+    )
+    .map_err(|e| e.to_string())
+}
 pub(crate) fn run(mut arguments: Vec<String>) -> Result<(), String> {
     if arguments.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Texted {}\nUsage: texted-tui [FILE ...]\n       texted --terminal [FILE ...]\n       texted-tui --dump-grid COLSxROWS [FILE ...]\n\nF2 Save · F3 Find · F5 Open · F6 New tab · F7/F8 Tabs · F9 Appearance\nF10 Close tab · Ctrl+Q Quit · Shift+F10 Context menu\nCtrl/Alt/Shift change F-key actions. Mouse and bracketed paste are supported.\nFont size and pointer shape are controlled by the terminal emulator.",env!("CARGO_PKG_VERSION"));
+        println!("Texted {}\nUsage: texted-tui [--render=auto|kitty|ansi] [FILE ...]\n       texted --terminal [FILE ...]\n       texted-tui --dump-grid COLSxROWS [FILE ...]\n\nF2 Save · F3 Find · F5 Open · F6 New tab · F7/F8 Tabs · F9 Appearance\nF10 Close tab · Ctrl+Q Quit · Shift+F10 Context menu\nCtrl/Alt/Shift change F-key actions. Mouse and bracketed paste are supported.\n--render=auto|kitty|ansi selects pixel graphics or plain text.\nGraphics mode uses Texted bitmap fonts and scaling; ANSI uses the terminal font.",env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if arguments.iter().any(|a| a == "--version" || a == "-V") {
         println!("Texted {} (terminal)", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    let mut mode = Mode::Auto;
+    let mut files = Vec::new();
+    let mut args = arguments.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            files.extend(args);
+            break;
+        } else if arg == "--render" {
+            mode = Mode::parse(&args.next().ok_or("--render requires auto, ansi or kitty")?)?;
+        } else if let Some(value) = arg.strip_prefix("--render=") {
+            mode = Mode::parse(value)?;
+        } else {
+            files.push(arg);
+        }
+    }
+    arguments = files;
     if arguments.first().is_some_and(|a| a == "--dump-grid") {
         if arguments.len() < 2 {
             return Err("--dump-grid requires COLSxROWS".into());
@@ -272,21 +334,44 @@ pub(crate) fn run(mut arguments: Vec<String>) -> Result<(), String> {
     }
     let (columns, rows) = terminal::size().map_err(|e| e.to_string())?;
     let (columns, rows) = size(columns, rows)?;
-    let preferences =
-        crate::preferences::default_path().map(|p| p.with_file_name("terminal-appearance.json"));
-    let (host, mut app) = application(
+    let registry = crate::kitty::Registry::default();
+    let panic_registry = registry.clone();
+    let old_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore(&panic_registry);
+        old_hook(info);
+    }));
+    let _guard = TerminalGuard::enter(registry.clone()).map_err(|e| e.to_string())?;
+    let mut reader = Reader::default();
+    let (mut graphics, mut queued, mut precise_cell) =
+        terminal_probe::negotiate(&mut reader, &mut io::stdout(), mode, columns, rows)?;
+    let mut pixel_mouse = false;
+    if graphics.is_some() {
+        io::stdout()
+            .write_all(b"\x1b[?1016$p")
+            .and_then(|()| io::stdout().flush())
+            .map_err(|e| e.to_string())?;
+    }
+    let filename = if graphics.is_some() {
+        "terminal-graphics.json"
+    } else {
+        "terminal-appearance.json"
+    };
+    let preferences = std::env::var_os("TEXTED_SETTINGS_PATH")
+        .map(PathBuf::from)
+        .or_else(|| crate::preferences::default_path().map(|p| p.with_file_name(filename)));
+    let (host, mut app) = application_with_graphics(
         columns,
         rows,
         arguments.into_iter().map(PathBuf::from).collect(),
         Some(Box::new(io::stdout())),
         preferences,
+        graphics,
+        registry,
     );
-    let old_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore();
-        old_hook(info);
-    }));
-    let _guard = TerminalGuard::enter().map_err(|e| e.to_string())?;
+    let mut dimensions = (columns, rows);
+    let mut geometry_poll = Instant::now();
+    let mut pixel_dimensions = terminal::window_size().ok().map(|s| (s.width, s.height));
     let mut last_paint = Instant::now();
     let mut last_title = String::new();
     let mut legacy_modifiers_until = None;
@@ -317,10 +402,89 @@ pub(crate) fn run(mut arguments: Vec<String>) -> Result<(), String> {
                 last_title = title;
             }
         }
-        if !event::poll(Duration::from_millis(16)).map_err(|e| e.to_string())? {
-            continue;
+        if geometry_poll.elapsed() >= Duration::from_millis(50) {
+            geometry_poll = Instant::now();
+            if let Ok(size) = terminal::window_size() {
+                let (c, r) = (size.columns, size.rows);
+                let pixels = Some((size.width, size.height));
+                if (c, r) != dimensions || (graphics.is_some() && pixels != pixel_dimensions) {
+                    pixel_dimensions = pixels;
+                    dimensions = (c, r);
+                    precise_cell = false;
+                    fits = self::size(c, r).is_ok();
+                    if fits {
+                        if let Some(current) = &mut graphics {
+                            current.columns = c;
+                            current.rows = r;
+                            if let Some((w, h)) = terminal_probe::cell_size(c, r) {
+                                current.cell_width = w;
+                                current.cell_height = h;
+                            }
+                            fits = current.pixels().is_ok();
+                            if fits {
+                                app.resize_graphics(*current)?;
+                            } else {
+                                app.suspend_graphics()?;
+                                resize_notice()?;
+                            }
+                            terminal_probe::pixel_query(&mut io::stdout())
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            host.resize_cells(c, r);
+                            app.resized();
+                        }
+                    } else {
+                        app.suspend_graphics()?;
+                        resize_notice()?;
+                    }
+                }
+            }
         }
-        match event::read().map_err(|e| e.to_string())? {
+        let message = if let Some(event) = queued.pop_front() {
+            Some(Message::Input(event))
+        } else {
+            reader
+                .read(Duration::from_millis(16))
+                .map_err(|e| e.to_string())?
+        };
+        let event = match message {
+            Some(Message::Input(event)) => event,
+            Some(Message::Pixels {
+                cell,
+                width,
+                height,
+            }) => {
+                if let Some(current) = &mut graphics {
+                    if current.update_report(&mut precise_cell, cell, width, height) {
+                        fits = self::size(dimensions.0, dimensions.1).is_ok()
+                            && current.pixels().is_ok();
+                        if fits {
+                            app.resize_graphics(*current)?;
+                        } else {
+                            app.suspend_graphics()?;
+                            resize_notice()?;
+                        }
+                    }
+                }
+                continue;
+            }
+            Some(Message::PixelMouse(available)) => {
+                if available && graphics.is_some() {
+                    io::stdout()
+                        .write_all(b"\x1b[?1016h")
+                        .and_then(|()| io::stdout().flush())
+                        .map_err(|e| e.to_string())?;
+                    pixel_mouse = true;
+                }
+                continue;
+            }
+            Some(Message::Notice(message)) => {
+                app.notice(message);
+                continue;
+            }
+            _ => continue,
+        };
+        match event {
             Event::Key(event) if fits => {
                 let mut mods = modifiers(event.modifiers);
                 if event.code == CKey::BackTab {
@@ -357,28 +521,20 @@ pub(crate) fn run(mut arguments: Vec<String>) -> Result<(), String> {
                 };
             }
             Event::Paste(text) if fits => app.paste_text(text),
-            Event::Resize(c, r) => {
-                fits = size(c, r).is_ok();
-                if fits {
-                    host.resize_cells(c, r);
-                    app.resized();
-                } else {
-                    execute!(
-                        io::stdout(),
-                        terminal::Clear(terminal::ClearType::All),
-                        cursor::MoveTo(0, 0),
-                        cursor::Hide,
-                        crossterm::style::Print("Resize to at least 40 x 24")
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-            }
             Event::Mouse(event) if fits => {
                 app.set_modifiers(modifiers(event.modifiers));
-                app.pointer_move(
-                    f32::from(event.column) * 8. + 4.,
-                    f32::from(event.row) * 16. + 8.,
-                );
+                let (x, y) = if pixel_mouse {
+                    (f32::from(event.column) + 0.5, f32::from(event.row) + 0.5)
+                } else {
+                    graphics.map_or(
+                        (
+                            f32::from(event.column) * 8. + 4.,
+                            f32::from(event.row) * 16. + 8.,
+                        ),
+                        |size| size.pointer(event.column, event.row),
+                    )
+                };
+                app.pointer_move(x, y);
                 match event.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         app.pointer_button(ElementState::Pressed)
@@ -393,6 +549,9 @@ pub(crate) fn run(mut arguments: Vec<String>) -> Result<(), String> {
                     MouseEventKind::ScrollRight => app.wheel_lines(-1., 0.),
                     _ => {}
                 }
+            }
+            Event::FocusGained => {
+                app.resized();
             }
             Event::FocusLost => {
                 app.set_modifiers(ModifiersState::empty());

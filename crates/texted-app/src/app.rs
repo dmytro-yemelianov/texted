@@ -134,6 +134,7 @@ impl App {
         }
         let mut appearance = AppearanceUi::new(settings);
         appearance.set_cell_backend(window.is_cells());
+        appearance.set_terminal_graphics(window.is_terminal() && !window.is_cells());
         let w = wake.clone();
         let preferences = if warning.is_none() {
             path.map(|path| Preferences::new(path, move || w()))
@@ -212,6 +213,18 @@ impl App {
     }
     pub(crate) fn settled(&self) -> bool {
         self.pending_open.is_empty() && self.session.settled()
+    }
+    pub(crate) fn resize_graphics(&mut self, size: crate::kitty::Size) -> Result<(), String> {
+        self.window.resize_graphics(size)?;
+        self.renderer.resize_graphics(size);
+        self.resized();
+        Ok(())
+    }
+    pub(crate) fn suspend_graphics(&mut self) -> Result<(), String> {
+        self.renderer.suspend()
+    }
+    pub(crate) fn notice(&mut self, message: &str) {
+        self.report(Err(message.into()));
     }
     pub(crate) fn resized(&mut self) {
         self.renderer.invalidate();
@@ -521,7 +534,7 @@ impl App {
     }
     fn report(&mut self, result: Result<(), String>) {
         if let Err(message) = result {
-            if !self.window.is_cells() {
+            if !self.window.is_terminal() {
                 eprintln!("{message}");
             }
             self.session.message = Some(message);
@@ -894,7 +907,7 @@ impl App {
         }
     }
     fn custom_cursor(&self) -> bool {
-        !self.window.is_cells()
+        !self.window.is_terminal()
             && self.focused
             && self.pointer_inside
             && !self.failed

@@ -69,3 +69,5 @@ Packages built from `feat/terminal-cell-grid` include `Contents/MacOS/texted-tui
 ```
 
 Both modes share the application controller, cell scene, tab state, command panel and in-app dialogs. See [terminal delivery](terminal-cell-grid.md) for controls and the JSON format.
+
+Development terminal builds now support `--render=auto|kitty|ansi`, including Texted bitmap fonts and 10% zoom through Kitty graphics. CI also runs the graphics PTY peer in both pixel-mouse and cell-mouse modes; see [graphics delivery](terminal-graphics.md). Published v0.2.0 assets remain unchanged.
