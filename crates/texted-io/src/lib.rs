@@ -25,6 +25,22 @@ struct NormalizedReader<R> {
     inner: R,
     pending_cr: bool,
     crlf: bool,
+    // Either makes CRLF saving differ from the file: a bare LF gains a CR, and CR+CRLF loses one.
+    bare_lf: bool,
+    doubled_cr: bool,
+    emitted_cr: bool,
+}
+impl<R> NormalizedReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            pending_cr: false,
+            crlf: false,
+            bare_lf: false,
+            doubled_cr: false,
+            emitted_cr: false,
+        }
+    }
 }
 impl<R: BufRead> Read for NormalizedReader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
@@ -39,6 +55,7 @@ impl<R: BufRead> Read for NormalizedReader<R> {
                     out[n] = b'\r';
                     n += 1;
                     self.pending_cr = false;
+                    self.emitted_cr = true;
                 }
                 break;
             }
@@ -51,6 +68,8 @@ impl<R: BufRead> Read for NormalizedReader<R> {
                     self.pending_cr = false;
                     if b == b'\n' {
                         self.crlf = true;
+                        self.doubled_cr |= self.emitted_cr;
+                        self.emitted_cr = false;
                         out[n] = b'\n';
                         n += 1;
                         consumed += 1;
@@ -58,6 +77,7 @@ impl<R: BufRead> Read for NormalizedReader<R> {
                     }
                     out[n] = b'\r';
                     n += 1;
+                    self.emitted_cr = true;
                     if n == out.len() {
                         break;
                     }
@@ -66,6 +86,8 @@ impl<R: BufRead> Read for NormalizedReader<R> {
                 if b == b'\r' {
                     self.pending_cr = true;
                 } else {
+                    self.bare_lf |= b == b'\n';
+                    self.emitted_cr = false;
                     out[n] = b;
                     n += 1;
                 }
@@ -76,9 +98,28 @@ impl<R: BufRead> Read for NormalizedReader<R> {
     }
 }
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+/// Renaming over a symlink would replace the link and orphan its target, so save to the target.
+fn resolve_links(path: &Path) -> io::Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = fs::read_link(&target)?;
+                target = match target.parent() {
+                    Some(parent) => parent.join(link),
+                    None => link,
+                };
+            }
+            _ => return Ok(target),
+        }
+    }
+    Err(io::Error::other("Too many levels of symbolic links"))
+}
 impl IoManager {
     pub fn open_file<P: AsRef<Path>>(path: P) -> io::Result<LoadedDocument> {
-        let path = path.as_ref();
+        Self::read(path.as_ref(), true)
+    }
+    fn read(path: &Path, normalize: bool) -> io::Result<LoadedDocument> {
         let file = File::open(path)?;
         let byte_size = file.metadata()?.len() as usize;
         let mut input = BufReader::new(file);
@@ -86,20 +127,26 @@ impl IoManager {
         if has_bom {
             input.consume(3);
         }
-        let mut reader = NormalizedReader {
-            inner: input,
-            pending_cr: false,
-            crlf: false,
-        };
-        let content = Rope::from_reader(&mut reader)?;
-        Ok(LoadedDocument {
-            content,
-            path: Some(path.into()),
-            line_ending: if reader.crlf {
+        let (content, line_ending) = if normalize {
+            let mut reader = NormalizedReader::new(input);
+            let content = Rope::from_reader(&mut reader)?;
+            if reader.crlf && (reader.bare_lf || reader.doubled_cr) {
+                // One ending setting cannot restore these lines; keep every byte as written.
+                return Self::read(path, false);
+            }
+            let ending = if reader.crlf {
                 LineEnding::Crlf
             } else {
                 LineEnding::Lf
-            },
+            };
+            (content, ending)
+        } else {
+            (Rope::from_reader(&mut input)?, LineEnding::Lf)
+        };
+        Ok(LoadedDocument {
+            content,
+            path: Some(path.into()),
+            line_ending,
             has_bom,
             byte_size,
         })
@@ -126,7 +173,8 @@ impl IoManager {
         has_bom: bool,
         ending: LineEnding,
     ) -> io::Result<()> {
-        let path = path.as_ref();
+        let path = resolve_links(path.as_ref())?;
+        let path = path.as_path();
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -232,18 +280,61 @@ mod tests {
         }
         fs::remove_dir_all(dir).unwrap();
     }
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_symlink_updates_its_target_and_keeps_the_link() {
+        let dir = std::env::temp_dir().join(format!("texted-io-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        fs::write(dir.join("dotfiles/vimrc"), "old").unwrap();
+        // Relative targets resolve against the link's directory, not the process directory.
+        std::os::unix::fs::symlink("dotfiles/vimrc", dir.join(".vimrc")).unwrap();
+        IoManager::save_atomic(dir.join(".vimrc"), "new", false, LineEnding::Lf).unwrap();
+        let link = fs::symlink_metadata(dir.join(".vimrc")).unwrap();
+        assert!(link.file_type().is_symlink());
+        assert_eq!(
+            fs::read_to_string(dir.join("dotfiles/vimrc")).unwrap(),
+            "new"
+        );
+        assert_eq!(fs::read_dir(dir.join("dotfiles")).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn files_with_mixed_or_doubled_carriage_returns_save_back_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("texted-io-mixed-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mixed.txt");
+        for raw in [
+            &b"a\r\r\nb\r\n"[..],
+            b"x\r\r\n",
+            b"lf\nlf\ncrlf\r\nlf\n",
+            b"crlf\r\ncrlf\r\nlf\n",
+        ] {
+            fs::write(&path, raw).unwrap();
+            let doc = IoManager::open_file(&path).unwrap();
+            IoManager::save_rope(&path, &doc.content, doc.has_bom, doc.line_ending).unwrap();
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                raw,
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn normalization_handles_read_boundaries_and_lone_cr() {
         for capacity in 1..6 {
             let input = BufReader::with_capacity(capacity, &b"a\r\nb\rc\r\n\r"[..]);
-            let mut reader = NormalizedReader {
-                inner: input,
-                pending_cr: false,
-                crlf: false,
-            };
+            let mut reader = NormalizedReader::new(input);
             let mut text = String::new();
             reader.read_to_string(&mut text).unwrap();
             assert_eq!(text, "a\nb\rc\n\r");
+            assert!(reader.crlf && !reader.bare_lf && !reader.doubled_cr);
+            let input = BufReader::with_capacity(capacity, &b"a\r\r\nb"[..]);
+            let mut reader = NormalizedReader::new(input);
+            reader.read_to_string(&mut text).unwrap();
+            assert!(reader.doubled_cr, "capacity {capacity}");
         }
     }
 }

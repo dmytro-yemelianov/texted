@@ -44,6 +44,10 @@ pub trait ClipboardBackend: Send + Sync + 'static {
     fn write(&self, text: String, cancel: &AtomicBool, deadline: Instant) -> Result<(), String>;
 }
 pub struct SystemClipboard;
+/// pbcopy/pbpaste pick their text encoding from the locale, and apps opened from Finder have none.
+fn utf8_locale(command: &mut Command) -> &mut Command {
+    command.env_remove("LC_ALL").env("LC_CTYPE", "UTF-8")
+}
 fn subprocess(
     input: Option<String>,
     cancel: &AtomicBool,
@@ -55,7 +59,7 @@ fn subprocess(
     } else {
         "/usr/bin/pbpaste"
     });
-    command
+    utf8_locale(&mut command)
         .stdin(if writing {
             Stdio::piped()
         } else {
@@ -359,6 +363,41 @@ mod tests {
                 active_col: 2,
             },
         }
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pasteboard_helpers_exchange_utf8_without_an_inherited_locale() {
+        // The ruler pasteboard keeps this test away from the user's clipboard.
+        fn pasteboard(mut command: Command, input: Option<&str>) -> String {
+            command
+                .args(["-pboard", "ruler"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            let stdin = child.stdin.take().unwrap();
+            if let Some(text) = input {
+                (&stdin).write_all(text.as_bytes()).unwrap();
+            }
+            drop(stdin);
+            String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned()
+        }
+        // Another app stores real Unicode text on the pasteboard.
+        let foreign = |program| {
+            let mut command = Command::new(program);
+            command.env_clear().env("LC_CTYPE", "UTF-8");
+            command
+        };
+        // Apps opened from Finder inherit no usable locale.
+        let ours = |program| {
+            let mut command = Command::new(program);
+            command.env_clear().env("LC_ALL", "C");
+            utf8_locale(&mut command);
+            command
+        };
+        pasteboard(foreign("/usr/bin/pbcopy"), Some("їжак"));
+        assert_eq!(pasteboard(ours("/usr/bin/pbpaste"), None), "їжак");
+        pasteboard(ours("/usr/bin/pbcopy"), Some("ґрунт"));
+        assert_eq!(pasteboard(foreign("/usr/bin/pbpaste"), None), "ґрунт");
     }
     #[test]
     fn an_expired_pipe_operation_terminates_and_reaps_its_child() {

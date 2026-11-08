@@ -277,7 +277,7 @@ impl App {
         }
     }
     fn appearance_height(&self) -> usize {
-        self.display.source.1 as usize - self.geometry().bottom
+        self.geometry().above_commands()
     }
     fn panel_context(&self) -> crate::chrome::Context {
         let p = self.session.buffer.client.latest();
@@ -503,8 +503,15 @@ impl App {
         self.appearance_changed(before);
         match self.session.files.enqueue(Action::Close) {
             Ok(()) => self.closing = true,
-            Err(error) => self.report(Err(error)),
+            Err(error) => {
+                self.report(Err(error));
+                self.abort_quit();
+            }
         }
+    }
+    fn abort_quit(&mut self) {
+        self.quitting = false;
+        crate::native_macos::cancel_terminate();
     }
     fn begin_quit(&mut self) {
         if self.session.files.locked() {
@@ -548,7 +555,12 @@ impl App {
             || self.appearance.open
             || self.dialogs.open()
     }
-    pub fn event(&mut self, event: Event<AppEvent>, target: &EventLoopWindowTarget<AppEvent>) {
+    /// Returns true once the last tab has closed and the app should end.
+    pub fn event(
+        &mut self,
+        event: Event<AppEvent>,
+        target: &EventLoopWindowTarget<AppEvent>,
+    ) -> bool {
         target.set_control_flow(ControlFlow::WaitUntil(
             Instant::now()
                 + Duration::from_millis(
@@ -577,13 +589,10 @@ impl App {
             {
                 self.window_event(event)
             }
-            Event::AboutToWait => {
-                if self.tick() {
-                    target.exit();
-                }
-            }
+            Event::AboutToWait => return self.tick(),
             _ => {}
         }
+        false
     }
     // Native event routing stays small; each branch delegates editing, geometry or file work.
     fn window_event(&mut self, event: WindowEvent) {
@@ -1524,7 +1533,7 @@ impl App {
         }
         if self.closing && self.session.files.idle() {
             self.closing = false;
-            self.quitting = false; // A cancelled sheet/save aborts the quit sequence.
+            self.abort_quit(); // A cancelled sheet/save aborts the quit sequence.
         }
         if !self.closing && !self.quitting && self.session.settled() {
             if let Some(action) = self.pending_open.pop_front() {
@@ -1734,7 +1743,7 @@ impl App {
             &mut self.draws,
             &mut self.ui_font,
             width as usize,
-            scene_height as usize - geometry.bottom,
+            geometry.above_commands(),
             display.pixelated,
         );
         let state = self.menu_state();
@@ -1742,7 +1751,7 @@ impl App {
             popup.paint(
                 &mut self.draws,
                 &mut self.ui_font,
-                (width as usize, scene_height as usize - geometry.bottom),
+                (width as usize, geometry.above_commands()),
                 display.pixelated,
                 state,
                 self.appearance.palette,
@@ -1751,7 +1760,7 @@ impl App {
         self.dialogs.paint(
             &mut self.draws,
             &mut self.ui_font,
-            (width as usize, scene_height as usize - geometry.bottom),
+            (width as usize, geometry.above_commands()),
             display.pixelated,
             &self.appearance.palette,
         );

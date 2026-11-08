@@ -7,15 +7,21 @@ mod mac {
     use super::*;
     use objc2::{
         class, msg_send,
-        runtime::{AnyClass, AnyObject, Sel},
+        runtime::{AnyClass, AnyObject, Bool, Sel},
         sel,
     };
     use std::{
-        cell::OnceCell,
+        cell::{Cell, OnceCell},
         ffi::{c_char, c_void, CStr},
         path::PathBuf,
     };
-    thread_local! {static PROXY:OnceCell<EventLoopProxy<AppEvent>>=const {OnceCell::new()};}
+    thread_local! {
+        static PROXY: OnceCell<EventLoopProxy<AppEvent>> = const { OnceCell::new() };
+        // AppKit waits for one reply per NSTerminateLater; the close sequence decides it.
+        static TERMINATE_PENDING: Cell<bool> = const { Cell::new(false) };
+    }
+    const NS_TERMINATE_NOW: usize = 1;
+    const NS_TERMINATE_LATER: usize = 2;
     #[link(name = "objc")]
     extern "C" {
         fn class_addMethod(
@@ -58,12 +64,54 @@ mod mac {
         _sel: Sel,
         _application: *mut AnyObject,
     ) -> usize {
-        PROXY.with(|p| {
-            if let Some(proxy) = p.get() {
-                let _ = proxy.send_event(AppEvent::Quit);
-            }
+        let queued = PROXY.with(|p| {
+            p.get()
+                .is_some_and(|proxy| proxy.send_event(AppEvent::Quit).is_ok())
         });
-        0 // NSTerminateCancel: Rust's guarded close will exit the event loop after the user decides.
+        if !queued {
+            return NS_TERMINATE_NOW; // The event loop is already gone; nothing is left to save.
+        }
+        // Logout and restart wait for this answer. Cancel would abort them even with
+        // nothing to save, so defer it until the guarded close sequence finishes.
+        TERMINATE_PENDING.set(true);
+        NS_TERMINATE_LATER
+    }
+    fn reply_to_terminate(accepted: bool) {
+        unsafe {
+            let application: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () =
+                msg_send![application, replyToApplicationShouldTerminate: Bool::new(accepted)];
+        }
+    }
+    unsafe extern "C" fn accept_later(_this: *mut AnyObject, _sel: Sel, _argument: *mut AnyObject) {
+        reply_to_terminate(true);
+    }
+    pub fn terminate_pending() -> bool {
+        TERMINATE_PENDING.get()
+    }
+    /// Declines a deferred system quit request after the close sequence was cancelled.
+    pub fn cancel_terminate() {
+        if TERMINATE_PENDING.replace(false) {
+            reply_to_terminate(false);
+        }
+    }
+    /// Lets a deferred system quit proceed; AppKit then ends the process without unwinding
+    /// Rust frames, so drop the app first. Accepting inside the winit callback would re-enter
+    /// it from applicationWillTerminate:, so the reply runs on the next run-loop pass.
+    pub fn accept_terminate() {
+        if !TERMINATE_PENDING.replace(false) {
+            return;
+        }
+        unsafe {
+            let application: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let delegate: *mut AnyObject = msg_send![application, delegate];
+            let _: () = msg_send![
+                delegate,
+                performSelectorOnMainThread: sel!(textedAcceptTerminate:),
+                withObject: std::ptr::null_mut::<AnyObject>(),
+                waitUntilDone: Bool::NO
+            ];
+        }
     }
     pub fn install(proxy: EventLoopProxy<AppEvent>) -> Result<(), String> {
         PROXY
@@ -89,7 +137,13 @@ mod mac {
                 should_terminate as *const c_void,
                 c"Q@:@".as_ptr(),
             );
-            if !opened || !quitting {
+            let accepting = class_addMethod(
+                class,
+                sel!(textedAcceptTerminate:),
+                accept_later as *const c_void,
+                c"v@:@".as_ptr(),
+            );
+            if !opened || !quitting || !accepting {
                 return Err("The native delegate already implements document callbacks".into());
             }
         }
@@ -97,8 +151,16 @@ mod mac {
     }
 }
 #[cfg(target_os = "macos")]
-pub use mac::install;
+pub use mac::{accept_terminate, cancel_terminate, install, terminate_pending};
 #[cfg(not(target_os = "macos"))]
 pub fn install(_proxy: EventLoopProxy<AppEvent>) -> Result<(), String> {
     Ok(())
+}
+#[cfg(not(target_os = "macos"))]
+pub fn cancel_terminate() {}
+#[cfg(not(target_os = "macos"))]
+pub fn accept_terminate() {}
+#[cfg(not(target_os = "macos"))]
+pub fn terminate_pending() -> bool {
+    false
 }

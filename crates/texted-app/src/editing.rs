@@ -295,12 +295,10 @@ impl EditorModel {
                 return Err("Block edit exceeds generated-text capacity".into());
             }
         }
-        let mut aborted = false;
-        self.buffer.transaction(|buffer| {
+        self.buffer.try_transaction(|buffer| {
             for (index, line) in (a..=max).rev().enumerate() {
                 if cancelled() {
-                    aborted = true;
-                    break;
+                    return Err("Operation cancelled".to_owned());
                 }
                 buffer.block_delete(line, line, from, to);
                 if !text.is_empty() {
@@ -310,10 +308,8 @@ impl EditorModel {
                     progress(index + 1, max - a + 1);
                 }
             }
-        });
-        if aborted {
-            return Err("Operation cancelled".into());
-        }
+            Ok(())
+        })?;
         let col = from + text.chars().count();
         self.selection = SelectionState {
             mode: SelectionMode::Block,
@@ -598,6 +594,36 @@ two",
         assert_eq!(e.buffer.to_string(), "aї\nxї\naї");
         assert!(e.buffer.undo());
         assert_eq!(e.buffer.to_string(), "abc\nx\nabc");
+        assert!(!e.buffer.undo());
+    }
+    #[test]
+    fn cancelled_block_delete_leaves_the_model_unchanged() {
+        let mut e = EditorModel::new(ropey::Rope::from_str("abc\nabc\nabc"));
+        e.selection = SelectionState {
+            mode: SelectionMode::Block,
+            anchor_line: 0,
+            active_line: 2,
+            anchor_col: 1,
+            active_col: 2,
+        };
+        let original = e.buffer.create_snapshot();
+        // Progress is reported after the first line changes, so this cancels mid-edit.
+        let edited = std::cell::Cell::new(false);
+        let result = e.apply_cancellable(
+            EditorCommand::Delete {
+                backward: true,
+                unit: DeleteUnit::Character,
+            },
+            &|| edited.get(),
+            &|_, _| edited.set(true),
+        );
+        assert!(result.is_err());
+        assert_eq!(e.buffer.to_string(), "abc\nabc\nabc");
+        assert!(e
+            .buffer
+            .create_snapshot()
+            .content
+            .is_instance(&original.content));
         assert!(!e.buffer.undo());
     }
     #[test]

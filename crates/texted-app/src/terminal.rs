@@ -82,6 +82,18 @@ impl Drop for TerminalGuard {
         restore(&self.registry);
     }
 }
+/// Hand the terminal back before a fatal panic prints. Worker panics are caught and the
+/// editor keeps drawing, so only a panic on the thread that owns the terminal restores it.
+fn restore_on_terminal_thread(
+    owner: std::thread::ThreadId,
+    restore: impl Fn() + Send + Sync + 'static,
+) -> impl Fn() + Send + Sync + 'static {
+    move || {
+        if std::thread::current().id() == owner {
+            restore();
+        }
+    }
+}
 
 fn modifiers(m: KeyModifiers) -> ModifiersState {
     let mut result = ModifiersState::empty();
@@ -336,9 +348,12 @@ pub(crate) fn run(mut arguments: Vec<String>) -> Result<(), String> {
     let (columns, rows) = size(columns, rows)?;
     let registry = crate::kitty::Registry::default();
     let panic_registry = registry.clone();
+    let restore_terminal = restore_on_terminal_thread(std::thread::current().id(), move || {
+        restore(&panic_registry)
+    });
     let old_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore(&panic_registry);
+        restore_terminal();
         old_hook(info);
     }));
     let _guard = TerminalGuard::enter(registry.clone()).map_err(|e| e.to_string())?;
@@ -571,6 +586,61 @@ mod tests {
         assert_eq!(physical, PhysicalKey::Code(KeyCode::KeyS));
         assert_eq!(logical, Key::Character("і".into()));
         assert_eq!(text.as_deref(), Some("і"));
+    }
+    #[test]
+    fn a_frame_shorter_than_the_command_bar_still_renders() {
+        // The window and graphics backends share this redraw; a 16 px frame is below the bar.
+        let size = crate::kitty::Size {
+            columns: 80,
+            rows: 1,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let (_, mut app) = application_with_graphics(
+            80,
+            1,
+            vec![],
+            Some(Box::new(io::sink())),
+            None,
+            Some(size),
+            crate::kitty::Registry::default(),
+        );
+        app.tick();
+        app.redraw();
+        assert_eq!(app.render_failure(), None);
+        // Appearance and dialogs paint into the zero-height area above the bar.
+        for key in [NamedKey::F9, NamedKey::F2] {
+            let logical = Key::Named(key);
+            app.key(&KeyInput {
+                physical: PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+                logical: &logical,
+                text: None,
+                modifiers: ModifiersState::empty(),
+            });
+            for _ in 0..30 {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            app.redraw();
+            assert_eq!(app.render_failure(), None);
+        }
+    }
+    #[test]
+    fn worker_panics_leave_the_terminal_to_its_owner() {
+        let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = restores.clone();
+        let hook = Arc::new(restore_on_terminal_thread(
+            std::thread::current().id(),
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        // Worker panics are caught and the editor keeps running, so the terminal must stay set up.
+        let worker = hook.clone();
+        std::thread::spawn(move || worker()).join().unwrap();
+        assert_eq!(restores.load(Ordering::SeqCst), 0);
+        hook();
+        assert_eq!(restores.load(Ordering::SeqCst), 1);
     }
     #[test]
     fn shared_app_renders_loaded_text_tabs_commands_and_modal_without_a_window() {

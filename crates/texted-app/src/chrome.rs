@@ -270,6 +270,10 @@ impl Geometry {
             h: self.bottom,
         }
     }
+    /// Height above the command row; frames shorter than the row have none.
+    pub fn above_commands(self) -> usize {
+        self.height.saturating_sub(self.bottom)
+    }
     pub fn document_height(self) -> usize {
         self.height.saturating_sub(self.top + self.bottom).max(1)
     }
@@ -411,7 +415,7 @@ pub(crate) fn paint(
         return;
     }
     let controls = 0;
-    let y = g.height - g.bottom;
+    let y = g.above_commands();
     for (ordinal, (key, label)) in commands.items.iter().take(g.columns).enumerate() {
         let slot = if g.columns == 12 { *key } else { ordinal };
         let x = controls + slot * g.width.saturating_sub(controls) / g.columns;
