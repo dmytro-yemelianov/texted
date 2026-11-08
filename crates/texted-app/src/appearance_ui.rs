@@ -1771,7 +1771,10 @@ mod tests {
         assert!(p.rect.y + p.rect.h <= h && p.rect.x + p.rect.w <= w);
         assert!(p.rows >= 1 && p.rows < ROWS);
         assert!(p.buttons + p.row_h + 4 + 8 <= p.rect.h);
-        assert!(p.reset().x + p.reset().w < p.done().x, "Reset runs into Done");
+        assert!(
+            p.reset().x + p.reset().w < p.done().x,
+            "Reset runs into Done"
+        );
         let mut ui = AppearanceUi::new(Appearance::default());
         ui.set_open(true);
         for _ in 0..FIELDS {
