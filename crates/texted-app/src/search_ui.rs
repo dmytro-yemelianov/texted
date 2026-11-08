@@ -222,7 +222,7 @@ pub(crate) fn hit(
     if mode == SearchBarMode::Closed {
         return None;
     }
-    if compact {
+    if compact || width < (PANEL_WIDTH + 16) as f32 {
         return CompactBar::new(mode, width as usize).hit(mode, x, y);
     }
     let left = (width - (PANEL_WIDTH + 16) as f32).max(0.0);

@@ -83,14 +83,26 @@ def verify_bundle(app):
     expected = "Texted " + info["TextedVersion"]
     if capture(binary, "--version") != expected:
         raise ValueError("Packaged binary version does not match Info.plist")
+    terminal_executable = binary.with_name("texted-tui")
+    if not os.access(terminal_executable, os.X_OK):
+        raise ValueError("Terminal executable is missing or not executable")
+    if set(capture("lipo", "-archs", terminal_executable).split()) != {"arm64", "x86_64"}:
+        raise ValueError("Expected both architectures in the terminal executable")
+    if capture(terminal_executable, "--version") != expected + " (terminal)":
+        raise ValueError("Terminal executable version does not match Info.plist")
+    frame = json.loads(capture(terminal_executable, "--dump-grid", "80x24"))
+    if frame["version"] != 1 or len(frame["cells"]) != 80 * 24:
+        raise ValueError("Terminal executable did not produce the shared cell grid")
     # Fail packaging if a local/Homebrew library accidentally enters the bundle's load commands.
-    dependencies = capture("otool", "-L", binary)
-    for line in dependencies.splitlines():
-        if not line.startswith("\t"):
-            continue
-        library = line.strip().split(" (", 1)[0]
-        if library.startswith("/") and not library.startswith(("/usr/lib/", "/System/Library/")):
-            raise ValueError(f"Unexpected non-system library: {library}")
+    for executable in (binary, terminal_executable):
+        dependencies = capture("otool", "-L", executable)
+        for line in dependencies.splitlines():
+            if not line.startswith("\t"):
+                continue
+            library = line.strip().split(" (", 1)[0]
+            if library.startswith("/") and not library.startswith(("/usr/lib/", "/System/Library/")):
+                raise ValueError(f"Unexpected non-system library: {library}")
+
 
 
 def package(output, tag=None):
@@ -106,7 +118,7 @@ def package(output, tag=None):
         raise FileExistsError("Delivery files already exist; use a new output directory")
     env = dict(os.environ, MACOSX_DEPLOYMENT_TARGET=MINIMUM_MACOS)
     for target in TARGETS:
-        run("cargo", "build", "--locked", "--release", "--bin", "texted", "--target", target, env=env)
+        run("cargo", "build", "--locked", "--release", "--bin", "texted", "--bin", "texted-tui", "--target", target, env=env)
     with tempfile.TemporaryDirectory(prefix="texted-package-") as directory:
         work = Path(directory)
         staging = work / "delivery"
@@ -120,11 +132,15 @@ def package(output, tag=None):
         target_dir = Path(metadata["target_directory"])
         run("lipo", "-create", *(target_dir / target / "release/texted" for target in TARGETS), "-output", executable)
         executable.chmod(0o755)
+        terminal_executable = executable.with_name("texted-tui")
+        run("lipo", "-create", *(target_dir / target / "release/texted-tui" for target in TARGETS), "-output", terminal_executable)
+        terminal_executable.chmod(0o755)
         with (app / "Contents/Info.plist").open("wb") as target:
             plistlib.dump(bundle_metadata(version), target)
         build_icon(resources / "Texted.icns", work)
         manifest = {
             "name": "Texted", "version": version, "architectures": ["arm64", "x86_64"],
+            "executables": ["texted", "texted-tui"],
             "minimum_macos": MINIMUM_MACOS, "commit": capture("git", "rev-parse", "HEAD"),
             "working_tree_dirty": bool(capture("git", "status", "--porcelain")),
             "rustc": capture("rustc", "--version"), "signature": "ad-hoc",
@@ -135,6 +151,7 @@ def package(output, tag=None):
             shutil.copy2(ROOT / name, resources / name)
         shutil.copytree(ROOT / "assets/fonts", resources / "fonts")
         # Give arm64 executables a valid local signature after lipo assembles the two slices.
+        run("codesign", "--force", "--sign", "-", "--timestamp=none", terminal_executable)
         run("codesign", "--force", "--sign", "-", "--timestamp=none", app)
         verify_bundle(app)
         run("ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", app, paths[0])

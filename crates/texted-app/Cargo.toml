@@ -9,6 +9,10 @@ name = "texted"
 path = "src/main.rs"
 
 [[bin]]
+name = "texted-tui"
+path = "src/bin/texted-tui.rs"
+
+[[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
 
@@ -26,6 +30,8 @@ pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
 ropey = { version = "1.6", default-features = false, features = ["simd"] }
 rfd = { version = "0.17.2", default-features = false }
+crossterm = "0.29"
+unicode-width = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { version = "0.17.2", default-features = false }

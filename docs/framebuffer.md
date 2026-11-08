@@ -47,5 +47,5 @@ Tests cover preset limits, legacy settings and separate typography, aspect-fit p
 
 ```sh
 cargo test --locked --workspace
-cargo test --locked --release -p texted-app --bin texted metal_ -- --ignored
+cargo test --locked --release -p texted-app --lib metal_ -- --ignored
 ```

@@ -9,6 +9,7 @@ use crate::{
     menus::{MenuCommand, MenuState, NativeMenus},
     mouse::Mouse,
     search_ui::{self, BarHit},
+    surface::{Host, Renderer as RenderBackend},
     transfers::submit,
     AppEvent,
 };
@@ -31,9 +32,18 @@ use winit::{
     keyboard::ModifiersState,
     window::Window,
 };
+pub(crate) struct Shell {
+    pub host: Arc<Host>,
+    pub renderer: RenderBackend,
+    pub menus: Option<NativeMenus>,
+    pub wake: crate::Wake,
+    pub preferences: Option<std::path::PathBuf>,
+}
 pub(crate) struct App {
     session: crate::session::Session,
     wake: crate::Wake,
+    dialogs: crate::dialog_ui::DialogUi,
+    dialog_client: crate::dialog_ui::Client,
     // The active slot is None because its complete state is owned by `session`.
     tabs: Vec<Option<crate::session::Session>>,
     active: usize,
@@ -43,8 +53,9 @@ pub(crate) struct App {
     pending_open: std::collections::VecDeque<Action>,
     closing: bool,
     quitting: bool,
-    renderer: gpu::Renderer,
+    renderer: RenderBackend,
     failed: bool,
+    render_failure: Option<String>,
     font: FontEngine,
     ui_font: FontEngine,
     appearance: AppearanceUi,
@@ -53,8 +64,9 @@ pub(crate) struct App {
     mouse: Mouse,
     modifiers: ModifiersState,
     hud: bool,
-    menus: NativeMenus,
+    menus: Option<NativeMenus>,
     context: Option<ContextRequest>,
+    popup: Option<context_menu::Popup>,
     display: ScreenMapping,
     pointer_physical: (f32, f32),
     panel_help: crate::status_ui::PanelHelp,
@@ -67,7 +79,7 @@ pub(crate) struct App {
     command_flash: Option<(usize, Instant)>,
     // Destroy the main-thread window last, after the renderer and document state.
     // Worker callbacks must notify `wake`, never capture this native window.
-    window: Arc<Window>,
+    window: Arc<Host>,
 }
 impl App {
     pub fn new(
@@ -86,15 +98,42 @@ impl App {
                 .unwrap_or_else(|p| p.into_inner())
                 .send_event(AppEvent::Wake);
         });
-        let mut session = crate::session::Session::new(wake.clone(), 1);
+        Self::from_shell(
+            Shell {
+                host: Host::native(window),
+                renderer: RenderBackend::Native(Box::new(renderer)),
+                menus: Some(menus),
+                wake,
+                preferences: preferences::default_path(),
+            },
+            initial,
+        )
+    }
+    pub(crate) fn from_shell(shell: Shell, initial: Vec<std::path::PathBuf>) -> Self {
+        let Shell {
+            host: window,
+            renderer,
+            menus,
+            wake,
+            preferences: path,
+        } = shell;
+        let (dialog_client, dialogs) = crate::dialog_ui::channel(wake.clone());
+        let mut session = crate::session::Session::new(wake.clone(), 1, dialog_client.clone());
         let mut initial = initial.into_iter();
         if let Some(path) = initial.next() {
             let _ = session.files.enqueue(Action::OpenPath(path));
         }
         let pending_open = initial.map(Action::OpenPath).collect();
-        let path = preferences::default_path();
-        let (settings,warning)=match path.as_deref().map(preferences::load) {Some(Ok(settings))=>(settings,None),Some(Err(error))=>(Appearance::default(),Some(format!("Appearance preferences could not be loaded: {error}. Changes apply for this session."))),None=>(Appearance::default(),Some("Appearance preferences path is unavailable; changes apply for this session.".into()))};
+        let (mut settings,warning)=match path.as_deref().map(preferences::load) {
+            Some(Ok(settings))=>(settings,None),Some(Err(error))=>(Appearance::default(),Some(format!("Appearance preferences could not be loaded: {error}. Changes apply for this session."))),None=>(Appearance::default(),None),
+        };
+        if window.is_cells() {
+            settings.framebuffer = texted_app::framebuffer::Framebuffer::Native;
+            settings.typography = Typography::default();
+            settings.pixel_typography = Typography::default();
+        }
         let mut appearance = AppearanceUi::new(settings);
+        appearance.set_cell_backend(window.is_cells());
         let w = wake.clone();
         let preferences = if warning.is_none() {
             path.map(|path| Preferences::new(path, move || w()))
@@ -102,8 +141,16 @@ impl App {
             appearance.save_status = "Session only: preferences could not be loaded".into();
             None
         };
-        let font = FontEngine::with_typography(appearance.settings.editor_typography());
-        let ui_font = Self::chrome_font(appearance.settings.resolution().is_some());
+        let font = if window.is_cells() {
+            FontEngine::for_cells()
+        } else {
+            FontEngine::with_typography(appearance.settings.editor_typography())
+        };
+        let ui_font = if window.is_cells() {
+            FontEngine::for_cells()
+        } else {
+            Self::chrome_font(appearance.settings.resolution().is_some())
+        };
         let size = window.inner_size();
         let display =
             ScreenMapping::new((size.width, size.height), appearance.settings.resolution());
@@ -113,6 +160,8 @@ impl App {
         Self {
             session,
             wake,
+            dialogs,
+            dialog_client,
             tabs: vec![None],
             active: 0,
             next_tab_id: 2,
@@ -124,6 +173,7 @@ impl App {
             window,
             renderer,
             failed: false,
+            render_failure: None,
             font,
             ui_font,
             appearance,
@@ -134,6 +184,7 @@ impl App {
             hud: false,
             menus,
             context: None,
+            popup: None,
             display,
             pointer_physical: (0.0, 0.0),
             panel_help: crate::status_ui::PanelHelp::new(),
@@ -144,6 +195,72 @@ impl App {
             key_function: None,
             mouse_function: None,
             command_flash: None,
+        }
+    }
+    fn resolution(&self) -> Option<(u32, u32)> {
+        if self.window.is_cells() {
+            None
+        } else {
+            self.appearance.settings.resolution()
+        }
+    }
+    pub(crate) fn render_failure(&self) -> Option<&str> {
+        self.render_failure.as_deref()
+    }
+    pub(crate) fn rendered_grid(&self) -> Option<&texted_app::cell_grid::CellGrid> {
+        self.renderer.frame()
+    }
+    pub(crate) fn settled(&self) -> bool {
+        self.pending_open.is_empty() && self.session.settled()
+    }
+    pub(crate) fn resized(&mut self) {
+        self.renderer.invalidate();
+        self.context = None;
+        self.session.viewport.input(true);
+        self.window.request_redraw();
+    }
+    pub(crate) fn set_modifiers(&mut self, modifiers: ModifiersState) {
+        self.modifiers = modifiers;
+        self.panel_help.clear_hover();
+        self.hover_commands();
+        self.window.request_redraw();
+    }
+    pub(crate) fn key_release(&mut self, key: &winit::keyboard::Key) {
+        if self.key_function.is_some() && input::function_key_index(key) == self.key_function {
+            self.key_function = None;
+            self.window.request_redraw();
+        }
+    }
+    pub(crate) fn paste_text(&mut self, text: String) {
+        if self.dialogs.open() {
+            self.dialogs.insert(&text);
+        } else if self.locked() {
+            self.report(Err(
+                "File or clipboard capture is pending; paste was not accepted".into(),
+            ));
+            return;
+        } else if self.session.search.state.mode != SearchBarMode::Closed {
+            if text.contains(['\n', '\r']) {
+                self.report(Err("Search fields accept a single line".into()));
+                return;
+            }
+            let intent = Intent::SearchText(text);
+            let snap = self.session.buffer.client.latest().snapshot.clone();
+            if let Some(result) = self.session.search.handle(&intent, snap) {
+                self.report(result);
+            }
+        } else {
+            self.edit(EditorCommand::Insert(text), true);
+        }
+        self.window.request_redraw();
+    }
+    fn poll_dialogs(&mut self) {
+        let open = self.dialogs.open();
+        if self.dialogs.poll() {
+            if !open && self.dialogs.open() {
+                crate::documents::reveal_for_dialog(&self.window);
+            }
+            self.window.request_redraw();
         }
     }
     fn appearance_height(&self) -> usize {
@@ -158,6 +275,8 @@ impl App {
                 replacement_field: self.session.search.state.active_field == 1,
             },
             appearance: self.appearance.open,
+            dialog: self.dialogs.open(),
+            dialog_accept: self.dialogs.command_label(),
             multiple_tabs: self.tabs.len() > 1,
             selected: context_menu::has_selection(&p),
             can_undo: p.can_undo,
@@ -166,6 +285,7 @@ impl App {
                 && !self.session.files.locked()
                 && !self.session.transfers.capturing(),
             has_query: !self.session.search.state.find_query.is_empty(),
+            scalable: !self.window.is_cells(),
             zoom_percent: self.appearance.settings.editor_typography().scale_percent(),
             statistics: crate::status_ui::selection_label(&p.snapshot, &p.selection)
                 .unwrap_or_else(|| {
@@ -254,6 +374,7 @@ impl App {
     }
     fn reset_transient(&mut self) {
         self.context = None;
+        self.popup = None;
         self.mouse = Mouse::new();
         self.panel_help.dismiss();
         self.session.viewport.current = None;
@@ -340,7 +461,11 @@ impl App {
                 == 0
             && !matches!(action, Action::New);
         if !reuse {
-            let next = crate::session::Session::new(self.wake.clone(), self.next_tab_id);
+            let next = crate::session::Session::new(
+                self.wake.clone(),
+                self.next_tab_id,
+                self.dialog_client.clone(),
+            );
             self.next_tab_id += 1;
             let old = std::mem::replace(&mut self.session, next);
             self.tabs[self.active] = Some(old);
@@ -354,6 +479,8 @@ impl App {
         self.reset_transient();
     }
     fn begin_close(&mut self) {
+        self.popup = None;
+        self.context = None;
         if self.closing {
             return;
         }
@@ -394,7 +521,9 @@ impl App {
     }
     fn report(&mut self, result: Result<(), String>) {
         if let Err(message) = result {
-            eprintln!("{message}");
+            if !self.window.is_cells() {
+                eprintln!("{message}");
+            }
             self.session.message = Some(message);
         }
         self.window.request_redraw();
@@ -404,6 +533,7 @@ impl App {
             || self.session.files.locked()
             || self.session.transfers.capturing()
             || self.appearance.open
+            || self.dialogs.open()
     }
     pub fn event(&mut self, event: Event<AppEvent>, target: &EventLoopWindowTarget<AppEvent>) {
         target.set_control_flow(ControlFlow::WaitUntil(
@@ -426,10 +556,19 @@ impl App {
             Event::UserEvent(AppEvent::Document(action)) => self.file_action(action),
             Event::UserEvent(AppEvent::Quit) => self.begin_quit(),
             Event::UserEvent(AppEvent::Wake) => self.window.request_redraw(),
-            Event::WindowEvent { window_id, event } if window_id == self.window.id() => {
+            Event::WindowEvent { window_id, event }
+                if self
+                    .window
+                    .native_window()
+                    .is_some_and(|w| window_id == w.id()) =>
+            {
                 self.window_event(event)
             }
-            Event::AboutToWait => self.tick(target),
+            Event::AboutToWait => {
+                if self.tick() {
+                    target.exit();
+                }
+            }
             _ => {}
         }
     }
@@ -549,6 +688,15 @@ impl App {
         }
     }
     fn keyboard(&mut self, event: KeyEvent) {
+        let input = KeyInput {
+            physical: event.physical_key,
+            logical: &event.logical_key,
+            text: event.text.as_deref(),
+            modifiers: self.modifiers,
+        };
+        self.key(&input);
+    }
+    pub(crate) fn key(&mut self, input: &KeyInput<'_>) {
         self.context = None;
         self.panel_help.clear_hover();
         let state = &self.session.search.state;
@@ -557,23 +705,46 @@ impl App {
             replace: state.mode == SearchBarMode::Replace,
             replacement_field: state.active_field == 1,
         };
-        let input = KeyInput {
-            physical: event.physical_key,
-            logical: &event.logical_key,
-            text: event.text.as_deref(),
-            modifiers: self.modifiers,
-        };
-        if let Some(index) = input::function_key_index(&event.logical_key) {
+        if self.popup.is_some() {
+            let state = self.menu_state();
+            let mut popup = self.popup.take().unwrap();
+            use winit::keyboard::{Key, NamedKey};
+            match input.logical {
+                Key::Named(NamedKey::Escape) => {}
+                Key::Named(NamedKey::Enter) => {
+                    if let Some(command) = popup.selected(state) {
+                        self.menu_command(command);
+                    }
+                }
+                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown | NamedKey::Tab) => {
+                    popup.navigate(
+                        *input.logical != Key::Named(NamedKey::ArrowUp)
+                            && !input.modifiers.shift_key(),
+                        state,
+                    );
+                    self.popup = Some(popup);
+                }
+                _ => self.popup = Some(popup),
+            }
+            self.window.request_redraw();
+            return;
+        }
+        if let Some(index) = input::function_key_index(input.logical) {
             self.key_function = Some(index);
             self.invoke_function(index);
             return;
         }
-        let intent = input::decode(&input, context);
+        if self.dialogs.open() {
+            self.dialogs.key(input);
+            self.window.request_redraw();
+            return;
+        }
+        let intent = input::decode(input, context);
         if self.panel_help.details && !matches!(intent, Some(Intent::DocumentInfo)) {
             self.panel_help.dismiss();
             self.window.request_redraw();
             if matches!(
-                event.logical_key,
+                *input.logical,
                 winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
             ) {
                 return;
@@ -594,7 +765,7 @@ impl App {
         {
             let before = self.appearance.settings.clone();
             self.appearance.key(
-                &input,
+                input,
                 self.display.source.0 as usize,
                 self.appearance_height(),
                 self.display.pixelated,
@@ -621,7 +792,7 @@ impl App {
                 self.mouse.dragging = false;
                 self.session.viewport.horizontal.end_drag();
             }
-            if previous != typography || resolution_changed {
+            if (previous != typography || resolution_changed) && !self.window.is_cells() {
                 if previous.family != typography.family || previous.size_px != typography.size_px {
                     self.font = FontEngine::with_typography(typography);
                 } else {
@@ -653,6 +824,9 @@ impl App {
         let (width, height) = self.document_size();
         let (x, y) = self.mouse.position;
         let compact = self.display.pixelated;
+        if self.popup.is_some() {
+            return Shape::Pointer;
+        }
         let scene = self.display.to_source_clamped(self.pointer_physical);
         if self
             .geometry()
@@ -669,6 +843,14 @@ impl App {
             } else {
                 Shape::Arrow
             };
+        }
+        if self.dialogs.open() {
+            return self.dialogs.cursor(
+                (self.display.source.0 as usize, self.appearance_height()),
+                compact,
+                scene.0,
+                scene.1,
+            );
         }
         if let Some(shape) = self.panel_help.cursor(self.geometry(), scene.0, scene.1) {
             return shape;
@@ -712,7 +894,8 @@ impl App {
         }
     }
     fn custom_cursor(&self) -> bool {
-        self.focused
+        !self.window.is_cells()
+            && self.focused
             && self.pointer_inside
             && !self.failed
             && !self.session.files.locked()
@@ -740,6 +923,20 @@ impl App {
         self.window.request_redraw();
     }
     fn intent(&mut self, intent: Intent) {
+        if matches!(
+            intent,
+            Intent::AcceptDialog | Intent::CancelDialog | Intent::NavigateDialog { .. }
+        ) {
+            match intent {
+                Intent::AcceptDialog => self.dialogs.accept(),
+                Intent::CancelDialog => self.dialogs.cancel(),
+                Intent::NavigateDialog { forward } => self.dialogs.navigate(forward),
+                _ => {}
+            }
+            self.window.request_redraw();
+            return;
+        }
+
         if matches!(
             intent,
             Intent::AcceptAppearance | Intent::ResetAppearance | Intent::BrowseAppearance { .. }
@@ -828,8 +1025,8 @@ impl App {
                     self.mouse.dragging = false;
                     self.session.viewport.horizontal.end_drag();
                 }
-                Intent::Zoom(delta) => self.appearance.zoom(delta),
-                Intent::ResetFontSize => self.appearance.reset_size(),
+                Intent::Zoom(delta) if !self.window.is_cells() => self.appearance.zoom(delta),
+                Intent::ResetFontSize if !self.window.is_cells() => self.appearance.reset_size(),
                 _ => {}
             }
             self.appearance_changed(before);
@@ -899,6 +1096,9 @@ impl App {
         self.window.request_redraw();
     }
     fn menu_state(&self) -> MenuState {
+        if self.dialogs.open() {
+            return self.dialogs.menu_state();
+        }
         let p = self.session.buffer.client.latest();
         MenuState {
             editable: !self.locked(),
@@ -916,8 +1116,16 @@ impl App {
         }
     }
     fn menu_command(&mut self, command: MenuCommand) {
+        self.popup = None;
+        if self.dialogs.open() {
+            self.dialogs.intent(command.intent());
+            self.window.request_redraw();
+            return;
+        }
         self.context = None;
-        self.menus.invalidate();
+        if let Some(menus) = &mut self.menus {
+            menus.invalidate();
+        }
         // Validate again at delivery: a native menu may have tracked while workers completed.
         if self.menu_state().enabled(command) {
             self.intent(command.intent());
@@ -947,7 +1155,7 @@ impl App {
         });
         self.window.request_redraw();
     }
-    fn context_click(&mut self) {
+    pub(crate) fn context_click(&mut self) {
         self.context = None;
         let (x, y) = self.mouse.position;
         if self.locked()
@@ -1004,14 +1212,44 @@ impl App {
             Ok(ContextStep::Cancel) => {}
             Ok(ContextStep::Show) => {
                 self.session.viewport.input(false);
-                self.menus.update(self.menu_state());
-                self.menus.show_context(&self.window, request.position);
+                let state = self.menu_state();
+                self.popup = Some(context_menu::Popup::new(
+                    self.display.to_source_clamped(request.position),
+                    state,
+                ));
                 self.window.request_redraw();
             }
             Err(error) => self.report(Err(error)),
         }
     }
-    fn pointer_move(&mut self, x: f32, y: f32) {
+    pub(crate) fn wheel_lines(&mut self, x: f32, y: f32) {
+        let state = self.menu_state();
+        if let Some(popup) = &mut self.popup {
+            popup.navigate(y < 0., state);
+            self.window.request_redraw();
+            return;
+        }
+        if self.dialogs.open() {
+            self.dialogs.navigate(y < 0.0);
+        } else if self.appearance.open {
+            self.appearance.wheel(
+                -f64::from(y),
+                self.display.source.0 as usize,
+                self.appearance_height(),
+                self.display.pixelated,
+            );
+        } else if !self.session.files.locked() {
+            self.session.viewport.wheel(
+                f64::from(x * self.font.char_width_px * 3.0),
+                f64::from(y * self.font.line_height_px * 2.5),
+                self.modifiers.shift_key(),
+                &self.session.buffer.client.latest().snapshot,
+                &self.font,
+            );
+        }
+        self.window.request_redraw();
+    }
+    pub(crate) fn pointer_move(&mut self, x: f32, y: f32) {
         self.pointer_inside = true;
         if self.custom_cursor() {
             self.window.request_redraw();
@@ -1023,6 +1261,26 @@ impl App {
         let (x, y) = self.mouse.position;
         self.update_cursor();
         self.hover_commands();
+        let state = self.menu_state();
+        let size = (self.display.source.0 as usize, self.appearance_height());
+        if let Some(popup) = &mut self.popup {
+            let scene = self.display.to_source_clamped(self.pointer_physical);
+            popup.hover(size, self.display.pixelated, scene.0, scene.1, state);
+            self.window.request_redraw();
+            return;
+        }
+        if self.dialogs.open() {
+            let scene = self.display.to_source_clamped(self.pointer_physical);
+            if self.dialogs.hover(
+                (self.display.source.0 as usize, self.appearance_height()),
+                self.display.pixelated,
+                scene.0,
+                scene.1,
+            ) {
+                self.window.request_redraw();
+            }
+            return;
+        }
         if self.appearance.open {
             if self.display.to_source(self.pointer_physical).is_some()
                 && self.appearance.hover(
@@ -1054,14 +1312,29 @@ impl App {
             self.edit(EditorCommand::Drag { line, col }, false);
         }
     }
-    fn pointer_button(&mut self, state: ElementState) {
+    pub(crate) fn pointer_button(&mut self, state: ElementState) {
         self.context = None;
         if state == ElementState::Released {
             self.mouse_function = None;
+            self.dialogs.release();
             self.appearance.end_drag();
             self.update_cursor();
             self.mouse.dragging = false;
             self.session.viewport.horizontal.end_drag();
+            return;
+        }
+        if let Some(mut popup) = self.popup.take() {
+            let scene = self.display.to_source_clamped(self.pointer_physical);
+            if let Some(command) = popup.click(
+                (self.display.source.0 as usize, self.appearance_height()),
+                self.display.pixelated,
+                scene.0,
+                scene.1,
+                self.menu_state(),
+            ) {
+                self.menu_command(command);
+            }
+            self.window.request_redraw();
             return;
         }
         let (x, y) = self.mouse.position;
@@ -1105,6 +1378,16 @@ impl App {
                 }
                 Hit::Consumed => {}
             }
+            self.window.request_redraw();
+            return;
+        }
+        if self.dialogs.open() {
+            self.dialogs.click(
+                (self.display.source.0 as usize, self.appearance_height()),
+                self.display.pixelated,
+                scene.0,
+                scene.1,
+            );
             self.window.request_redraw();
             return;
         }
@@ -1185,7 +1468,8 @@ impl App {
             false,
         );
     }
-    fn tick(&mut self, target: &EventLoopWindowTarget<AppEvent>) {
+    pub(crate) fn tick(&mut self) -> bool {
+        self.poll_dialogs();
         if let Some(result) = self.preferences.as_mut().and_then(Preferences::poll) {
             match result {
                 Ok(()) => self.appearance.save_status = "Saved".into(),
@@ -1207,21 +1491,20 @@ impl App {
             .transfers
             .poll(&self.session.buffer.client, &mut self.session.search);
         self.report_if_error(result);
-        match self.session.files.poll(
-            &self.session.buffer.client,
-            self.session.transfers.busy(),
-            &self.window,
-        ) {
+        match self
+            .session
+            .files
+            .poll(&self.session.buffer.client, self.session.transfers.busy())
+        {
             Ok(true) => {
                 if self.tabs.len() == 1 {
-                    target.exit();
-                    return;
+                    return true;
                 }
                 self.remove_active();
                 if self.quitting {
                     self.begin_close();
                 }
-                return;
+                return false;
             }
             Err(error) => self.session.message = Some(error),
             _ => {}
@@ -1296,7 +1579,10 @@ impl App {
             )
         };
         self.window.set_title(&title);
-        self.menus.update(self.menu_state());
+        let state = self.menu_state();
+        if let Some(menus) = &mut self.menus {
+            menus.update(state);
+        }
         self.poll_context();
         if self
             .command_flash
@@ -1314,6 +1600,7 @@ impl App {
         {
             self.window.request_redraw();
         }
+        false
     }
     fn report_if_error(&mut self, result: Result<(), String>) {
         if let Err(error) = result {
@@ -1321,7 +1608,8 @@ impl App {
             self.window.request_redraw();
         }
     }
-    fn redraw(&mut self) {
+    pub(crate) fn redraw(&mut self) {
+        self.poll_dialogs();
         if self.failed {
             return;
         }
@@ -1329,10 +1617,7 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        let display = ScreenMapping::new(
-            (size.width, size.height),
-            self.appearance.settings.resolution(),
-        );
+        let display = ScreenMapping::new((size.width, size.height), self.resolution());
         let (width, scene_height) = display.source;
         let geometry = crate::chrome::Geometry::new(
             width as usize,
@@ -1374,17 +1659,18 @@ impl App {
                 line_digits: frame.line_digits,
                 text_start_x: frame.text_start_x,
                 show_line_numbers: self.session.viewport.line_numbers,
-                caret_visible: self.session.viewport.caret,
+                caret_visible: self.session.viewport.caret
+                    && !self.dialogs.open()
+                    && !self.appearance.open
+                    && self.popup.is_none(),
                 current_scrollbar: self.session.viewport.bar,
                 show_perf_hud: self.hud,
-                gpu_name: &self.renderer.description,
+                gpu_name: self.renderer.description(),
                 frame_start: start,
                 layout_time: frame.layout_time,
             },
         );
-        for draw in &mut self.draws.draws {
-            draw.rect[1] += geometry.top as f32;
-        }
+        self.draws.translate(0.0, geometry.top as f32);
         let labels: Vec<_> = self
             .tabs
             .iter()
@@ -1438,6 +1724,24 @@ impl App {
             scene_height as usize - geometry.bottom,
             display.pixelated,
         );
+        let state = self.menu_state();
+        if let Some(popup) = &mut self.popup {
+            popup.paint(
+                &mut self.draws,
+                &mut self.ui_font,
+                (width as usize, scene_height as usize - geometry.bottom),
+                display.pixelated,
+                state,
+                self.appearance.palette,
+            );
+        }
+        self.dialogs.paint(
+            &mut self.draws,
+            &mut self.ui_font,
+            (width as usize, scene_height as usize - geometry.bottom),
+            display.pixelated,
+            &self.appearance.palette,
+        );
         if self.custom_cursor() {
             if let Some((x, y)) = display.to_source(self.pointer_physical) {
                 let shape = self.pointer_shape();
@@ -1466,7 +1770,8 @@ impl App {
             Ok(false) => self.window.request_redraw(),
             Err(error) => {
                 self.failed = true;
-                let _=self.session.files.enqueue(Action::ReportError(format!("GPU rendering failed: {error}. Texted will close; you can save unsaved changes before closing.")));
+                self.render_failure = Some(error.clone());
+                let _=self.session.files.enqueue(Action::ReportError(format!("Rendering failed: {error}. Texted will close; you can save unsaved changes before closing.")));
                 let _ = self.session.files.enqueue(Action::Close);
             }
         }

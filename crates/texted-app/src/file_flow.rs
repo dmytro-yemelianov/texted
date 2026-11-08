@@ -3,10 +3,9 @@ use crate::{
     documents::{Action, Documents, Effect},
     transfers::submit,
 };
-use std::{collections::VecDeque, sync::Arc};
+use std::collections::VecDeque;
 use texted_app::buffer_service::{BufferClient, Command, Published};
 use texted_io::LineEnding;
-use winit::window::Window;
 pub(crate) struct FileFlow {
     pub documents: Documents,
     queue: VecDeque<Action>,
@@ -14,9 +13,9 @@ pub(crate) struct FileFlow {
     pub reset: bool,
 }
 impl FileFlow {
-    pub fn new(content: ropey::Rope, wake: crate::Wake) -> Self {
+    pub fn new(content: ropey::Rope, wake: crate::Wake, dialogs: crate::dialog_ui::Client) -> Self {
         Self {
-            documents: Documents::new(content, None, false, LineEnding::Lf, wake),
+            documents: Documents::new(content, None, false, LineEnding::Lf, wake, dialogs),
             queue: VecDeque::new(),
             install: None,
             reset: false,
@@ -42,12 +41,7 @@ impl FileFlow {
             None
         }
     }
-    pub fn poll(
-        &mut self,
-        client: &BufferClient,
-        transferring: bool,
-        window: &Arc<Window>,
-    ) -> Result<bool, String> {
+    pub fn poll(&mut self, client: &BufferClient, transferring: bool) -> Result<bool, String> {
         let p = client.latest();
         if let Some(sequence) = self.install {
             if p.completed_through < sequence {
@@ -59,10 +53,10 @@ impl FileFlow {
         if !ready(&p, client.barrier(), transferring) {
             return Ok(false);
         }
-        let mut effect = self.documents.poll(&p.snapshot, client, window);
+        let mut effect = self.documents.poll(&p.snapshot, client);
         if matches!(effect, Effect::None) {
             if let Some(action) = self.next_ready(&p, client.barrier(), transferring) {
-                effect = self.documents.handle(action, &p.snapshot, client, window);
+                effect = self.documents.handle(action, &p.snapshot, client);
             }
         }
         match effect {
@@ -72,7 +66,6 @@ impl FileFlow {
                 let sequence = submit(client, Command::Load(document.content.clone()))?;
                 self.documents.installed(&document);
                 self.install = Some(sequence);
-                window.request_redraw();
             }
         }
         Ok(false)
@@ -85,6 +78,7 @@ fn ready(p: &texted_app::buffer_service::Published, accepted: u64, transferring:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     #[test]
     fn keyboard_save_waits_for_clipboard_capture_and_its_accepted_paste() {
         use texted_app::commands::EditorCommand;
@@ -93,7 +87,11 @@ mod tests {
             let _ = wake.try_send(());
         });
         let client = &service.client;
-        let mut flow = FileFlow::new(client.latest().snapshot.content.clone(), Arc::new(|| {}));
+        let mut flow = FileFlow::new(
+            client.latest().snapshot.content.clone(),
+            Arc::new(|| {}),
+            crate::dialog_ui::channel(Arc::new(|| {})).0,
+        );
         client
             .submit(Command::Edit(EditorCommand::Insert("prior".into())))
             .unwrap_or_else(|_| panic!("rejected"));
@@ -149,7 +147,11 @@ mod tests {
     fn initial_saved_root_is_the_actual_published_root() {
         let service = texted_app::buffer_service::BufferService::new(|| {});
         let p = service.client.latest();
-        let flow = FileFlow::new(p.snapshot.content.clone(), Arc::new(|| {}));
+        let flow = FileFlow::new(
+            p.snapshot.content.clone(),
+            Arc::new(|| {}),
+            crate::dialog_ui::channel(Arc::new(|| {})).0,
+        );
         assert!(!flow.documents.dirty(&p.snapshot));
     }
 }

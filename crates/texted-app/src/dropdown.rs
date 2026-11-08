@@ -53,6 +53,8 @@ pub(crate) struct Popup {
     pub row_height: usize,
     pub visible: usize,
     pub scrollbar: usize,
+    inset_x: usize,
+    inset_y: usize,
 }
 impl Popup {
     pub fn new(
@@ -63,12 +65,14 @@ impl Popup {
         label_width: usize,
     ) -> Self {
         let (width, height) = size;
-        let margin = if compact { 4 } else { 8 };
-        let row_height = if compact { 14 } else { 26 };
-        let visible = (height.saturating_sub(2 * margin + 2) / row_height)
+        let margin = 8;
+        let inset_x = 8;
+        let inset_y = if compact { 8 } else { 16 };
+        let row_height = if compact { 16 } else { 32 };
+        let visible = (height.saturating_sub(2 * margin + 2 * inset_y) / row_height)
             .clamp(1, 12)
             .min(total.max(1));
-        let h = (visible * row_height + 2).min(height);
+        let h = (visible * row_height + 2 * inset_y).min(height);
         let scrollbar = if visible < total {
             if compact {
                 8
@@ -81,8 +85,10 @@ impl Popup {
         let w = anchor
             .w
             .max(label_width + 24 + scrollbar)
-            .min(width.saturating_sub(2 * margin).max(1));
-        let x = anchor.x.min(width.saturating_sub(margin + w));
+            .min(width.saturating_sub(2 * margin).max(1))
+            / 8
+            * 8;
+        let x = anchor.x.min(width.saturating_sub(margin + w)) / 8 * 8;
         let below = anchor.y + anchor.h;
         let y = if below + h + margin <= height {
             below
@@ -91,29 +97,36 @@ impl Popup {
         } else {
             height.saturating_sub(margin + h)
         };
+        let y = y / inset_y * inset_y;
         Self {
             rect: Rect { x, y, w, h },
             row_height,
             visible,
             scrollbar,
+            inset_x,
+            inset_y,
         }
     }
     pub fn row(&self, index: usize, first: usize) -> Option<Rect> {
         (index >= first && index < first + self.visible).then(|| Rect {
-            x: self.rect.x + 1,
-            y: self.rect.y + 1 + (index - first) * self.row_height,
-            w: self.rect.w.saturating_sub(2 + self.scrollbar),
+            x: self.rect.x + self.inset_x,
+            y: self.rect.y + self.inset_y + (index - first) * self.row_height,
+            w: self
+                .rect
+                .w
+                .saturating_sub(2 * self.inset_x + self.scrollbar),
             h: self.row_height,
         })
     }
     pub fn item_at(&self, x: f32, y: f32, first: usize, total: usize) -> Option<usize> {
         if !self.rect.contains(x, y)
-            || x >= (self.rect.x + self.rect.w.saturating_sub(self.scrollbar + 1)) as f32
-            || y < (self.rect.y + 1) as f32
+            || x >= (self.rect.x + self.rect.w.saturating_sub(self.scrollbar + self.inset_x)) as f32
+            || y < (self.rect.y + self.inset_y) as f32
         {
             return None;
         }
-        let row = ((y - self.rect.y as f32 - 1.0) / self.row_height as f32) as usize;
+        let row =
+            ((y - self.rect.y as f32 - self.inset_y as f32) / self.row_height as f32) as usize;
         (row < self.visible && first + row < total).then_some(first + row)
     }
 }

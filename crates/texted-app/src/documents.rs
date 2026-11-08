@@ -1,19 +1,12 @@
 //! Single-document file lifecycle. Native sheets are polled on main; file I/O runs on snapshots.
+use crate::surface::Host;
 use ropey::Rope;
-use std::{
-    future::Future,
-    path::PathBuf,
-    pin::Pin,
-    sync::{mpsc, Arc},
-    task::{Context, Poll, Wake, Waker},
-    thread,
-};
+use std::{path::PathBuf, sync::mpsc, thread};
 use texted_app::buffer_service::{BufferClient, Command};
 use texted_buffer::BufferSnapshot;
 use texted_io::{IoManager, LineEnding, LoadedDocument};
-use winit::window::Window;
 /// A user-requested file operation must not wait on a hidden or minimized sheet.
-pub(crate) fn reveal_for_dialog(window: &Window) {
+pub(crate) fn reveal_for_dialog(window: &Host) {
     window.set_visible(true);
     window.set_minimized(false);
     window.focus_window();
@@ -32,7 +25,6 @@ pub enum Effect {
     Install(LoadedDocument),
     Close,
 }
-type NativeFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 struct Saved {
     path: PathBuf,
     text: Rope,
@@ -41,28 +33,15 @@ enum Job {
     Save(mpsc::Receiver<Result<Saved, String>>),
     Load(mpsc::Receiver<Result<LoadedDocument, String>>),
     ChooseSave {
-        future: NativeFuture<Option<rfd::FileHandle>>,
+        ticket: crate::dialog_ui::Ticket,
         snapshot: BufferSnapshot,
     },
-    ChooseOpen(NativeFuture<Option<rfd::FileHandle>>),
+    ChooseOpen(crate::dialog_ui::Ticket),
     Confirm {
-        future: NativeFuture<rfd::MessageDialogResult>,
+        ticket: crate::dialog_ui::Ticket,
         action: Action,
     },
-    Error(NativeFuture<rfd::MessageDialogResult>),
-}
-struct DialogWake(crate::Wake);
-impl Wake for DialogWake {
-    fn wake(self: Arc<Self>) {
-        (self.0)();
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        (self.0)();
-    }
-}
-fn poll_native<T>(future: &mut NativeFuture<T>, wake: &crate::Wake) -> Poll<T> {
-    let waker = Waker::from(Arc::new(DialogWake(wake.clone())));
-    future.as_mut().poll(&mut Context::from_waker(&waker))
+    Error(crate::dialog_ui::Ticket),
 }
 pub struct Documents {
     pub path: Option<PathBuf>,
@@ -70,6 +49,7 @@ pub struct Documents {
     pub ending: LineEnding,
     saved_text: Rope,
     wake: crate::Wake,
+    dialogs: crate::dialog_ui::Client,
     job: Option<Job>,
     next: Option<Action>,
 }
@@ -80,6 +60,7 @@ impl Documents {
         bom: bool,
         ending: LineEnding,
         wake: crate::Wake,
+        dialogs: crate::dialog_ui::Client,
     ) -> Self {
         Self {
             path,
@@ -87,6 +68,7 @@ impl Documents {
             ending,
             saved_text: text,
             wake,
+            dialogs,
             job: None,
             next: None,
         }
@@ -109,14 +91,14 @@ impl Documents {
             .path
             .as_ref()
             .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().into_owned())
+            .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Untitled".into());
         format!(
             "{name}{}{} - Texted",
             if self.dirty(snapshot) { " *" } else { "" },
             match self.job {
-                Some(Job::Load(_)) => " (Opening…)",
-                Some(Job::Save(_)) => " (Saving…)",
+                Some(Job::Load(_)) => " (Opening...)",
+                Some(Job::Save(_)) => " (Saving...)",
                 _ => "",
             }
         )
@@ -127,26 +109,21 @@ impl Documents {
         self.ending = document.line_ending;
         self.saved_text = document.content.clone();
     }
-    fn error(&mut self, window: &Arc<Window>, message: &str) {
-        reveal_for_dialog(window);
-        eprintln!("{message}");
+    fn error(&mut self, message: &str) {
         self.next = None;
-        self.job = Some(Job::Error(Box::pin(
-            rfd::AsyncMessageDialog::new()
-                .set_parent(window.as_ref())
-                .set_title("Texted")
-                .set_description(message)
-                .set_level(rfd::MessageLevel::Error)
-                .show(),
-        )));
-        window.request_redraw();
+        self.job = self
+            .dialogs
+            .request(crate::dialog_ui::Kind::Error {
+                message: message.into(),
+            })
+            .ok()
+            .map(Job::Error);
     }
     pub fn handle(
         &mut self,
         action: Action,
         snapshot: &BufferSnapshot,
         client: &BufferClient,
-        window: &Arc<Window>,
     ) -> Effect {
         if self.job.is_some() {
             if self.next.is_none() {
@@ -155,34 +132,32 @@ impl Documents {
             return Effect::None;
         }
         if let Action::Save { save_as } = action {
-            self.save(snapshot, save_as, client, window);
+            self.save(snapshot, save_as, client);
             return Effect::None;
         }
         if let Action::ReportError(message) = action {
-            self.error(window, &message);
+            self.error(&message);
             return Effect::None;
         }
         if self.dirty(snapshot) {
-            reveal_for_dialog(window);
-            let future = Box::pin(
-                rfd::AsyncMessageDialog::new()
-                    .set_parent(window.as_ref())
-                    .set_title("Save changes?")
-                    .set_description("Your changes will be lost if you don't save them.")
-                    .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
-                        "Save".into(),
-                        "Discard".into(),
-                        "Cancel".into(),
-                    ))
-                    .show(),
-            );
-            self.job = Some(Job::Confirm { future, action });
-            window.request_redraw();
+            let name = self
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Untitled".into());
+            match self
+                .dialogs
+                .request(crate::dialog_ui::Kind::ConfirmSave { name })
+            {
+                Ok(ticket) => self.job = Some(Job::Confirm { ticket, action }),
+                Err(error) => self.error(&error),
+            }
             return Effect::None;
         }
-        self.proceed(action, window)
+        self.proceed(action)
     }
-    fn proceed(&mut self, action: Action, window: &Arc<Window>) -> Effect {
+    fn proceed(&mut self, action: Action) -> Effect {
         match action {
             Action::Close => Effect::Close,
             Action::New => Effect::Install(LoadedDocument {
@@ -193,28 +168,33 @@ impl Documents {
                 byte_size: 0,
             }),
             Action::OpenDialog => {
-                reveal_for_dialog(window);
-                let mut dialog = rfd::AsyncFileDialog::new()
-                    .set_parent(window.as_ref())
-                    .set_title("Open plain-text file");
-                if let Some(parent) = self.path.as_ref().and_then(|p| p.parent()) {
-                    dialog = dialog.set_directory(parent);
+                let directory = self
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(std::path::Path::to_owned)
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                    });
+                match self
+                    .dialogs
+                    .request(crate::dialog_ui::Kind::Open { directory })
+                {
+                    Ok(ticket) => self.job = Some(Job::ChooseOpen(ticket)),
+                    Err(error) => self.error(&error),
                 }
-                self.job = Some(Job::ChooseOpen(Box::pin(dialog.pick_file())));
-                window.request_redraw();
                 Effect::None
             }
             Action::OpenPath(path) => {
-                self.open(path, window);
+                self.open(path);
                 Effect::None
             }
             Action::Save { .. } | Action::ReportError(_) => unreachable!(),
         }
     }
-    fn open(&mut self, path: PathBuf, window: &Arc<Window>) {
+    fn open(&mut self, path: PathBuf) {
         let (tx, rx) = mpsc::channel();
         self.job = Some(Job::Load(rx));
-        window.request_redraw();
         let wake = self.wake.clone();
         thread::spawn(move || {
             let result = IoManager::open_file(&path)
@@ -223,48 +203,33 @@ impl Documents {
             wake();
         });
     }
-    fn save(
-        &mut self,
-        snapshot: &BufferSnapshot,
-        save_as: bool,
-        client: &BufferClient,
-        window: &Arc<Window>,
-    ) {
+    fn save(&mut self, snapshot: &BufferSnapshot, save_as: bool, client: &BufferClient) {
         if client.submit(Command::BreakUndoGroup).is_err() {
-            self.error(
-                window,
-                "Buffer is busy; save was not accepted. Please retry.",
-            );
+            self.error("Buffer is busy; save was not accepted. Please retry.");
             return;
         }
         if save_as || self.path.is_none() {
-            reveal_for_dialog(window);
-            let mut dialog = rfd::AsyncFileDialog::new()
-                .set_parent(window.as_ref())
-                .set_title("Save plain-text file")
-                .set_file_name(
-                    self.path
-                        .as_ref()
-                        .and_then(|p| p.file_name())
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Untitled.txt".into()),
-                );
-            if let Some(parent) = self.path.as_ref().and_then(|p| p.parent()) {
-                dialog = dialog.set_directory(parent);
-            }
-            self.job = Some(Job::ChooseSave {
-                future: Box::pin(dialog.save_file()),
-                snapshot: snapshot.clone(),
+            let path = self.path.clone().unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join("Untitled.txt")
             });
-            window.request_redraw();
+            match self.dialogs.request(crate::dialog_ui::Kind::Save { path }) {
+                Ok(ticket) => {
+                    self.job = Some(Job::ChooseSave {
+                        ticket,
+                        snapshot: snapshot.clone(),
+                    })
+                }
+                Err(error) => self.error(&error),
+            }
         } else {
-            self.write(snapshot, self.path.clone().unwrap(), window);
+            self.write(snapshot, self.path.clone().unwrap());
         }
     }
-    fn write(&mut self, snapshot: &BufferSnapshot, path: PathBuf, window: &Arc<Window>) {
+    fn write(&mut self, snapshot: &BufferSnapshot, path: PathBuf) {
         let (tx, rx) = mpsc::channel();
         self.job = Some(Job::Save(rx));
-        window.request_redraw();
         let content = snapshot.content.clone();
         let bom = self.bom;
         let ending = self.ending;
@@ -280,106 +245,94 @@ impl Documents {
             wake();
         });
     }
-    pub fn poll(
-        &mut self,
-        snapshot: &BufferSnapshot,
-        client: &BufferClient,
-        window: &Arc<Window>,
-    ) -> Effect {
-        if let Some(mut job) = self.job.take() {
-            match &mut job {
-                Job::Save(rx) => match rx.try_recv() {
+    pub fn poll(&mut self, snapshot: &BufferSnapshot, client: &BufferClient) -> Effect {
+        use crate::dialog_ui::Answer;
+        if let Some(job) = self.job.take() {
+            match job {
+                Job::Save(receive) => match receive.try_recv() {
                     Ok(Ok(saved)) => {
                         self.path = Some(saved.path);
                         self.saved_text = saved.text;
                     }
                     Ok(Err(error)) => {
-                        self.error(window, &error);
-                        return Effect::None;
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        self.error(window, "The save worker stopped before completing.");
+                        self.error(&error);
                         return Effect::None;
                     }
                     Err(mpsc::TryRecvError::Empty) => {
-                        self.job = Some(job);
+                        self.job = Some(Job::Save(receive));
+                        return Effect::None;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.error("The save worker stopped before completing");
                         return Effect::None;
                     }
                 },
-                Job::Load(rx) => match rx.try_recv() {
+                Job::Load(receive) => match receive.try_recv() {
                     Ok(Ok(document)) => return Effect::Install(document),
                     Ok(Err(error)) => {
-                        self.error(window, &error);
-                        return Effect::None;
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        self.error(window, "The file loader stopped before completing.");
+                        self.error(&error);
                         return Effect::None;
                     }
                     Err(mpsc::TryRecvError::Empty) => {
-                        self.job = Some(job);
+                        self.job = Some(Job::Load(receive));
+                        return Effect::None;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.error("The file loader stopped before completing");
                         return Effect::None;
                     }
                 },
                 Job::ChooseSave {
-                    future,
+                    ticket,
                     snapshot: written,
-                } => match poll_native(future, &self.wake) {
-                    Poll::Ready(Some(file)) => {
-                        self.write(written, file.path().into(), window);
+                } => match ticket.poll() {
+                    Some(Answer::Path(path)) => {
+                        self.write(&written, path);
                         return Effect::None;
                     }
-                    Poll::Ready(None) => {
-                        self.next = None;
-                    }
-                    Poll::Pending => {
-                        self.job = Some(job);
-                        return Effect::None;
-                    }
-                },
-                Job::ChooseOpen(future) => match poll_native(future, &self.wake) {
-                    Poll::Ready(Some(file)) => {
-                        self.open(file.path().into(), window);
-                        return Effect::None;
-                    }
-                    Poll::Ready(None) => {}
-                    Poll::Pending => {
-                        self.job = Some(job);
+                    Some(_) => self.next = None,
+                    None => {
+                        self.job = Some(Job::ChooseSave {
+                            ticket,
+                            snapshot: written,
+                        });
                         return Effect::None;
                     }
                 },
-                Job::Confirm { future, action } => match poll_native(future, &self.wake) {
-                    Poll::Ready(choice) => {
-                        if choice == rfd::MessageDialogResult::Yes
-                            || choice == rfd::MessageDialogResult::Custom("Save".into())
-                        {
-                            self.next = Some(action.clone());
-                            self.save(snapshot, false, client, window);
-                            return Effect::None;
-                        }
-                        if choice == rfd::MessageDialogResult::No
-                            || choice == rfd::MessageDialogResult::Custom("Discard".into())
-                        {
-                            return self.proceed(action.clone(), window);
-                        }
-                        self.next = None;
+                Job::ChooseOpen(ticket) => match ticket.poll() {
+                    Some(Answer::Path(path)) => {
+                        self.open(path);
+                        return Effect::None;
                     }
-                    Poll::Pending => {
-                        self.job = Some(job);
+                    Some(_) => {}
+                    None => {
+                        self.job = Some(Job::ChooseOpen(ticket));
                         return Effect::None;
                     }
                 },
-                Job::Error(future) => match poll_native(future, &self.wake) {
-                    Poll::Ready(_) => {}
-                    Poll::Pending => {
-                        self.job = Some(job);
+                Job::Confirm { ticket, action } => match ticket.poll() {
+                    Some(Answer::Save) => {
+                        self.next = Some(action);
+                        self.save(snapshot, false, client);
+                        return Effect::None;
+                    }
+                    Some(Answer::Discard) => return self.proceed(action),
+                    Some(_) => self.next = None,
+                    None => {
+                        self.job = Some(Job::Confirm { ticket, action });
                         return Effect::None;
                     }
                 },
+                Job::Error(ticket) => {
+                    if ticket.poll().is_none() {
+                        self.job = Some(Job::Error(ticket));
+                        return Effect::None;
+                    }
+                }
             }
         }
         if let Some(action) = self.next.take() {
-            return self.handle(action, snapshot, client, window);
+            return self.handle(action, snapshot, client);
         }
         Effect::None
     }
@@ -387,37 +340,22 @@ impl Documents {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use texted_buffer::TextBuffer;
-    #[test]
-    fn native_dialog_completion_wakes_an_undispatched_ui_queue() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let (send, received) = mpsc::channel();
-        let wake: crate::Wake = Arc::new(move || {
-            let _ = send.send(());
-        });
-        let done = Arc::new(AtomicBool::new(false));
-        let state = done.clone();
-        let mut future: NativeFuture<()> = Box::pin(std::future::poll_fn(move |cx| {
-            if state.load(Ordering::Acquire) {
-                return Poll::Ready(());
-            }
-            let state = state.clone();
-            let waker = cx.waker().clone();
-            thread::spawn(move || {
-                state.store(true, Ordering::Release);
-                waker.wake();
-            });
-            Poll::Pending
-        }));
-        assert!(poll_native(&mut future, &wake).is_pending());
-        received
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        assert!(poll_native(&mut future, &wake).is_ready());
+    fn dialogs() -> crate::dialog_ui::Client {
+        let (client, _) = crate::dialog_ui::channel(Arc::new(|| {}));
+        client
     }
     #[test]
     fn actions_wait_for_file_work_and_its_continuation() {
-        let mut doc = Documents::new(Rope::new(), None, false, LineEnding::Lf, Arc::new(|| {}));
+        let mut doc = Documents::new(
+            Rope::new(),
+            None,
+            false,
+            LineEnding::Lf,
+            Arc::new(|| {}),
+            dialogs(),
+        );
         assert!(doc.is_idle());
         let (_tx, rx) = mpsc::channel();
         doc.job = Some(Job::Save(rx));
@@ -437,6 +375,7 @@ mod tests {
             false,
             LineEnding::Lf,
             Arc::new(|| {}),
+            dialogs(),
         );
         b.set_cursor_offset(3);
         assert!(!doc.dirty(&b.create_snapshot()));
@@ -457,6 +396,7 @@ mod tests {
             false,
             LineEnding::Lf,
             Arc::new(|| {}),
+            dialogs(),
         );
         assert!(doc.dirty(&b.create_snapshot()));
     }

@@ -9,6 +9,7 @@ use std::{
 use texted_app::{
     appearance::Typography,
     bitmap_fonts::{self, BitmapFace},
+    cell_grid::{self, CellCommand, CellGrid},
 };
 
 static NEXT_FONT_ID: AtomicU64 = AtomicU64::new(1);
@@ -33,11 +34,30 @@ pub(crate) struct Draw {
 pub(crate) struct DrawList {
     pub clear: u32,
     pub draws: Vec<Draw>,
+    pub cells: Vec<CellCommand>,
 }
 impl DrawList {
     pub fn reset(&mut self, clear: u32) {
         self.clear = clear;
         self.draws.clear();
+        self.cells.clear();
+    }
+    pub fn translate(&mut self, x: f32, y: f32) {
+        for draw in &mut self.draws {
+            draw.rect[0] += x;
+            draw.rect[1] += y;
+        }
+        for command in &mut self.cells {
+            command.translate(x, y);
+        }
+    }
+    pub fn cell_grid(
+        &self,
+        columns: usize,
+        rows: usize,
+        cell_size: [f32; 2],
+    ) -> Result<CellGrid, &'static str> {
+        cell_grid::compose(columns, rows, cell_size, self.clear, &self.cells)
     }
     pub(crate) fn push(
         &mut self,
@@ -73,6 +93,7 @@ impl DrawList {
 
 pub struct FontEngine {
     face: BitmapFace,
+    logical_only: bool,
     font_id: u64,
     scale: u32,
     pub char_width_px: f32,
@@ -85,6 +106,11 @@ pub struct FontEngine {
     preview_cache: HashMap<(u32, u32, u32), Arc<CachedGlyph>>,
 }
 impl FontEngine {
+    pub fn for_cells() -> Self {
+        let mut font = Self::new(16.0);
+        font.logical_only = true;
+        font
+    }
     pub fn new(scale_px: f32) -> Self {
         Self::with_typography(Typography {
             size_px: scale_px.round() as u16,
@@ -103,6 +129,7 @@ impl FontEngine {
         let natural_line_height_px = f32::from(size_px);
         Self {
             face,
+            logical_only: false,
             font_id: NEXT_FONT_ID.fetch_add(1, Ordering::Relaxed),
             scale,
             char_width_px: f32::from(face.width) * scale as f32,
@@ -125,6 +152,18 @@ impl FontEngine {
         text: &str,
         color: u32,
     ) {
+        if self.logical_only {
+            self.draw_string(
+                list,
+                bounds[0] as usize,
+                bounds[1] as usize,
+                at[0] as usize,
+                at[1] as usize,
+                text,
+                color,
+            );
+            return;
+        }
         let cells = text.chars().count().max(1) as f32;
         let mut factor =
             (area[0] / (cells * self.char_width_px)).min(area[1] / self.natural_line_height_px);
@@ -261,6 +300,15 @@ impl FontEngine {
         ch: char,
         color: u32,
     ) {
+        buffer.cells.push(CellCommand::Glyph {
+            at: [x as f32, y as f32],
+            bounds: [stride as f32, max_height as f32],
+            symbol: ch,
+            color,
+        });
+        if self.logical_only {
+            return;
+        }
         let glyph = self.glyph(ch);
         buffer.push(
             [
@@ -321,6 +369,11 @@ pub(crate) fn draw_rect(
     height: usize,
     color: u32,
 ) {
+    buffer.cells.push(CellCommand::Fill {
+        rect: [x as f32, y as f32, width as f32, height as f32],
+        bounds: [stride as f32, max_height as f32],
+        color,
+    });
     buffer.push(
         [x as f32, y as f32, width as f32, height as f32],
         [stride as f32, max_height as f32],
@@ -366,6 +419,11 @@ pub(crate) fn draw_box(
         height,
         border_color,
     );
+    buffer.cells.push(CellCommand::Border {
+        rect: [x as f32, y as f32, width as f32, height as f32],
+        bounds: [stride as f32, max_height as f32],
+        color: border_color,
+    });
 }
 
 #[cfg(test)]

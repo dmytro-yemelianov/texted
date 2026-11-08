@@ -92,7 +92,7 @@ python3 scripts/review_bitmap_fonts.py
 # Ordinary CI requires neither dependency
 python3 -m unittest discover -s scripts -p 'test_*.py'
 cargo test --locked --workspace
-cargo test --release -p texted-app --bin texted metal_ -- --ignored
+cargo test --release -p texted-app --lib metal_ -- --ignored
 ```
 
 Asset checks pin source/output hashes, sorted scalar records, native row bounds,

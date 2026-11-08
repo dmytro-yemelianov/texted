@@ -75,7 +75,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 python3 -m unittest discover -s scripts -p 'test_*.py'
-cargo test --release -p texted-app --bin texted metal_ -- --ignored
+cargo test --release -p texted-app --lib metal_ -- --ignored
 cargo run --locked --release --bin bench -- --hardening
 python3 scripts/package_macos.py
 ```
@@ -106,3 +106,12 @@ F-buttons highlight on hover and invocation, including physical keyboard holds a
 The reported exit hang was reproduced and sampled. Main was joining `DocumentStats`; its wake callback or final `Window` release synchronously dispatched to the main queue. winit 0.29's `maybe_queue_on_main` actually waits on main. Reordering the window alone passed idle exit but failed the save/exit race. The complete fix sends all service, file-I/O and dialog-future notifications through `AppEvent::Wake`/`EventLoopProxy`. Only the main handler calls `request_redraw`; callbacks hold no `Arc<Window>`. The window also drops last. Dialogs reveal/restore/focus their parent before awaiting a choice. See [exit lifecycle](docs/exit-lifecycle.md).
 
 Two additional tests cover background native-future wake without UI access and service teardown with queued events left undispatched, including durable preference flushing. The full suite now has 151 passing Rust tests. Native validation covers empty/two-tab quit and a previously hanging dirty Save/quit with Unicode preserved. Install/launch tests should use Launch Services for the real app, and separately identified isolated bundles for QA; always verify process exit rather than only window disappearance. Recovered prior fixture edits are under ignored `target/exit-recovery/`.
+
+
+## Shared cell-grid transport (2026-11-08)
+
+`feat/terminal-cell-grid` builds on `feat/verba-font-library`. Both executables now bootstrap the same library `App`: `texted --terminal` and `texted-tui` use a crossterm transport, `Host::Cells`, and an ANSI diff renderer, without creating winit/NSApplication/GPU. `graphics::DrawList` preserves source characters/colors/borders/cursor alongside native GPU commands. `cell_grid.rs` exports version-1 bounded frames and safely writes single-cell terminal characters. `--dump-grid COLSxROWS [FILE ...]` exports the actual common UI as JSON. See [contract and validation](docs/terminal-cell-grid.md).
+
+`dialog_ui.rs` replaces regular OS file/error/Save-Discard-Cancel sheets with one cell-aligned in-app controller for both backends. It uses asynchronous bounded tickets, off-thread directory/path inspection, existing EditorModel path editing and context-fenced clipboard completion. Existing FileFlow acceptance/save/close barriers remain authoritative. Context menus also render through the common scene; the macOS application menu remains a native adapter. Cell-only font/scale/cursor settings are visibly terminal-managed. Terminal preferences are separate unless TEXTED_SETTINGS_PATH is supplied. Background workers still capture only Wake, never a native Window; preserve the macOS exit fix. GPU tests now live in the library target (`--lib metal_`). User-owned untracked `docs/specs/` remains untouched.
+
+Validation for the shared transport: 161 ordinary Rust tests, strict Clippy/formatting, four Python regressions, both explicit Metal readbacks and the release PTY smoke test passed. Native QA verified Save As with menu-driven path selection, cancellation of dirty quit, and durable Save/quit with actual process exit. Local universal ZIP/DMG packaging verifies both executable slices, resources, load commands, cell-grid output, extraction and checksums. Development artifacts are under ignored `dist/terminal-cell-grid-preview/`; published releases remain unchanged.
