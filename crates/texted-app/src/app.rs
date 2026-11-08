@@ -1432,6 +1432,15 @@ impl App {
             match action {
                 Action::Close => self.panel_help.dismiss(),
                 Action::Wrap => self.intent(Intent::ToggleWrap),
+                Action::Encoding => self.session.files.documents.next_save_format(),
+                Action::Reread => {
+                    let documents = &self.session.files.documents;
+                    if documents.path.is_some() {
+                        let reopen = crate::documents::Action::Reopen(documents.reread_target());
+                        let result = self.session.files.enqueue(reopen);
+                        self.report(result);
+                    }
+                }
                 Action::Consumed => {}
             }
             self.window.request_redraw();
@@ -1735,7 +1744,14 @@ impl App {
                 cur_line: frame.cur_line,
                 cur_col: frame.cur_col,
                 word_wrap: self.session.viewport.wrap,
-                bom: self.session.files.documents.bom,
+                format: self.session.files.documents.format_name(),
+                reread: self
+                    .session
+                    .files
+                    .documents
+                    .path
+                    .as_ref()
+                    .map(|_| self.session.files.documents.reread_target().name()),
                 ending: self.session.files.documents.ending,
             },
         );

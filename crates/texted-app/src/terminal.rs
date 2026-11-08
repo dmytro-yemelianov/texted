@@ -588,6 +588,34 @@ mod tests {
         assert_eq!(text.as_deref(), Some("і"));
     }
     #[test]
+    fn details_show_a_legacy_file_encoding_and_offer_a_reread() {
+        let dir = std::env::temp_dir().join(format!("texted-details-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.txt");
+        std::fs::write(&path, [191, 230, 224, 234, 10]).unwrap(); // "їжак\n" in Windows-1251
+        let (_, mut app) = application(100, 30, vec![path], None, None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.settled() {
+            app.tick();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let details = Key::Named(NamedKey::F12);
+        app.key(&KeyInput {
+            physical: PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+            logical: &details,
+            text: None,
+            modifiers: ModifiersState::empty(),
+        });
+        app.tick();
+        app.redraw();
+        let text = app.rendered_grid().unwrap().text();
+        assert!(text.contains("їжак"), "{text}");
+        assert!(text.contains("Encoding: Windows-1251"), "{text}");
+        assert!(text.contains("Reread as KOI8-U"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn a_frame_shorter_than_the_command_bar_still_renders() {
         // The window and graphics backends share this redraw; a 16 px frame is below the bar.
         let size = crate::kitty::Size {
