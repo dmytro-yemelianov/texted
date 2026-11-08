@@ -12,11 +12,15 @@ A minimal Rust plain-text editor with a GPU-rendered GUI and a buffer owned by a
 cargo run --release --bin texted -- path/to/file.txt
 cargo run --release --bin texted
 cargo run --release --bin texted-tui -- path/to/file.txt
+# Require our own bitmap fonts through terminal graphics:
+cargo run --release --bin texted-tui -- --render=kitty path/to/file.txt
 # Or use the same executable:
 cargo run --release --bin texted -- --terminal path/to/file.txt
 ```
 
 The current GUI uses bundled bitmap fonts and macOS `pbcopy`/`pbpaste`. Running without a path opens an empty document. Open, Save As, overwrite and save-before-close use shared in-app dialogs in both the window and terminal modes. New and Open create tabs. Files can also be dropped onto the window, passed together on the command line, or opened together through Finder. Each tab retains its own buffer, undo/redo, selection, search and scroll position. Closing a changed tab prompts to save it; quitting checks each remaining tab and Cancel stops the sequence.
+
+Terminal rendering defaults to Auto: supporting terminals receive pixel graphics with Texted’s own bitmap fonts, zoom and Appearance; other terminals receive ANSI characters. Use `--render=kitty` or `--render=ansi` to require either mode. See [terminal graphics, controls and limits](docs/terminal-graphics.md).
 
 ## Implementation
 

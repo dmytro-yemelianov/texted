@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the shared editor through a real PTY; no window or GPU is created."""
 import argparse
+import ast
 import fcntl
 import os
 from pathlib import Path
@@ -86,7 +87,11 @@ def smoke(binary):
             send(b"\x11")  # Ctrl+Q: close both clean tabs
             wait(lambda: child.poll() is not None, "quit completed")
             assert child.returncode == 0, bytes(output[-1000:])
-            assert restored.read_text() == repr(before), "PTY termios was not restored"
+            after = ast.literal_eval(restored.read_text())
+            # Darwin may set kernel-managed PENDIN while restoring canonical input.
+            before[3] &= ~getattr(termios, "PENDIN", 0)
+            after[3] &= ~getattr(termios, "PENDIN", 0)
+            assert after == before, f"PTY termios was not restored: {before!r} -> {after!r}"
             assert b"\x1b[?1049l" in output, "alternate screen was not restored"
             assert b"\x1b[?2004l" in output, "bracketed paste was not disabled"
             print("PTY OK: Ukrainian paste, tabs, Save/Save As, Cancel, context menu, resize, quit and termios restoration")

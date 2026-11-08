@@ -45,6 +45,7 @@ jobs:
           ./target/release/texted-tui --version
           ./target/release/texted --dump-grid 80x24 README.md > target/cell-grid.json
           python3 scripts/smoke_terminal.py --binary target/release/texted-tui
+          python3 scripts/smoke_terminal_graphics.py --binary target/release/texted-tui
 
   package:
     name: Universal macOS delivery
