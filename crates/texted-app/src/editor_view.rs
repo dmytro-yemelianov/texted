@@ -10,12 +10,8 @@ use texted_app::{
     selection::{SelectionMode, SelectionState},
 };
 use texted_buffer::BufferSnapshot;
-use texted_io::LineEnding;
 use texted_layout::{ViewportConfig, ViewportLayout};
 pub(crate) struct ViewModel<'a> {
-    pub footer: &'a crate::status_ui::Footer,
-    pub words: Option<usize>,
-    pub zoom_percent: u16,
     pub palette: &'a texted_app::appearance::Palette,
     pub snap: &'a BufferSnapshot,
     pub layout: &'a ViewportLayout,
@@ -29,15 +25,10 @@ pub(crate) struct ViewModel<'a> {
     pub gutter_w: f32,
     pub line_digits: usize,
     pub text_start_x: usize,
-    pub cur_line: usize,
-    pub cur_col: usize,
-    pub word_wrap: bool,
     pub show_line_numbers: bool,
     pub caret_visible: bool,
     pub current_scrollbar: Option<Scrollbar>,
     pub show_perf_hud: bool,
-    pub bom: bool,
-    pub ending: LineEnding,
     pub gpu_name: &'a str,
     pub frame_start: Instant,
     pub layout_time: Duration,
@@ -55,7 +46,6 @@ pub(crate) fn paint(
     paint_text(buffer, font_engine, model);
     paint_caret(buffer, font_engine, model);
     paint_search_bar(buffer, ui_font, model);
-    paint_status(buffer, ui_font, model);
     if model.show_perf_hud {
         paint_hud(buffer, ui_font, model);
     }
@@ -78,7 +68,7 @@ fn paint_gutter(buffer: &mut DrawList, model: &ViewModel<'_>) {
             0,
             0,
             gutter_width_int,
-            height.saturating_sub(if model.compact { 14 } else { 28 }),
+            model.text_height,
             model.palette.gutter_bg,
         );
         draw_rect(
@@ -88,7 +78,7 @@ fn paint_gutter(buffer: &mut DrawList, model: &ViewModel<'_>) {
             gutter_width_int.saturating_sub(1),
             0,
             1,
-            height.saturating_sub(if model.compact { 14 } else { 28 }),
+            model.text_height,
             model.palette.gutter_border,
         );
     }
@@ -650,10 +640,6 @@ fn paint_compact_search(buffer: &mut DrawList, font: &mut FontEngine, model: &Vi
             c.text,
         );
     }
-}
-
-fn paint_status(buffer: &mut DrawList, font: &mut FontEngine, model: &ViewModel<'_>) {
-    model.footer.paint(buffer, font, model);
 }
 
 fn paint_hud(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewModel<'_>) {

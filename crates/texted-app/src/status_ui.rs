@@ -1,84 +1,60 @@
-//! Minimal, actionable document footer and one on-demand details card.
+//! On-demand details and delayed help for the single command panel; no reserved footer row.
 use crate::{
     appearance_ui::Rect,
-    editor_view::ViewModel,
-    graphics::{draw_box, draw_rect, DrawList, FontEngine},
+    chrome::Geometry,
+    graphics::{draw_box, DrawList, FontEngine},
 };
 use std::time::{Duration, Instant};
-use texted_app::selection::SelectionMode;
+use texted_app::{
+    appearance::Palette,
+    selection::{SelectionMode, SelectionState},
+};
 use texted_io::LineEnding;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
-    Statistics,
-    Smaller,
-    Reset,
-    Larger,
-    Appearance,
     Wrap,
     Close,
     Consumed,
 }
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Tip {
+    pub rect: Rect,
+    pub text: String,
+}
+pub(crate) struct Model<'a> {
+    pub geometry: Geometry,
+    pub palette: &'a Palette,
+    pub snap: &'a texted_buffer::BufferSnapshot,
+    pub selection: &'a SelectionState,
+    pub words: Option<usize>,
+    pub cur_line: usize,
+    pub cur_col: usize,
+    pub word_wrap: bool,
+    pub bom: bool,
+    pub ending: LineEnding,
+}
 pub(crate) struct Layout {
-    pub stats: Rect,
-    pub smaller: Rect,
-    pub reset: Rect,
-    pub larger: Rect,
-    pub appearance: Rect,
     pub card: Rect,
     pub wrap: Rect,
     pub close: Rect,
 }
 impl Layout {
-    pub fn new(width: usize, height: usize, compact: bool) -> Self {
-        let (h, pad, gap, button, zoom, appearance) = if compact {
-            (14, 2, 2, 12, 34, 24)
-        } else {
-            (28, 12, 6, 24, 56, 96)
-        };
-        let y = height.saturating_sub(h);
-        let appearance = Rect {
-            x: width.saturating_sub(appearance + pad),
-            y,
-            w: appearance.min(width),
-            h,
-        };
-        let larger = Rect {
-            x: appearance.x.saturating_sub(button + gap),
-            y,
-            w: button.min(width),
-            h,
-        };
-        let reset = Rect {
-            x: larger.x.saturating_sub(zoom + gap),
-            y,
-            w: zoom.min(width),
-            h,
-        };
-        let smaller = Rect {
-            x: reset.x.saturating_sub(button + gap),
-            y,
-            w: button.min(width),
-            h,
-        };
-        let stats = Rect {
-            x: pad.min(width),
-            y,
-            w: smaller.x.saturating_sub(pad * 2),
-            h,
-        };
-        let card_h = if compact { 100 } else { 184 };
-        let card_w = if compact { 250 } else { 380 };
+    pub fn new(g: Geometry) -> Self {
+        let pad = if g.compact { 2 } else { 12 };
+        let y = g.height.saturating_sub(g.bottom);
+        let card_h = if g.compact { 100 } else { 184 };
+        let card_w = if g.compact { 250 } else { 380 };
         let card = Rect {
-            x: pad.min(width),
+            x: g.width.saturating_sub(card_w + pad).max(pad).min(g.width),
             y: y.saturating_sub(card_h + 8),
-            w: card_w.min(width.saturating_sub(pad * 2)),
+            w: card_w.min(g.width.saturating_sub(pad * 2)),
             h: card_h.min(y.saturating_sub(8)),
         };
         let wrap = Rect {
             x: card.x + 8,
-            y: card.y + card.h.saturating_sub(if compact { 18 } else { 34 }),
+            y: card.y + card.h.saturating_sub(if g.compact { 18 } else { 34 }),
             w: card.w.saturating_sub(16),
-            h: if compact { 14 } else { 24 },
+            h: if g.compact { 14 } else { 24 },
         };
         let close = Rect {
             x: card.x + card.w.saturating_sub(24),
@@ -86,30 +62,10 @@ impl Layout {
             w: 20,
             h: 20,
         };
-        Self {
-            stats,
-            smaller,
-            reset,
-            larger,
-            appearance,
-            card,
-            wrap,
-            close,
-        }
-    }
-    fn action(&self, x: f32, y: f32) -> Option<Action> {
-        [
-            (self.stats, Action::Statistics),
-            (self.smaller, Action::Smaller),
-            (self.reset, Action::Reset),
-            (self.larger, Action::Larger),
-            (self.appearance, Action::Appearance),
-        ]
-        .into_iter()
-        .find_map(|(r, a)| r.contains(x, y).then_some(a))
+        Self { card, wrap, close }
     }
 }
-fn selection_label(
+pub(crate) fn selection_label(
     snapshot: &texted_buffer::BufferSnapshot,
     selection: &texted_app::selection::SelectionState,
 ) -> Option<String> {
@@ -143,13 +99,13 @@ fn help_lines(text: &str, columns: usize) -> Vec<String> {
     }
     lines
 }
-pub(crate) struct Footer {
+pub(crate) struct PanelHelp {
     pub details: bool,
-    hover: Option<Action>,
+    hover: Option<Tip>,
     since: Instant,
     tooltip: bool,
 }
-impl Footer {
+impl PanelHelp {
     pub fn new() -> Self {
         Self {
             details: false,
@@ -166,14 +122,20 @@ impl Footer {
         self.details = false;
         self.clear_hover();
     }
-    pub fn hover(&mut self, width: usize, height: usize, compact: bool, x: f32, y: f32) -> bool {
-        let l = Layout::new(width, height, compact);
+    pub fn hover(&mut self, g: Geometry, x: f32, y: f32, command: Option<Tip>) -> bool {
+        let l = Layout::new(g);
         let next = if self.details && l.close.contains(x, y) {
-            Some(Action::Close)
+            Some(Tip {
+                rect: l.close,
+                text: "Close document details (Esc)".into(),
+            })
         } else if self.details && l.wrap.contains(x, y) {
-            Some(Action::Wrap)
+            Some(Tip {
+                rect: l.wrap,
+                text: "Toggle line wrapping".into(),
+            })
         } else {
-            l.action(x, y)
+            command
         };
         if next != self.hover {
             self.hover = next;
@@ -198,18 +160,9 @@ impl Footer {
     pub fn pending_tip(&self) -> bool {
         self.hover.is_some() && !self.tooltip
     }
-    pub fn cursor(
-        &self,
-        width: usize,
-        height: usize,
-        compact: bool,
-        x: f32,
-        y: f32,
-    ) -> Option<crate::cursor_ui::Shape> {
-        let l = Layout::new(width, height, compact);
-        if l.action(x, y).is_some()
-            || (self.details && (l.close.contains(x, y) || l.wrap.contains(x, y)))
-        {
+    pub fn cursor(&self, g: Geometry, x: f32, y: f32) -> Option<crate::cursor_ui::Shape> {
+        let l = Layout::new(g);
+        if self.details && (l.close.contains(x, y) || l.wrap.contains(x, y)) {
             Some(crate::cursor_ui::Shape::Pointer)
         } else if self.details && l.card.contains(x, y) {
             Some(crate::cursor_ui::Shape::Arrow)
@@ -217,80 +170,33 @@ impl Footer {
             None
         }
     }
-    pub fn click(
-        &mut self,
-        width: usize,
-        height: usize,
-        compact: bool,
-        x: f32,
-        y: f32,
-    ) -> Option<Action> {
-        let l = Layout::new(width, height, compact);
-        if let Some(a) = l.action(x, y) {
-            return Some(a);
+    pub fn click(&mut self, g: Geometry, x: f32, y: f32) -> Option<Action> {
+        if !self.details {
+            return None;
         }
-        if self.details {
-            if l.close.contains(x, y) {
-                return Some(Action::Close);
-            }
-            if l.wrap.contains(x, y) {
-                return Some(Action::Wrap);
-            }
-            if l.card.contains(x, y) {
-                return Some(Action::Consumed);
-            }
-            self.dismiss();
+        let l = Layout::new(g);
+        if l.close.contains(x, y) {
+            return Some(Action::Close);
+        }
+        if l.wrap.contains(x, y) {
+            return Some(Action::Wrap);
+        }
+        if l.card.contains(x, y) {
             return Some(Action::Consumed);
         }
-        None
+        self.dismiss();
+        Some(Action::Consumed)
     }
-    pub fn paint(&self, draws: &mut DrawList, font: &mut FontEngine, m: &ViewModel<'_>) {
-        let l = Layout::new(m.width, m.height, m.compact);
+    pub fn paint(&self, draws: &mut DrawList, font: &mut FontEngine, m: &Model<'_>) {
+        let g = m.geometry;
+        let l = Layout::new(g);
         let c = m.palette;
-        let y = l.stats.y;
-        draw_rect(draws, m.width, m.height, 0, y, m.width, m.height - y, c.bg);
-        let stats = selection_label(m.snap, m.selection).unwrap_or_else(|| {
-            m.words
-                .map_or_else(|| "... words".into(), |n| format!("{n} words"))
-        });
-        for (r, text, action) in [
-            (l.stats, stats, Action::Statistics),
-            (l.smaller, "-".into(), Action::Smaller),
-            (l.reset, format!("{}%", m.zoom_percent), Action::Reset),
-            (l.larger, "+".into(), Action::Larger),
-            (
-                l.appearance,
-                if m.compact { "Aa" } else { "Appearance" }.into(),
-                Action::Appearance,
-            ),
-        ] {
-            let active =
-                self.hover == Some(action) || (action == Action::Statistics && self.details);
-            if active {
-                draw_rect(draws, m.width, m.height, r.x, r.y, r.w, r.h, c.panel_bg);
-            }
-            let text_width = text.chars().count() * font.char_width_px as usize;
-            let x = if action == Action::Statistics {
-                r.x + 2
-            } else {
-                r.x + r.w.saturating_sub(text_width) / 2
-            };
-            font.draw_string(
-                draws,
-                (r.x + r.w).min(m.width),
-                m.height,
-                x,
-                r.y + if m.compact { 3 } else { 6 },
-                &text,
-                if active { c.text } else { c.gutter_text },
-            );
-        }
         if self.details {
             let r = l.card;
             draw_box(
                 draws,
-                m.width,
-                m.height,
+                g.width,
+                g.height,
                 r.x,
                 r.y,
                 r.w,
@@ -303,7 +209,12 @@ impl Footer {
                 .map_or_else(|| "Counting words...".into(), |n| format!("{n} words"));
             let lines = [
                 "Document details".into(),
-                format!("{word}  ·  {} characters", m.snap.content.len_chars()),
+                format!(
+                    "{word} · {} chars{}",
+                    m.snap.content.len_chars(),
+                    selection_label(m.snap, m.selection)
+                        .map_or(String::new(), |s| format!(" · {s}"))
+                ),
                 format!("Line {}  ·  Column {}", m.cur_line + 1, m.cur_col + 1),
                 format!(
                     "Text: {} bytes  ·  {}",
@@ -319,12 +230,12 @@ impl Footer {
                     }
                 ),
             ];
-            let step = if m.compact { 13 } else { 26 };
+            let step = if g.compact { 13 } else { 26 };
             for (i, line) in lines.iter().enumerate() {
                 font.draw_string(
                     draws,
                     r.x + r.w.saturating_sub(12),
-                    m.height,
+                    g.height,
                     r.x + 10,
                     r.y + 8 + i * step,
                     line,
@@ -333,8 +244,8 @@ impl Footer {
             }
             font.draw_string(
                 draws,
-                m.width,
-                m.height,
+                g.width,
+                g.height,
                 l.close.x + 4,
                 l.close.y + 2,
                 "x",
@@ -343,7 +254,7 @@ impl Footer {
             font.draw_string(
                 draws,
                 l.wrap.x + l.wrap.w,
-                m.height,
+                g.height,
                 l.wrap.x + 2,
                 l.wrap.y + 3,
                 if m.word_wrap {
@@ -355,44 +266,25 @@ impl Footer {
             );
         }
         if self.tooltip {
-            if let Some(action) = self.hover {
-                let text = match action {
-                    Action::Statistics => "Document statistics and details (Cmd+Shift+I)",
-                    Action::Smaller => "Smaller text (Cmd+-)",
-                    Action::Reset => "Reset text to native size (Cmd+0)",
-                    Action::Larger => "Larger text (Cmd++)",
-                    Action::Appearance => "Fonts, themes and screen settings (Cmd+,)",
-                    Action::Wrap => "Toggle line wrapping",
-                    Action::Close => "Close document details (Esc)",
-                    _ => "",
-                };
-                let at = match action {
-                    Action::Statistics => l.stats,
-                    Action::Smaller => l.smaller,
-                    Action::Reset => l.reset,
-                    Action::Larger => l.larger,
-                    Action::Wrap => l.wrap,
-                    Action::Close => l.close,
-                    _ => l.appearance,
-                };
-                let w = (text.chars().count() * font.char_width_px as usize + 16)
-                    .min(m.width.saturating_sub(8));
+            if let Some(tip) = &self.hover {
+                let w = (tip.text.chars().count() * font.char_width_px as usize + 16)
+                    .min(g.width.saturating_sub(8));
                 let lines = help_lines(
-                    text,
+                    &tip.text,
                     w.saturating_sub(16) / (font.char_width_px as usize).max(1),
                 );
-                let step = if m.compact { 10 } else { 18 };
+                let step = if g.compact { 10 } else { 18 };
                 let h = lines.len() * step + 10;
-                let x = at.x.min(m.width.saturating_sub(w + 4));
+                let x = tip.rect.x.min(g.width.saturating_sub(w + 4));
                 let y = if self.details {
                     l.card.y.saturating_sub(h + 4)
                 } else {
-                    at.y.saturating_sub(h + 6)
+                    tip.rect.y.saturating_sub(h + 6)
                 };
                 draw_box(
                     draws,
-                    m.width,
-                    m.height,
+                    g.width,
+                    g.height,
                     x,
                     y,
                     w,
@@ -404,7 +296,7 @@ impl Footer {
                     font.draw_string(
                         draws,
                         x + w.saturating_sub(6),
-                        m.height,
+                        g.height,
                         x + 8,
                         y + 5 + i * step,
                         line,
@@ -448,43 +340,47 @@ mod tests {
         );
     }
     #[test]
-    fn all_footer_controls_have_matching_nonoverlapping_hit_regions() {
-        for compact in [false, true] {
-            let l = Layout::new(980, 700, compact);
-            for (r, a) in [
-                (l.stats, Action::Statistics),
-                (l.smaller, Action::Smaller),
-                (l.reset, Action::Reset),
-                (l.larger, Action::Larger),
-                (l.appearance, Action::Appearance),
-            ] {
-                assert_eq!(l.action((r.x + 1) as f32, (r.y + 1) as f32), Some(a));
+    fn details_fit_above_the_command_panel_at_small_resolutions() {
+        for (w, h, compact) in [(256, 192, true), (320, 200, true), (980, 700, false)] {
+            for shown in [true, false] {
+                let g = Geometry::new(w, h, compact, shown);
+                let l = Layout::new(g);
+                assert!(l.card.x + l.card.w <= w);
+                assert!(l.card.y + l.card.h <= h - g.bottom);
+                assert!(l.wrap.y + l.wrap.h <= l.card.y + l.card.h);
             }
         }
     }
     #[test]
     fn details_close_on_outside_click_and_do_not_edit_the_document() {
-        let mut f = Footer::new();
+        let mut f = PanelHelp::new();
         f.details = true;
-        assert_eq!(f.click(980, 700, false, 400., 100.), Some(Action::Consumed));
+        assert_eq!(
+            f.click(Geometry::new(980, 700, false, true), 400., 100.),
+            Some(Action::Consumed)
+        );
         assert!(!f.details);
     }
     #[test]
-    fn hover_opens_only_the_relevant_tooltip_after_a_delay() {
-        let mut f = Footer::new();
-        let l = Layout::new(980, 700, false);
-        assert!(f.hover(
-            980,
-            700,
-            false,
-            l.reset.x as f32 + 1.,
-            l.reset.y as f32 + 1.
-        ));
+    fn command_hover_opens_delayed_help_without_a_footer_hit_region() {
+        let mut f = PanelHelp::new();
+        let g = Geometry::new(980, 700, false, true);
+        let tip = Tip {
+            rect: Rect {
+                x: 600,
+                y: 672,
+                w: 80,
+                h: 28,
+            },
+            text: "Reset text scale to 100%".into(),
+        };
+        assert!(f.hover(g, 601., 680., Some(tip.clone())));
         assert!(!f.tick());
         f.since = Instant::now() - Duration::from_millis(500);
         assert!(f.tick());
         assert!(f.tooltip);
-        assert!(f.hover(980, 700, false, 0., 0.));
+        assert!(!f.hover(g, 601., 680., Some(tip)));
+        assert!(f.hover(g, 0., 0., None));
         assert!(!f.tooltip);
     }
 }

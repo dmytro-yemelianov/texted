@@ -10,7 +10,7 @@ use texted_app::{
     input::KeyInput,
 };
 use winit::keyboard::{Key, NamedKey};
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Rect {
     pub x: usize,
     pub y: usize,
@@ -264,6 +264,13 @@ impl AppearanceUi {
             return Shape::Grabbing;
         }
         let p = self.panel(width, height, compact);
+        if self.dropdown.is_some_and(|d| {
+            self.popup(d, width, height, compact, &self.choices(d.field))
+                .rect
+                .contains(x, y)
+        }) {
+            return Shape::Pointer;
+        }
         if y < (p.rect.y + if compact { 24 } else { 36 }) as f32
             && p.rect.contains(x, y)
             && x < (p.rect.x + p.rect.w.saturating_sub(28)) as f32
@@ -509,12 +516,18 @@ impl AppearanceUi {
     }
     pub fn click(&mut self, width: usize, height: usize, x: f32, y: f32, compact: bool) {
         let panel = self.panel(width, height, compact);
-        if panel.done().contains(x, y) {
+        let over_popup = self.dropdown.is_some_and(|d| {
+            self.popup(d, width, height, compact, &self.choices(d.field))
+                .rect
+                .contains(x, y)
+        });
+        if panel.done().contains(x, y) && !over_popup {
             self.accept_preview();
             self.open = false;
             return;
         }
-        if panel.rect.contains(x, y)
+        if !over_popup
+            && panel.rect.contains(x, y)
             && y < (panel.rect.y + if compact { 24 } else { 36 }) as f32
             && x < (panel.rect.x + panel.rect.w.saturating_sub(28)) as f32
         {
@@ -1082,6 +1095,27 @@ mod tests {
         let filtered = ui.choices(2);
         assert!(!Arc::ptr_eq(&first, &filtered));
         assert!(Arc::ptr_eq(&filtered, &ui.choices(2)));
+    }
+    #[test]
+    fn cursor_popup_items_take_priority_over_the_header_and_done_button() {
+        for index in 0..MouseCursor::ALL.len() {
+            let mut ui = AppearanceUi::new(Appearance::default());
+            ui.set_open(true);
+            ui.open_dropdown(5, 980, 700, false);
+            let d = ui.dropdown.unwrap();
+            let choices = ui.choices(5);
+            let popup = ui.popup(d, 980, 700, false, &choices);
+            if let Some(row) = popup.row(index, d.first) {
+                let (x, y) = ((row.x + row.w / 2) as f32, (row.y + row.h / 2) as f32);
+                assert_eq!(
+                    ui.cursor(980, 700, false, x, y),
+                    crate::cursor_ui::Shape::Pointer
+                );
+                ui.click(980, 700, x, y, false);
+                assert!(ui.settings.mouse_cursor == MouseCursor::ALL[index]);
+                assert!(ui.drag.is_none());
+            }
+        }
     }
     #[test]
     fn dragging_keeps_values_and_moves_the_panel_and_its_hit_regions() {

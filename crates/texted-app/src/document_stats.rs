@@ -125,8 +125,11 @@ impl DocumentStats {
                 self.latest = Some(count);
             }
         }
+        self.result(document, snapshot.revision)
+    }
+    pub fn result(&self, document: u128, revision: u64) -> Option<usize> {
         self.latest
-            .filter(|c| c.document == document && c.revision == snapshot.revision)
+            .filter(|c| c.document == document && c.revision == revision)
             .map(|c| c.words)
     }
 }

@@ -43,7 +43,7 @@ Development builds include native **Texted / File / Edit / Search / View / Windo
 | Horizontal scrolling (wrap off) | Trackpad / Shift+wheel / scrollbar |
 | Block selection | Option+drag or Cmd+B |
 | Toggle line numbers | Cmd+L |
-| Appearance / styles | Cmd+, or Appearance in the footer |
+| Appearance / styles | Cmd+, or F9 |
 | Context menu | Right-click / Shift+F10 |
 | Text scale, steps of 10% | Cmd++ / Cmd+- / Cmd+0 (100%) |
 | Previous / next tab | Ctrl+Shift+Tab / Ctrl+Tab; Cmd+Shift+[ / ] |
@@ -53,9 +53,19 @@ Development builds include native **Texted / File / Edit / Search / View / Windo
 
 Physical letter keys keep shortcuts working with Ukrainian keyboard layouts. Wrapping currently breaks at character-cell boundaries. Text uses character columns rather than grapheme clusters or shaped display cells; complex-script shaping and IME composition remain future work. No-wrap mode supports the trackpad horizontal axis, Shift+wheel, scrollbar dragging and page clicks. Navigation and typing keep the caret visible; manual scrolling leaves its document position unchanged.
 
-The footer shows a word or selected-character count, text scale and Appearance. Click the count for document details: Unicode character count, normalized UTF-8 bytes, cursor position, save encoding/newlines and a wrapping switch. Hover over actions for help. Word counts run on a cancellable background snapshot scan. UTF-8 bytes exclude the BOM and use internal LF, so they can differ from the saved file size.
+The bottom of the window has one command-button row. There is no separate status strip. Hold **Control** to reveal scale and document values in the existing F-key cells:
 
-The clickable F-key panel occupies one line and can be hidden with F1. Its keys work while hidden: **F2 Save · F3 Find · F4 Replace · F5 Open · F6 New · F7 Previous tab · F8 Next tab · F9 Appearance · F10 Close tab · F11 Wrap · F12 Details**. Shift+F10 still opens the context menu. The panel shows the commands relevant to the editor, search or Appearance; narrow framebuffers show a prioritized subset. Hold **Cmd / Option / Control / Shift** on the keyboard to switch F-command labels and actions. The panel displays only commands. Shift offers Save As, previous match and Replace All; Cmd exposes undo/redo and quit; Option exposes clipboard/selection actions; Control exposes 10% zoom. On keyboards that reserve F-keys for media controls, use Fn or click the commands.
+| Ctrl layer | Button value and action |
+|---|---|
+| F7 / F8 | Decrease / increase text scale by 10% |
+| F9 | Current scale, e.g. `110%`; click or press to reset to 100% |
+| F10 | Cursor line:column; open document details |
+| F11 | Wrapping state; click or press to toggle |
+| F12 | Word count, or selected characters/rectangle size; open document details |
+
+Buttons highlight on hover and briefly when invoked by mouse or keyboard. Hover help describes the current action and full values. Details show Unicode character count, normalized UTF-8 bytes, save encoding/newlines and a wrapping switch. Word counts run on cancellable background snapshots; bytes exclude the BOM and use internal LF, so they can differ from saved file size.
+
+The one-line panel can be hidden with F1. F-keys work while hidden: **F2 Save · F3 Find · F4 Replace · F5 Open · F6 New · F7 Previous tab · F8 Next tab · F9 Appearance · F10 Close tab · F11 Wrap · F12 Details**. Labels adapt to editor, search and Appearance context. Narrow framebuffers prioritize the active task; the Ctrl layer keeps zoom and counts visible. Hold **Cmd / Option / Control / Shift** on the keyboard for alternate actions; no modifier controls are drawn. Shift offers Save As, previous match and Replace All; Cmd exposes undo/redo, quit and diagnostics; Option exposes clipboard and selection actions. Shift+F10 retains the context menu. On keyboards reserving F-keys for media, use Fn or click the buttons while holding the modifier.
 
 ## Themes and typography
 
@@ -63,13 +73,13 @@ Available in `main` development builds; the published v0.2.0 preview predates th
 
 Appearance offers Modern Dark/Light, VGA, EGA, Atari, Commander, C64, ZX Spectrum, Amber and Green CRT palettes. The theme applies to the document, selection/search highlights, gutter, status, search and appearance panels. Palettes and editor fonts are independent.
 
-Open **Appearance** in the footer or press **Cmd+,**. Drag its title to move it. Click a field to open its list, or use Tab/Shift+Tab then Enter/Space. Up/Down, Home/End and Page Up/Down preview the highlighted value immediately; Enter or a click keeps it, and Escape/outside clicks restore the previous value. Preview settings are not written to disk. Done keeps the preview and closes the panel. Font lists contain actual bitmap specimens and accept typed name searches; wheel scrolling browses long lists.
+Open **Appearance** with **F9** or **Cmd+,**. Drag its title to move it. Click a field to open its list, or use Tab/Shift+Tab then Enter/Space. Up/Down, Home/End and Page Up/Down preview the highlighted value immediately; Enter or a click keeps it, and Escape/outside clicks restore the previous value. Preview settings are not written to disk. Done keeps the preview and closes the panel. Font lists contain actual bitmap specimens and accept typed name searches; wheel scrolling browses long lists.
 
 Five embedded faces include the complete Ukrainian alphabet: IBM BIOS 8×8, EGA 8×14, VGA 8×16, Spleen 6×12 and 8×16. The optional [Verba library bridge](docs/verba-font-library.md) adds the complete local catalog and saved glyph edits with actual coverage, disabled reasons and source metadata. It currently exposes 2,266 entries, of which 1,993 have unambiguous Unicode bitmap glyphs. The font selector does not invent Unicode mappings for raw-code fonts.
 
 Text scale changes by **10%**, from 10–800%; 110%, 120%, etc. scale the original masks through nearest-texel sampling. The native glyph pixels stay one-bit. Legacy integer `size_px` settings still load. Line height is independently adjustable from 100–180%. UI labels use fixed bitmap faces. Unsupported characters display a missing-glyph box. See the [bundled font review](docs/bitmap-font-review.md). Appearance settings do not edit document text or undo history.
 
-The Mouse cursor selector offers **System**, **Pixel** and **Large pixel**. Pointer shapes follow the hovered control: text, buttons and draggable headers. Pixel cursors render within the app; the system cursor returns outside the client scene, on focus loss and during file dialogs.
+The Mouse cursor selector offers **System**, **Small pixel**, **Pixel**, **Large pixel**, **Dark pixel**, **Amber pixel**, **Green pixel**, **Cyan pixel**, **Classic arrow**, **Crosshair** and **Ring**. Pointer shapes follow the hovered control: text, buttons and draggable headers. Reticles retain text and drag-specific shapes. Pixel cursor sizes are bounded inside limited-resolution framebuffers. Custom cursors render within the app; the system cursor returns outside the client scene, on focus loss and during file dialogs.
 
 Style also offers a **Screen / Resolution** row. **Auto (theme)** renders retro palettes into a real limited-resolution framebuffer: VGA 640×480, EGA 640×350, Atari/C64 320×200, Commander 720×400, ZX Spectrum 256×192, and monochrome 720×350. Modern themes stay native. Choose **Native** for a full-resolution palette, or select an explicit raster independently of the theme. The complete in-app scene scales to the largest size that fits the window, preserving the source aspect ratio with letterboxing and nearest-texel sampling. Fractional upscale factors are supported. Compact Style/search/status controls remain usable at 256×192. Native and framebuffer typography are saved separately; framebuffers start with IBM BIOS 8×8 at 8 px. See [framebuffer behavior and reference platforms](docs/framebuffer.md).
 

@@ -321,14 +321,42 @@ pub enum MouseCursor {
     System,
     Pixel,
     LargePixel,
+    SmallPixel,
+    DarkPixel,
+    AmberPixel,
+    GreenPixel,
+    CyanPixel,
+    Classic,
+    Crosshair,
+    Ring,
 }
 impl MouseCursor {
-    pub const ALL: [Self; 3] = [Self::System, Self::Pixel, Self::LargePixel];
+    pub const ALL: [Self; 11] = [
+        Self::System,
+        Self::SmallPixel,
+        Self::Pixel,
+        Self::LargePixel,
+        Self::DarkPixel,
+        Self::AmberPixel,
+        Self::GreenPixel,
+        Self::CyanPixel,
+        Self::Classic,
+        Self::Crosshair,
+        Self::Ring,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             Self::System => "System",
             Self::Pixel => "Pixel",
             Self::LargePixel => "Large pixel",
+            Self::SmallPixel => "Small pixel",
+            Self::DarkPixel => "Dark pixel",
+            Self::AmberPixel => "Amber pixel",
+            Self::GreenPixel => "Green pixel",
+            Self::CyanPixel => "Cyan pixel",
+            Self::Classic => "Classic arrow",
+            Self::Crosshair => "Crosshair",
+            Self::Ring => "Ring",
         }
     }
 }

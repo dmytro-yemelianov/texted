@@ -57,10 +57,14 @@ pub(crate) struct App {
     context: Option<ContextRequest>,
     display: ScreenMapping,
     pointer_physical: (f32, f32),
-    footer: crate::status_ui::Footer,
+    panel_help: crate::status_ui::PanelHelp,
     stats: texted_app::document_stats::DocumentStats,
     pointer_inside: bool,
     focused: bool,
+    command_hover: Option<usize>,
+    key_function: Option<usize>,
+    mouse_function: Option<usize>,
+    command_flash: Option<(usize, Instant)>,
 }
 impl App {
     pub fn new(
@@ -118,10 +122,14 @@ impl App {
             context: None,
             display,
             pointer_physical: (0.0, 0.0),
-            footer: crate::status_ui::Footer::new(),
+            panel_help: crate::status_ui::PanelHelp::new(),
             stats,
             pointer_inside: false,
             focused: false,
+            command_hover: None,
+            key_function: None,
+            mouse_function: None,
+            command_flash: None,
         }
     }
     fn appearance_height(&self) -> usize {
@@ -144,6 +152,41 @@ impl App {
                 && !self.session.files.locked()
                 && !self.session.transfers.capturing(),
             has_query: !self.session.search.state.find_query.is_empty(),
+            zoom_percent: self.appearance.settings.editor_typography().scale_percent(),
+            statistics: crate::status_ui::selection_label(&p.snapshot, &p.selection)
+                .unwrap_or_else(|| {
+                    self.stats
+                        .result(
+                            (u128::from(self.session.id) << 64) | u128::from(p.document),
+                            p.snapshot.revision,
+                        )
+                        .map_or_else(|| "Counting words...".into(), |n| format!("{n} words"))
+                }),
+            statistics_short: match p.selection.mode {
+                texted_app::selection::SelectionMode::Stream => {
+                    let (a, b) = p.selection.offsets(&p.snapshot);
+                    format!(
+                        "{}s",
+                        p.snapshot.content.byte_to_char(b) - p.snapshot.content.byte_to_char(a)
+                    )
+                }
+                texted_app::selection::SelectionMode::Block => {
+                    let (a, b, c, d) = p.selection.block();
+                    format!("{}x{}", b - a + 1, d - c)
+                }
+                texted_app::selection::SelectionMode::None => self
+                    .stats
+                    .result(
+                        (u128::from(self.session.id) << 64) | u128::from(p.document),
+                        p.snapshot.revision,
+                    )
+                    .map_or_else(|| "...".into(), |n| format!("{n}w")),
+            },
+            cursor: {
+                let (line, col) = p.snapshot.offset_to_line_col(p.snapshot.cursor_offset);
+                (line + 1, col + 1)
+            },
+            wrap: self.session.viewport.wrap,
         }
     }
     fn panel_commands(&self) -> crate::chrome::Commands {
@@ -151,6 +194,35 @@ impl App {
     }
     fn function_command(&self, index: usize) -> Option<Intent> {
         crate::chrome::command(index, &self.panel_context(), self.modifiers)
+    }
+    fn invoke_function(&mut self, index: usize) {
+        if let Some(intent) = self.function_command(index) {
+            self.command_flash = Some((index, Instant::now()));
+            self.intent(intent);
+        }
+    }
+    fn hover_commands(&mut self) {
+        let g = self.geometry();
+        let (x, y) = self.display.to_source_clamped(self.pointer_physical);
+        let commands = self.panel_commands();
+        let key = if self.pointer_inside {
+            g.command_slot(x, y)
+                .and_then(|slot| commands.key_at(g, slot))
+        } else {
+            None
+        };
+        if key != self.command_hover {
+            self.command_hover = key;
+            self.window.request_redraw();
+        }
+        let tip = if self.pointer_inside {
+            commands.tip_at(g, x, y)
+        } else {
+            None
+        };
+        if self.panel_help.hover(g, x, y, tip) {
+            self.window.request_redraw();
+        }
     }
     fn geometry(&self) -> crate::chrome::Geometry {
         crate::chrome::Geometry::new(
@@ -169,7 +241,7 @@ impl App {
     fn reset_transient(&mut self) {
         self.context = None;
         self.mouse = Mouse::new();
-        self.footer.dismiss();
+        self.panel_help.dismiss();
         self.session.viewport.current = None;
         self.session.viewport.input(false);
         self.geometry()
@@ -320,7 +392,8 @@ impl App {
         target.set_control_flow(ControlFlow::WaitUntil(
             Instant::now()
                 + Duration::from_millis(
-                    if self.footer.pending_tip()
+                    if self.command_flash.is_some()
+                        || self.panel_help.pending_tip()
                         || self.session.buffer.client.latest().busy.is_some()
                         || self.session.search.state.pending
                         || self.session.transfers.busy()
@@ -351,6 +424,9 @@ impl App {
                 if !focused {
                     self.context = None;
                     self.modifiers = ModifiersState::empty();
+                    self.key_function = None;
+                    self.mouse_function = None;
+                    self.command_hover = None;
                 }
                 self.focused = focused;
                 self.update_cursor();
@@ -362,18 +438,30 @@ impl App {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.pointer_inside = false;
+                self.command_hover = None;
+                self.mouse_function = None;
                 self.update_cursor();
-                self.footer.clear_hover();
+                self.panel_help.clear_hover();
                 self.window.request_redraw();
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
+                self.panel_help.clear_hover();
+                self.hover_commands();
                 self.window.request_redraw();
             }
             WindowEvent::Resized(_) => {
                 self.context = None;
                 self.session.viewport.input(true);
                 self.window.request_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
+                if self.key_function.is_some()
+                    && input::function_key_index(&event.logical_key) == self.key_function
+                {
+                    self.key_function = None;
+                    self.window.request_redraw();
+                }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 self.keyboard(event);
@@ -444,7 +532,7 @@ impl App {
     }
     fn keyboard(&mut self, event: KeyEvent) {
         self.context = None;
-        self.footer.clear_hover();
+        self.panel_help.clear_hover();
         let state = &self.session.search.state;
         let context = SearchContext {
             open: state.mode != SearchBarMode::Closed,
@@ -458,14 +546,13 @@ impl App {
             modifiers: self.modifiers,
         };
         if let Some(index) = input::function_key_index(&event.logical_key) {
-            if let Some(intent) = self.function_command(index) {
-                self.intent(intent);
-            }
+            self.key_function = Some(index);
+            self.invoke_function(index);
             return;
         }
         let intent = input::decode(&input, context);
-        if self.footer.details && !matches!(intent, Some(Intent::DocumentInfo)) {
-            self.footer.dismiss();
+        if self.panel_help.details && !matches!(intent, Some(Intent::DocumentInfo)) {
+            self.panel_help.dismiss();
             self.window.request_redraw();
             if matches!(
                 event.logical_key,
@@ -554,7 +641,19 @@ impl App {
             .hit(scene.0, scene.1, self.tab_first, self.tabs.len())
             .is_some_and(|h| matches!(h, crate::chrome::Hit::Command(_)))
         {
-            return Shape::Pointer;
+            return if self
+                .geometry()
+                .command_slot(scene.0, scene.1)
+                .and_then(|slot| self.panel_commands().key_at(self.geometry(), slot))
+                .is_some()
+            {
+                Shape::Pointer
+            } else {
+                Shape::Arrow
+            };
+        }
+        if let Some(shape) = self.panel_help.cursor(self.geometry(), scene.0, scene.1) {
+            return shape;
         }
         if self.appearance.open {
             let width = self.display.source.0;
@@ -572,12 +671,6 @@ impl App {
         {
             return Shape::Pointer;
         }
-        if let Some(shape) = self
-            .footer
-            .cursor(width as usize, height as usize, compact, x, y)
-        {
-            return shape;
-        }
         if let Some(hit) =
             search_ui::hit(self.session.search.state.mode, width as f32, x, y, compact)
         {
@@ -593,7 +686,7 @@ impl App {
             .current
             .as_ref()
             .map_or(0.0, |f| f.gutter_w)
-            || y >= height as f32 - if compact { 14.0 } else { 28.0 }
+            || y >= height as f32
         {
             Shape::Arrow
         } else {
@@ -650,8 +743,16 @@ impl App {
             }
             return;
         }
+        if matches!(intent, Intent::ToggleWrap) && !self.failed && !self.session.files.locked() {
+            self.session.viewport.wrap = !self.session.viewport.wrap;
+            self.session.viewport.input(true);
+            self.window.request_redraw();
+            return;
+        }
         if matches!(intent, Intent::ToggleCommands) {
             self.commands = !self.commands;
+            self.command_hover = None;
+            self.panel_help.clear_hover();
             self.session.viewport.input(false);
             self.window.request_redraw();
             return;
@@ -680,17 +781,17 @@ impl App {
             return;
         }
         if matches!(intent, Intent::DocumentInfo) {
-            self.footer.clear_hover();
+            self.panel_help.clear_hover();
             let before = self.appearance.settings.clone();
             self.appearance.set_open(false);
             self.appearance_changed(before);
-            self.footer.details = !self.footer.details;
+            self.panel_help.details = !self.panel_help.details;
             self.mouse.dragging = false;
             self.window.request_redraw();
             return;
         }
         if matches!(intent, Intent::ContextMenu) {
-            self.footer.dismiss();
+            self.panel_help.dismiss();
             self.context_keyboard();
             return;
         }
@@ -704,7 +805,7 @@ impl App {
             let before = self.appearance.settings.clone();
             match intent {
                 Intent::ToggleAppearance => {
-                    self.footer.dismiss();
+                    self.panel_help.dismiss();
                     self.appearance.set_open(!self.appearance.open);
                     self.mouse.dragging = false;
                     self.session.viewport.horizontal.end_drag();
@@ -768,10 +869,6 @@ impl App {
                         Err(error) => self.session.message = Some(error),
                     }
                 }
-            }
-            Intent::ToggleWrap => {
-                self.session.viewport.wrap = !self.session.viewport.wrap;
-                self.session.viewport.input(true);
             }
             Intent::ToggleLineNumbers => {
                 self.session.viewport.line_numbers = !self.session.viewport.line_numbers;
@@ -907,6 +1004,7 @@ impl App {
             .document_point(self.display.to_source_clamped((x, y)));
         let (x, y) = self.mouse.position;
         self.update_cursor();
+        self.hover_commands();
         if self.appearance.open {
             if self.display.to_source(self.pointer_physical).is_some()
                 && self.appearance.hover(
@@ -920,15 +1018,6 @@ impl App {
                 self.window.request_redraw();
             }
             return;
-        }
-        if self.footer.hover(
-            self.display.source.0 as usize,
-            self.geometry().document_height(),
-            self.display.pixelated,
-            x,
-            y,
-        ) {
-            self.window.request_redraw();
         }
         if self.locked()
             || (!self.mouse.dragging
@@ -950,6 +1039,7 @@ impl App {
     fn pointer_button(&mut self, state: ElementState) {
         self.context = None;
         if state == ElementState::Released {
+            self.mouse_function = None;
             self.appearance.end_drag();
             self.update_cursor();
             self.mouse.dragging = false;
@@ -964,7 +1054,6 @@ impl App {
             }
             return;
         }
-        let (width, height) = self.document_size();
         let scene = self.display.to_source_clamped(self.pointer_physical);
         if let Some(hit) = self
             .geometry()
@@ -992,9 +1081,8 @@ impl App {
                 }
                 Hit::Command(slot) => {
                     if let Some(index) = self.panel_commands().key_at(self.geometry(), slot) {
-                        if let Some(intent) = self.function_command(index) {
-                            self.intent(intent);
-                        }
+                        self.mouse_function = Some(index);
+                        self.invoke_function(index);
                     }
                 }
                 Hit::Consumed => {}
@@ -1015,27 +1103,13 @@ impl App {
             self.appearance_changed(before);
             return;
         }
-        if let Some(action) = self.footer.click(
-            width as usize,
-            height as usize,
-            self.display.pixelated,
-            x,
-            y,
-        ) {
-            use crate::status_ui::Action as F;
-            self.footer.clear_hover();
+        if let Some(action) = self.panel_help.click(self.geometry(), scene.0, scene.1) {
+            use crate::status_ui::Action;
+            self.panel_help.clear_hover();
             match action {
-                F::Statistics => self.footer.details = !self.footer.details,
-                F::Close => self.footer.dismiss(),
-                F::Smaller => self.intent(Intent::Zoom(-1)),
-                F::Reset => self.intent(Intent::ResetFontSize),
-                F::Larger => self.intent(Intent::Zoom(1)),
-                F::Appearance => {
-                    self.footer.dismiss();
-                    self.intent(Intent::ToggleAppearance);
-                }
-                F::Wrap => self.intent(Intent::ToggleWrap),
-                F::Consumed => {}
+                Action::Close => self.panel_help.dismiss(),
+                Action::Wrap => self.intent(Intent::ToggleWrap),
+                Action::Consumed => {}
             }
             self.window.request_redraw();
             return;
@@ -1206,7 +1280,14 @@ impl App {
         self.window.set_title(&title);
         self.menus.update(self.menu_state());
         self.poll_context();
-        if self.footer.tick() {
+        if self
+            .command_flash
+            .is_some_and(|(_, at)| at.elapsed() >= Duration::from_millis(160))
+        {
+            self.command_flash = None;
+            self.window.request_redraw();
+        }
+        if self.panel_help.tick() {
             self.window.request_redraw();
         }
         if self.session.viewport.blink.elapsed() >= Duration::from_millis(500)
@@ -1248,15 +1329,10 @@ impl App {
             (u128::from(self.session.id) << 64) | u128::from(p.document),
             &p.snapshot,
         );
-        let typography = self.appearance.settings.editor_typography();
-        let zoom_percent = typography.scale_percent();
-        let frame = self.session.viewport.prepare(
-            &p.snapshot,
-            &self.font,
-            width as usize,
-            height as usize,
-            display.pixelated,
-        );
+        let frame =
+            self.session
+                .viewport
+                .prepare(&p.snapshot, &self.font, width as usize, height as usize);
         self.session
             .search
             .state
@@ -1266,9 +1342,6 @@ impl App {
             &mut self.font,
             &mut self.ui_font,
             &ViewModel {
-                footer: &self.footer,
-                words,
-                zoom_percent,
                 compact: display.pixelated,
                 palette: &self.appearance.palette,
                 snap: &p.snapshot,
@@ -1282,15 +1355,10 @@ impl App {
                 gutter_w: frame.gutter_w,
                 line_digits: frame.line_digits,
                 text_start_x: frame.text_start_x,
-                cur_line: frame.cur_line,
-                cur_col: frame.cur_col,
-                word_wrap: self.session.viewport.wrap,
                 show_line_numbers: self.session.viewport.line_numbers,
                 caret_visible: self.session.viewport.caret,
                 current_scrollbar: self.session.viewport.bar,
                 show_perf_hud: self.hud,
-                bom: self.session.files.documents.bom,
-                ending: self.session.files.documents.ending,
                 gpu_name: &self.renderer.description,
                 frame_start: start,
                 layout_time: frame.layout_time,
@@ -1321,6 +1389,29 @@ impl App {
             self.active,
             self.tab_first,
             &commands,
+            crate::chrome::Feedback {
+                hover: self.command_hover,
+                pressed: self
+                    .key_function
+                    .or(self.mouse_function)
+                    .or(self.command_flash.map(|(key, _)| key)),
+            },
+        );
+        self.panel_help.paint(
+            &mut self.draws,
+            &mut self.ui_font,
+            &crate::status_ui::Model {
+                geometry,
+                palette: &self.appearance.palette,
+                snap: &p.snapshot,
+                selection: &p.selection,
+                words,
+                cur_line: frame.cur_line,
+                cur_col: frame.cur_col,
+                word_wrap: self.session.viewport.wrap,
+                bom: self.session.files.documents.bom,
+                ending: self.session.files.documents.ending,
+            },
         );
         self.appearance.paint(
             &mut self.draws,
@@ -1338,6 +1429,7 @@ impl App {
                     [x, y],
                     self.appearance.settings.mouse_cursor,
                     shape,
+                    display.pixelated,
                 );
             }
         }

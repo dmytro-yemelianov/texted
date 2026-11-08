@@ -175,8 +175,8 @@ pub fn function_key_for(
             6 => return Some(Intent::Zoom(-1)),
             7 => return Some(Intent::Zoom(1)),
             8 => return Some(Intent::ResetFontSize),
-            10 => return Some(Intent::ToggleLineNumbers),
-            11 => return Some(Intent::ToggleDiagnostics),
+            9 | 11 => return Some(Intent::DocumentInfo),
+            10 => return Some(Intent::ToggleWrap),
             _ => {}
         }
     }

@@ -1,5 +1,6 @@
 //! Window chrome uses scene coordinates; document input and drawing use a translated viewport.
 use crate::graphics::{draw_rect, DrawList, FontEngine};
+use std::borrow::Cow;
 use texted_app::appearance::Palette;
 #[derive(Clone, Copy)]
 pub(crate) struct Geometry {
@@ -29,6 +30,11 @@ pub(crate) struct Context {
     pub can_redo: bool,
     pub editable: bool,
     pub has_query: bool,
+    pub zoom_percent: u16,
+    pub statistics: String,
+    pub statistics_short: String,
+    pub cursor: (usize, usize),
+    pub wrap: bool,
 }
 pub(crate) fn command(
     index: usize,
@@ -36,7 +42,9 @@ pub(crate) fn command(
     modifiers: winit::keyboard::ModifiersState,
 ) -> Option<texted_app::input::Intent> {
     use texted_app::input::Intent as I;
-    if context.appearance {
+    if context.appearance
+        && !(modifiers.control_key() && !modifiers.super_key() && !modifiers.alt_key())
+    {
         return Some(match index {
             0 => I::ToggleCommands,
             1 => I::AcceptAppearance,
@@ -50,7 +58,8 @@ pub(crate) fn command(
     texted_app::input::function_key_for(index, modifiers, context.search)
 }
 pub(crate) struct Commands {
-    pub items: Vec<(usize, &'static str)>,
+    pub items: Vec<(usize, Cow<'static, str>)>,
+    tips: Vec<(usize, String)>,
 }
 impl Commands {
     pub fn key_at(&self, geometry: Geometry, slot: usize) -> Option<usize> {
@@ -64,15 +73,72 @@ impl Commands {
         }
     }
 
+    pub fn tip_at(&self, g: Geometry, x: f32, y: f32) -> Option<crate::status_ui::Tip> {
+        let slot = g.command_slot(x, y)?;
+        let key = self.key_at(g, slot)?;
+        let text = self.tips.iter().find(|(index, _)| *index == key)?.1.clone();
+        Some(crate::status_ui::Tip {
+            rect: g.command_rect(slot),
+            text,
+        })
+    }
     pub fn new(context: &Context, modifiers: winit::keyboard::ModifiersState) -> Self {
         use texted_app::{
             commands::EditorCommand as E,
             input::{FileIntent as F, Intent as I},
         };
         let mut items = Vec::new();
+        let mut tips = Vec::new();
+        let data_layer = modifiers.control_key() && !modifiers.super_key() && !modifiers.alt_key();
         for index in 0..12 {
             let Some(intent) = command(index, context, modifiers) else {
                 continue;
+            };
+            let value = match &intent {
+                I::ResetFontSize => Some(format!("{}%", context.zoom_percent)),
+                I::DocumentInfo if data_layer => Some(if index == 9 {
+                    format!("{}:{}", context.cursor.0, context.cursor.1)
+                } else {
+                    context.statistics_short.clone()
+                }),
+                I::ToggleWrap if data_layer => {
+                    Some(if context.wrap { "W:on" } else { "W:off" }.into())
+                }
+                _ => None,
+            };
+            let description = match &intent {
+                I::ResetFontSize => format!(
+                    "Reset text scale to 100% (currently {}%)",
+                    context.zoom_percent
+                ),
+                I::Zoom(delta) => format!(
+                    "{} text scale by 10% (currently {}%)",
+                    if *delta > 0 { "Increase" } else { "Decrease" },
+                    context.zoom_percent
+                ),
+                I::DocumentInfo => format!(
+                    "{}; line {}, column {}. Open document details",
+                    context.statistics, context.cursor.0, context.cursor.1
+                ),
+                I::ToggleAppearance => "Fonts, themes, screen and mouse cursors (Cmd+,)".into(),
+                I::ToggleWrap => format!(
+                    "Line wrapping is {}. Click to toggle",
+                    if context.wrap { "on" } else { "off" }
+                ),
+                I::Find => "Find text (Cmd+F)".into(),
+                I::Replace => "Find and replace text (Cmd+R)".into(),
+                I::File(F::Close) => "Close this tab; ask to save changed text (Cmd+W)".into(),
+                I::File(F::Quit) => "Quit; check all changed tabs (Cmd+Q)".into(),
+                I::File(F::Save { as_new }) => if *as_new {
+                    "Save this tab as a new file"
+                } else {
+                    "Save this tab (Cmd+S)"
+                }
+                .into(),
+                I::ToggleCommands => {
+                    "Show or hide the command panel (F1). Hold Ctrl for scale and statistics".into()
+                }
+                _ => String::new(),
             };
             let (label, available) = match intent {
                 I::ToggleCommands => ("Keys", true),
@@ -91,7 +157,7 @@ impl Commands {
                     (if forward { "Next" } else { "Prev" }, context.multiple_tabs)
                 }
                 I::ToggleAppearance => (if context.appearance { "Back" } else { "Look" }, true),
-                I::ToggleWrap => ("Wrap", context.editable),
+                I::ToggleWrap => ("Wrp", context.editable),
                 I::DocumentInfo => ("Info", true),
                 I::ToggleLineNumbers => ("Ln", context.editable),
                 I::ToggleDiagnostics => ("Perf", context.editable),
@@ -109,24 +175,44 @@ impl Commands {
                 I::SearchClose | I::Cancel => ("Back", true),
                 I::ContextMenu => ("Menu", context.editable),
                 I::AcceptAppearance => ("Keep", true),
-                I::ResetAppearance => ("Reset", true),
+                I::ResetAppearance => ("Rst", true),
                 I::BrowseAppearance { forward } => (if forward { "Next" } else { "Prev" }, true),
                 _ => continue,
             };
             if available {
+                let label = value.map_or(Cow::Borrowed(label), Cow::Owned);
+                tips.push((
+                    index,
+                    format!(
+                        "F{}: {}",
+                        index + 1,
+                        if description.is_empty() {
+                            label.as_ref()
+                        } else {
+                            &description
+                        }
+                    ),
+                ));
                 items.push((index, label));
             }
         }
         // Narrow rasters show the operations for the active task first.
-        if context.search.open {
+        if data_layer {
+            items.sort_by_key(|(i, _)| {
+                [6, 7, 8, 11, 9, 10]
+                    .iter()
+                    .position(|key| key == i)
+                    .unwrap_or(6)
+            });
+        } else if context.search.open {
             items.sort_by_key(|(i, _)| if matches!(i, 2 | 3 | 9) { 0 } else { 1 });
         }
-        Self { items }
+        Self { items, tips }
     }
 }
 impl Geometry {
     pub fn new(width: usize, height: usize, compact: bool, commands: bool) -> Self {
-        let columns = (width / if compact { 48 } else { 64 }).clamp(1, 12);
+        let columns = (width / 64).clamp(1, 12);
         let bottom = if commands {
             if compact {
                 16
@@ -143,6 +229,24 @@ impl Geometry {
             bottom,
             columns,
             compact,
+        }
+    }
+    pub fn command_slot(self, x: f32, y: f32) -> Option<usize> {
+        (self.bottom > 0
+            && x >= 0.0
+            && x < self.width as f32
+            && y >= self.height.saturating_sub(self.bottom) as f32
+            && y < self.height as f32)
+            .then(|| (x as usize * self.columns / self.width.max(1)).min(self.columns - 1))
+    }
+    pub fn command_rect(self, slot: usize) -> crate::appearance_ui::Rect {
+        let x = slot * self.width / self.columns;
+        let next = (slot + 1) * self.width / self.columns;
+        crate::appearance_ui::Rect {
+            x,
+            y: self.height.saturating_sub(self.bottom),
+            w: next - x,
+            h: self.bottom,
         }
     }
     pub fn document_height(self) -> usize {
@@ -195,16 +299,19 @@ impl Geometry {
                 Hit::Tab(index)
             });
         }
-        if self.bottom > 0 && y >= self.height.saturating_sub(self.bottom) as f32 {
-            let column = (x as usize * self.columns / self.width.max(1)).min(self.columns - 1);
-            return Some(Hit::Command(column));
+        if let Some(slot) = self.command_slot(x, y) {
+            return Some(Hit::Command(slot));
         }
         None
     }
 }
+pub(crate) struct Feedback {
+    pub hover: Option<usize>,
+    pub pressed: Option<usize>,
+}
 #[expect(
     clippy::too_many_arguments,
-    reason = "Chrome paints shared window geometry and tab/command state"
+    reason = "Chrome paints shared geometry and command feedback"
 )]
 pub(crate) fn paint(
     list: &mut DrawList,
@@ -215,6 +322,7 @@ pub(crate) fn paint(
     active: usize,
     first: usize,
     commands: &Commands,
+    feedback: Feedback,
 ) {
     draw_rect(list, g.width, g.height, 0, 0, g.width, g.top, p.status_bg);
     for (slot, label) in labels.iter().skip(first).take(g.tab_capacity()).enumerate() {
@@ -295,17 +403,15 @@ pub(crate) fn paint(
             y,
             next - x - 1,
             g.bottom,
-            p.status_bg,
-        );
-        let text = format!(
-            "F{}{}",
-            key + 1,
-            if g.compact {
-                label.chars().take(2).collect::<String>()
+            if feedback.pressed == Some(*key) {
+                p.input_active
+            } else if feedback.hover == Some(*key) {
+                p.panel_border
             } else {
-                (*label).into()
-            }
+                p.status_bg
+            },
         );
+        let text = format!("F{}{}", key + 1, label);
         let fit = ((next - x).saturating_sub(4) as f32 / font.char_width_px) as usize;
         font.draw_string(
             list,
@@ -314,7 +420,11 @@ pub(crate) fn paint(
             x + 2,
             y + if g.compact { 4 } else { 6 },
             &text.chars().take(fit).collect::<String>(),
-            p.status_text,
+            if feedback.hover == Some(*key) || feedback.pressed == Some(*key) {
+                p.text
+            } else {
+                p.status_text
+            },
         );
     }
 }
@@ -331,6 +441,11 @@ mod tests {
             can_redo: false,
             editable: true,
             has_query: true,
+            zoom_percent: 120,
+            statistics: "42 words".into(),
+            statistics_short: "42w".into(),
+            cursor: (3, 9),
+            wrap: true,
         }
     }
     #[test]
@@ -339,19 +454,21 @@ mod tests {
         use winit::keyboard::ModifiersState as M;
         let mut c = context();
         let editor = Commands::new(&c, M::empty());
-        assert!(editor.items.contains(&(2, "Find")));
+        assert!(editor.items.contains(&(2, "Find".into())));
         let geometry = Geometry::new(980, 700, false, true);
         for (key, _) in &editor.items {
             assert_eq!(editor.key_at(geometry, *key), Some(*key));
         }
         c.search.open = true;
         let search = Commands::new(&c, M::empty());
-        assert_eq!(search.items[0], (2, "Next"));
+        assert_eq!(search.items[0], (2, "Next".into()));
         assert!(matches!(
             command(2, &c, M::SHIFT),
             Some(I::NextMatch { forward: false })
         ));
-        assert!(Commands::new(&c, M::SHIFT).items.contains(&(1, "As")));
+        assert!(Commands::new(&c, M::SHIFT)
+            .items
+            .contains(&(1, "As".into())));
         assert!(matches!(
             command(9, &c, M::SUPER),
             Some(I::File(texted_app::input::FileIntent::Quit))
@@ -362,15 +479,88 @@ mod tests {
             .iter()
             .all(|(_, label)| *label != "Copy" && *label != "Cut"));
         c.selected = true;
-        assert!(Commands::new(&c, M::ALT).items.contains(&(1, "Copy")));
+        assert!(Commands::new(&c, M::ALT)
+            .items
+            .contains(&(1, "Copy".into())));
         c.appearance = true;
         let appearance = Commands::new(&c, M::empty());
-        assert!(appearance.items.contains(&(1, "Keep")));
+        assert!(appearance.items.contains(&(1, "Keep".into())));
         assert!(!appearance.items.iter().any(|(_, label)| *label == "Save"));
         assert!(matches!(
             command(2, &c, M::empty()),
             Some(I::BrowseAppearance { forward: false })
         ));
+    }
+    #[test]
+    fn ctrl_data_uses_existing_slots_and_keeps_scale_and_counts_visible_when_narrow() {
+        use winit::keyboard::ModifiersState as M;
+        let mut c = context();
+        c.has_query = false;
+        let commands = Commands::new(&c, M::CONTROL);
+        assert!(commands.items.contains(&(8, "120%".into())));
+        assert!(commands.items.contains(&(9, "3:9".into())));
+        assert!(commands.items.contains(&(10, "W:on".into())));
+        assert!(commands.items.contains(&(11, "42w".into())));
+        let narrow = Geometry::new(256, 192, true, true);
+        assert_eq!(
+            commands
+                .items
+                .iter()
+                .take(narrow.columns)
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>(),
+            vec![6, 7, 8, 11]
+        );
+        for (slot, (key, label)) in commands.items.iter().take(narrow.columns).enumerate() {
+            let rect = narrow.command_rect(slot);
+            assert!((format!("F{}{}", key + 1, label).chars().count() * 8 + 4) <= rect.w);
+            let tip = commands
+                .tip_at(narrow, (rect.x + 2) as f32, (rect.y + 2) as f32)
+                .unwrap();
+            assert_eq!(tip.rect, rect);
+            assert!(!tip.text.is_empty());
+        }
+        c.appearance = true;
+        assert!(matches!(
+            command(6, &c, M::CONTROL),
+            Some(texted_app::input::Intent::Zoom(-1))
+        ));
+    }
+    #[test]
+    fn hover_and_pressed_feedback_color_only_the_invoked_button() {
+        let c = context();
+        let commands = Commands::new(&c, winit::keyboard::ModifiersState::empty());
+        let g = Geometry::new(980, 700, false, true);
+        let palette = texted_app::appearance::Appearance::default()
+            .palette()
+            .unwrap();
+        let mut font = FontEngine::new(16.0);
+        let mut list = DrawList::default();
+        paint(
+            &mut list,
+            &mut font,
+            g,
+            &palette,
+            &[],
+            0,
+            0,
+            &commands,
+            Feedback {
+                hover: Some(2),
+                pressed: Some(1),
+            },
+        );
+        for (key, color) in [
+            (1, palette.input_active),
+            (2, palette.panel_border),
+            (3, palette.status_bg),
+        ] {
+            let rect = g.command_rect(key);
+            assert!(list.draws.iter().any(|d| d.glyph.is_none()
+                && d.rect[0] == rect.x as f32
+                && d.rect[1] == rect.y as f32
+                && d.color == color));
+        }
     }
     #[test]
     fn scene_translation_and_command_hits_match_at_all_resolutions() {
