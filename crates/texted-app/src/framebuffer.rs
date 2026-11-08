@@ -66,11 +66,60 @@ impl Framebuffer {
         }
     }
 }
+/// A simulated tube for limited-resolution screens: curved glass, scanlines, darker corners
+/// and phosphor glow. The window backend draws it; terminals show the flat picture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrtEffect {
+    #[default]
+    Off,
+    Subtle,
+    Strong,
+}
+impl CrtEffect {
+    pub const ALL: [Self; 3] = [Self::Off, Self::Subtle, Self::Strong];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Subtle => "Subtle",
+            Self::Strong => "Strong",
+        }
+    }
+    /// Curvature, scanline depth, vignette and glow, in the shader's uniform order.
+    pub fn params(self) -> [f32; 4] {
+        match self {
+            Self::Off => [0.0; 4],
+            Self::Subtle => [0.03, 0.25, 0.2, 0.15],
+            Self::Strong => [0.08, 0.5, 0.4, 0.3],
+        }
+    }
+    /// The picture point shown at screen point `(u, v)` (0..1 each); presentation.wgsl matches it.
+    fn bend(self, (u, v): (f32, f32)) -> (f32, f32) {
+        let k = self.params()[0];
+        let (x, y) = (u * 2.0 - 1.0, v * 2.0 - 1.0);
+        (
+            x * (1.0 + k * y * y) * 0.5 + 0.5,
+            y * (1.0 + k * x * x) * 0.5 + 0.5,
+        )
+    }
+    /// The inverse of `bend` by fixed-point iteration, which converges fast for small curvature.
+    fn unbend(self, (u, v): (f32, f32)) -> (f32, f32) {
+        let k = self.params()[0];
+        let (tx, ty) = (u * 2.0 - 1.0, v * 2.0 - 1.0);
+        let (mut x, mut y) = (tx, ty);
+        for _ in 0..8 {
+            x = tx / (1.0 + k * y * y);
+            y = ty / (1.0 + k * x * x);
+        }
+        (x * 0.5 + 0.5, y * 0.5 + 0.5)
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScreenMapping {
     pub source: (u32, u32),
     pub destination: (u32, u32, u32, u32),
     pub pixelated: bool,
+    pub crt: CrtEffect,
 }
 impl ScreenMapping {
     pub fn new(window: (u32, u32), resolution: Option<(u32, u32)>) -> Self {
@@ -80,6 +129,7 @@ impl ScreenMapping {
                 source: (width, height),
                 destination: (0, 0, width, height),
                 pixelated: false,
+                crt: CrtEffect::Off,
             };
         };
         // Fill one window dimension, preserving the source aspect to physical-pixel precision.
@@ -99,7 +149,15 @@ impl ScreenMapping {
             source: (w, h),
             destination: ((width - dw) / 2, (height - dh) / 2, dw, dh),
             pixelated: true,
+            crt: CrtEffect::Off,
         }
+    }
+    /// The effect applies only to limited-resolution screens, which have a presentation pass.
+    pub fn with_crt(mut self, crt: CrtEffect) -> Self {
+        if self.pixelated {
+            self.crt = crt;
+        }
+        self
     }
     pub fn scale(self) -> (f32, f32) {
         (
@@ -112,17 +170,42 @@ impl ScreenMapping {
         if x < dx as f32 || y < dy as f32 || x >= (dx + w) as f32 || y >= (dy + h) as f32 {
             return None;
         }
+        if self.crt != CrtEffect::Off {
+            let (u, v) = self.crt.bend(self.screen_fraction((x, y)));
+            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                return None; // Black glass beyond the curved picture.
+            }
+        }
         Some(self.to_source_clamped((x, y)))
+    }
+    fn screen_fraction(self, (x, y): (f32, f32)) -> (f32, f32) {
+        let (dx, dy, w, h) = self.destination;
+        ((x - dx as f32) / w as f32, (y - dy as f32) / h as f32)
     }
     pub fn to_source_clamped(self, (x, y): (f32, f32)) -> (f32, f32) {
         let (sx, sy) = self.scale();
+        let (mut px, mut py) = (
+            (x - self.destination.0 as f32) / sx,
+            (y - self.destination.1 as f32) / sy,
+        );
+        if self.crt != CrtEffect::Off {
+            let (u, v) = self.crt.bend(self.screen_fraction((x, y)));
+            (px, py) = (u * self.source.0 as f32, v * self.source.1 as f32);
+        }
         (
-            ((x - self.destination.0 as f32) / sx).clamp(0.0, self.source.0 as f32 - 0.001),
-            ((y - self.destination.1 as f32) / sy).clamp(0.0, self.source.1 as f32 - 0.001),
+            px.clamp(0.0, self.source.0 as f32 - 0.001),
+            py.clamp(0.0, self.source.1 as f32 - 0.001),
         )
     }
     pub fn to_window(self, (x, y): (f32, f32)) -> (f32, f32) {
         let (sx, sy) = self.scale();
+        if self.crt != CrtEffect::Off {
+            let (u, v) = self
+                .crt
+                .unbend((x / self.source.0 as f32, y / self.source.1 as f32));
+            let (dx, dy, w, h) = self.destination;
+            return (dx as f32 + u * w as f32, dy as f32 + v * h as f32);
+        }
         (
             self.destination.0 as f32 + x * sx,
             self.destination.1 as f32 + y * sy,
@@ -172,6 +255,36 @@ mod tests {
                 assert!((f64::from(h) * 256.0 / 192.0 - f64::from(w)).abs() < 1.0);
             }
         }
+    }
+    #[test]
+    fn crt_curvature_maps_clicks_where_the_bent_picture_shows_them() {
+        let flat = ScreenMapping::new((640, 480), Some((640, 480)));
+        let bent = flat.with_crt(CrtEffect::Strong);
+        assert_eq!(bent.to_source((320.0, 240.0)), Some((320.0, 240.0)));
+        // Near a corner the picture is pushed outward, so a click there lands nearer the edge.
+        let (fx, fy) = flat.to_source((40.0, 40.0)).unwrap();
+        let (bx, by) = bent.to_source((40.0, 40.0)).unwrap();
+        assert!(bx < fx && by < fy, "{bx},{by} vs {fx},{fy}");
+        // The very corner shows black glass, not the picture.
+        assert!(bent.to_source((1.0, 1.0)).is_none());
+        // A keyboard-placed popup goes to the window and back to the same scene point.
+        let p = (100.0, 80.0);
+        let q = bent.to_source_clamped(bent.to_window(p));
+        assert!(
+            (p.0 - q.0).abs() < 0.01 && (p.1 - q.1).abs() < 0.01,
+            "{q:?}"
+        );
+        assert_eq!(
+            flat.with_crt(CrtEffect::Off).to_source((40.0, 40.0)),
+            Some((fx, fy))
+        );
+        // Native windows have no presentation pass, so they stay flat.
+        assert_eq!(
+            ScreenMapping::new((640, 480), None)
+                .with_crt(CrtEffect::Strong)
+                .crt,
+            CrtEffect::Off
+        );
     }
     #[test]
     fn low_resolution_canvases_use_the_full_available_window_without_whole_number_steps() {

@@ -3,6 +3,8 @@ use texted_app::framebuffer::ScreenMapping;
 pub(crate) struct PixelPresenter {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
+    /// Four floats for the CRT pass; new buffers start zeroed, which draws flat.
+    crt: wgpu::Buffer,
     format: wgpu::TextureFormat,
     target: Option<Target>,
 }
@@ -16,16 +18,34 @@ impl PixelPresenter {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fixed framebuffer binding"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let crt = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("crt effect"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("nearest framebuffer presentation"),
@@ -64,6 +84,7 @@ impl PixelPresenter {
         Self {
             pipeline,
             layout,
+            crt,
             format,
             target: None,
         }
@@ -89,10 +110,16 @@ impl PixelPresenter {
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("fixed framebuffer"),
                 layout: &self.layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.crt.as_entire_binding(),
+                    },
+                ],
             });
             self.target = Some(Target {
                 _texture: texture,
@@ -102,6 +129,10 @@ impl PixelPresenter {
             });
         }
         &self.target.as_ref().unwrap().view
+    }
+    /// Curvature, scanlines, vignette and glow for the next presentation; zeros draw it flat.
+    pub fn set_crt(&self, queue: &wgpu::Queue, params: [f32; 4]) {
+        queue.write_buffer(&self.crt, 0, bytemuck::cast_slice(&params));
     }
     pub fn release(&mut self) {
         self.target = None;

@@ -26,7 +26,7 @@ impl Rect {
     }
 }
 
-const ROWS: usize = 6;
+const ROWS: usize = 7;
 struct Panel {
     rect: Rect,
     input: usize,
@@ -134,6 +134,7 @@ enum Value {
     Size(u16),
     Spacing(u16),
     Cursor(MouseCursor),
+    Crt(texted_app::framebuffer::CrtEffect),
 }
 struct Choice {
     label: String,
@@ -318,11 +319,13 @@ impl AppearanceUi {
             2 => Value::Font(t.family),
             3 => Value::Size(t.scale_percent()),
             4 => Value::Spacing(t.line_spacing),
-            _ => Value::Cursor(self.settings.mouse_cursor),
+            5 => Value::Cursor(self.settings.mouse_cursor),
+            _ => Value::Crt(self.settings.crt),
         }
     }
     fn choices(&self, row: usize) -> Arc<Vec<Choice>> {
-        if (self.cell_backend && row != 0) || (self.terminal_graphics && row == 5) {
+        // Terminals draw their own pointer, and their pictures skip the CRT pass.
+        if (self.cell_backend && row != 0) || (self.terminal_graphics && row >= 5) {
             return Arc::new(vec![Choice {
                 label: "Managed by the terminal emulator".into(),
                 value: self.selected(row),
@@ -389,6 +392,10 @@ impl AppearanceUi {
                 .into_iter()
                 .map(|c| Choice::new(c.name().into(), Value::Cursor(c)))
                 .collect(),
+            6 => texted_app::framebuffer::CrtEffect::ALL
+                .into_iter()
+                .map(|c| Choice::new(c.name().into(), Value::Crt(c)))
+                .collect(),
             row => {
                 let t = self.settings.editor_typography();
                 let mut numbers: Vec<u16> = if row == 3 {
@@ -431,6 +438,7 @@ impl AppearanceUi {
                 }
             }
             Value::Screen(screen) => self.settings.framebuffer = screen,
+            Value::Crt(crt) => self.settings.crt = crt,
             Value::Font(font) => {
                 let t = self.settings.editor_typography_mut();
                 let zoom = t.scale_percent();
@@ -805,6 +813,7 @@ impl AppearanceUi {
             format!("{}%", t.scale_percent()),
             format!("{}%", t.line_spacing),
             self.settings.mouse_cursor.name().into(),
+            self.settings.crt.name().into(),
         ];
         if self.cell_backend {
             for value in &mut values[1..] {
@@ -813,9 +822,12 @@ impl AppearanceUi {
         }
         if self.terminal_graphics {
             values[5] = "Terminal pointer".into();
+            values[6] = "Window only".into();
         }
         let titles = if compact {
-            ["Theme", "Screen", "Font", "Size", "Spacing", "Cursor"]
+            [
+                "Theme", "Screen", "Font", "Size", "Spacing", "Cursor", "CRT",
+            ]
         } else {
             [
                 "Theme",
@@ -824,6 +836,7 @@ impl AppearanceUi {
                 "Text scale",
                 "Line height",
                 "Mouse cursor",
+                "CRT effect",
             ]
         };
         for (row, (title, value)) in titles.iter().zip(values).enumerate() {
@@ -1274,6 +1287,24 @@ mod tests {
                 |c| matches!(c.value,Value::Size(v) if v % 10 == 0 && (10..=800).contains(&v))
             ));
         }
+    }
+    #[test]
+    fn the_crt_row_offers_three_strengths_and_keeps_the_choice() {
+        use texted_app::framebuffer::CrtEffect;
+        let mut ui = AppearanceUi::new(Appearance {
+            theme: Theme::C64,
+            ..Default::default()
+        });
+        let labels: Vec<_> = ui.choices(6).iter().map(|c| c.label.clone()).collect();
+        assert_eq!(labels, ["Off", "Subtle", "Strong"]);
+        ui.set_open(true);
+        ui.open_dropdown(6, 320, 200, true);
+        let d = ui.dropdown.unwrap();
+        let choices = ui.choices(6);
+        let popup = ui.popup(d, 320, 200, true, &choices);
+        let row = popup.row(2, d.first).unwrap();
+        ui.click(320, 200, (row.x + 10) as f32, (row.y + 4) as f32, true);
+        assert_eq!(ui.settings.crt, CrtEffect::Strong);
     }
     #[test]
     fn compact_lists_commit_clicked_values_and_outside_clicks_dismiss_only_the_list() {

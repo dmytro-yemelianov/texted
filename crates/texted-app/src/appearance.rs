@@ -368,6 +368,8 @@ pub struct Appearance {
     pub mouse_cursor: MouseCursor,
     pub typography: Typography,
     pub framebuffer: Framebuffer,
+    /// Tube simulation for limited-resolution screens; older files without it load as Off.
+    pub crt: crate::framebuffer::CrtEffect,
     pub pixel_typography: Typography,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub colors: BTreeMap<String, String>,
@@ -380,6 +382,7 @@ impl Default for Appearance {
             mouse_cursor: MouseCursor::System,
             typography: Typography::default(),
             framebuffer: Framebuffer::default(),
+            crt: Default::default(),
             pixel_typography: Typography {
                 family: FontFamily::Bios,
                 size_px: 8,
@@ -527,6 +530,19 @@ mod tests {
             serde_json::from_str::<Appearance>(&serde_json::to_string(&a).unwrap()).unwrap(),
             a
         );
+    }
+    #[test]
+    fn crt_effect_is_saved_and_older_files_load_without_it() {
+        use crate::framebuffer::CrtEffect;
+        let old: Appearance = serde_json::from_str(r#"{"theme":"c64"}"#).unwrap();
+        assert_eq!(old.crt, CrtEffect::Off);
+        let a = Appearance {
+            crt: CrtEffect::Strong,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains(r#""crt":"strong""#), "{json}");
+        assert_eq!(serde_json::from_str::<Appearance>(&json).unwrap(), a);
     }
     #[test]
     fn future_versions_unknown_colors_and_invalid_rgb_are_rejected() {

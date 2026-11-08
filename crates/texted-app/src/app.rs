@@ -167,7 +167,8 @@ impl App {
         };
         let size = window.inner_size();
         let display =
-            ScreenMapping::new((size.width, size.height), appearance.settings.resolution());
+            ScreenMapping::new((size.width, size.height), appearance.settings.resolution())
+                .with_crt(appearance.settings.crt);
         let w = wake.clone();
         let stats = texted_app::document_stats::DocumentStats::new(move || w());
         session.message = warning;
@@ -1793,7 +1794,8 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        let display = ScreenMapping::new((size.width, size.height), self.resolution());
+        let display = ScreenMapping::new((size.width, size.height), self.resolution())
+            .with_crt(self.appearance.settings.crt);
         let (width, scene_height) = display.source;
         let geometry = crate::chrome::Geometry::new(
             width as usize,
