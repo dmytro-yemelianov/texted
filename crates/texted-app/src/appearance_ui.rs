@@ -34,7 +34,11 @@ const PRESET: usize = STYLE_FIELDS;
 const FRAME_RATE: usize = STYLE_FIELDS + 1;
 const TIME: usize = STYLE_FIELDS + 2;
 const FIRST_EFFECT: usize = STYLE_FIELDS + 3;
-const FIELDS: usize = FIRST_EFFECT + Effect::ALL.len();
+/// Chrome: ShaderWallpaper's text and border shadow.
+const SHADOW: usize = FIRST_EFFECT + Effect::ALL.len();
+const SHADOW_X: usize = SHADOW + 1;
+const SHADOW_Y: usize = SHADOW + 2;
+const FIELDS: usize = SHADOW + 3;
 /// Rows shown at once; the Visuals page scrolls through its fields.
 const ROWS: usize = 7;
 struct Panel {
@@ -171,6 +175,9 @@ enum Value {
     Time(Option<u32>),
     /// An effect by its Effect::ALL index, at a step of its range.
     Effect(usize, u16),
+    Shadow(bool),
+    /// A shadow offset in font pixels; `true` is horizontal.
+    Offset(bool, u8),
 }
 struct Choice {
     label: String,
@@ -416,6 +423,9 @@ impl AppearanceUi {
             }
             FRAME_RATE => Value::Fps(self.settings.visuals().fps),
             TIME => Value::Time(self.settings.visuals().time),
+            SHADOW => Value::Shadow(self.settings.visuals().shadow),
+            SHADOW_X => Value::Offset(true, self.settings.visuals().shadow_x),
+            SHADOW_Y => Value::Offset(false, self.settings.visuals().shadow_y),
             field => {
                 let index = field - FIRST_EFFECT;
                 let effect = Effect::ALL[index];
@@ -463,6 +473,8 @@ impl AppearanceUi {
                 let effect = Effect::ALL[index];
                 effect.label(effect.get(&v.effects))
             }
+            Value::Shadow(on) => if on { "On" } else { "Off" }.into(),
+            Value::Offset(_, pixels) => pixels.to_string(),
             _ => String::new(),
         }
     }
@@ -554,6 +566,13 @@ impl AppearanceUi {
                     Choice::new(format!("{hour:02}:00"), Value::Time(Some(hour * 3600)))
                 }))
                 .collect(),
+            SHADOW => [false, true]
+                .into_iter()
+                .map(|on| Choice::new(if on { "On" } else { "Off" }.into(), Value::Shadow(on)))
+                .collect(),
+            SHADOW_X | SHADOW_Y => (0..=4)
+                .map(|n| Choice::new(n.to_string(), Value::Offset(row == SHADOW_X, n)))
+                .collect(),
             field if field >= FIRST_EFFECT => {
                 let index = field - FIRST_EFFECT;
                 let effect = Effect::ALL[index];
@@ -634,6 +653,9 @@ impl AppearanceUi {
                 let effect = Effect::ALL[index];
                 effect.set(&mut self.visuals_mut().effects, effect.value_at(step));
             }
+            Value::Shadow(on) => self.visuals_mut().shadow = on,
+            Value::Offset(true, n) => self.visuals_mut().shadow_x = n,
+            Value::Offset(false, n) => self.visuals_mut().shadow_y = n,
             Value::Font(font) => {
                 let t = self.settings.editor_typography_mut();
                 let zoom = t.scale_percent();
@@ -1276,7 +1298,7 @@ impl AppearanceUi {
 fn field_title(field: usize, compact: bool) -> &'static str {
     const COMPACT: [&str; FIELDS] = [
         "Theme", "Screen", "Font", "Size", "Spacing", "Cursor", "Preset", "FPS", "Time", "Bright",
-        "Curve", "Aberr", "Glow", "Noise", "Flicker", "Scan",
+        "Curve", "Aberr", "Glow", "Noise", "Flicker", "Scan", "Shadow", "Shad X", "Shad Y",
     ];
     const FULL: [&str; FIELDS] = [
         "Theme",
@@ -1295,6 +1317,9 @@ fn field_title(field: usize, compact: bool) -> &'static str {
         "Noise",
         "Flicker",
         "Scanlines",
+        "Shadow",
+        "Shadow X",
+        "Shadow Y",
     ];
     if compact {
         COMPACT[field]
@@ -1608,6 +1633,18 @@ mod tests {
         ui.reset();
         assert_eq!(ui.settings.visuals(), Machine::ZxSpectrum.visuals());
         assert_eq!(ui.settings.theme, Theme::ZxSpectrum);
+    }
+    #[test]
+    fn shadow_rows_switch_it_and_set_its_offsets() {
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        pick(&mut ui, SHADOW, "On");
+        pick(&mut ui, SHADOW_X, "2");
+        pick(&mut ui, SHADOW_Y, "0");
+        let v = ui.settings.visuals();
+        assert_eq!((v.shadow, v.shadow_x, v.shadow_y), (true, 2, 0));
+        assert_eq!(ui.field_text(SHADOW), "On");
+        assert_eq!(ui.field_text(SHADOW_X), "2");
     }
     #[test]
     fn terminals_show_visuals_as_window_only() {

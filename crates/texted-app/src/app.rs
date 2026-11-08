@@ -1851,6 +1851,13 @@ impl App {
             .search
             .state
             .set_view(&p.snapshot, &frame.layout);
+        let visuals = self.appearance.settings.visuals();
+        self.draws.shadow =
+            (visuals.shadow && !self.window.is_terminal()).then_some(crate::graphics::TextShadow {
+                x: visuals.shadow_x,
+                y: visuals.shadow_y,
+                color: self.appearance.palette.shadow,
+            });
         editor_view::paint(
             &mut self.draws,
             &mut self.font,

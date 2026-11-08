@@ -104,6 +104,12 @@ impl Theme {
             status_border: muted,
             status_text: fg,
             status_accent: accent,
+            // ShaderWallpaper's machines shadow with black; a light screen needs grey.
+            shadow: if self == Self::ModernLight {
+                0xb0b0b0
+            } else {
+                0x000000
+            },
         }
     }
 }
@@ -130,6 +136,8 @@ pub struct Palette {
     pub status_border: u32,
     pub status_text: u32,
     pub status_accent: u32,
+    /// Behind shadowed text and borders, as ShaderWallpaper's palette `shadow`.
+    pub shadow: u32,
 }
 impl Default for Palette {
     fn default() -> Self {
@@ -155,6 +163,7 @@ impl Default for Palette {
             status_border: 0x282828,
             status_text: 0x888888,
             status_accent: 0x569cd6,
+            shadow: 0,
         }
     }
 }
@@ -182,6 +191,7 @@ impl Palette {
             "status_border" => &mut self.status_border,
             "status_text" => &mut self.status_text,
             "status_accent" => &mut self.status_accent,
+            "shadow" => &mut self.shadow,
             _ => return Err(format!("Unknown appearance color: {key}")),
         };
         *slot = value;
@@ -551,6 +561,20 @@ mod tests {
             serde_json::from_str::<Appearance>(&serde_json::to_string(&a).unwrap()).unwrap(),
             a
         );
+    }
+    #[test]
+    fn every_theme_has_a_shadow_color_and_it_can_be_overridden() {
+        for theme in Theme::ALL {
+            let expected = if theme == Theme::ModernLight {
+                0xb0b0b0
+            } else {
+                0x000000
+            };
+            assert_eq!(theme.palette().shadow, expected, "{theme:?}");
+        }
+        let mut a = Appearance::default();
+        a.colors.insert("shadow".into(), "#203040".into());
+        assert_eq!(a.palette().unwrap().shadow, 0x203040);
     }
     #[test]
     fn visuals_are_saved_and_older_crt_files_migrate() {

@@ -273,7 +273,6 @@ impl Machine {
         };
         Visuals {
             fps,
-            time: None,
             effects: VisualEffects {
                 brightness,
                 curvature,
@@ -283,6 +282,8 @@ impl Machine {
                 flicker,
                 scanlines,
             },
+            shadow: true,
+            ..Visuals::default()
         }
     }
 }
@@ -295,6 +296,10 @@ pub struct Visuals {
     /// A fixed time of day in seconds for every moving effect; `None` follows the clock.
     pub time: Option<u32>,
     pub effects: VisualEffects,
+    /// Chrome shadow: text drawn again behind itself, offset in font pixels (0 to 4).
+    pub shadow: bool,
+    pub shadow_x: u8,
+    pub shadow_y: u8,
 }
 impl Default for Visuals {
     fn default() -> Self {
@@ -302,6 +307,9 @@ impl Default for Visuals {
             fps: 12,
             time: None,
             effects: VisualEffects::NEUTRAL,
+            shadow: false,
+            shadow_x: 1,
+            shadow_y: 1,
         }
     }
 }
@@ -319,6 +327,9 @@ impl Visuals {
             fps: self.fps.clamp(4, 30),
             time: self.time.map(|t| t.min(86_399)),
             effects: self.effects.normalized(),
+            shadow_x: self.shadow_x.min(4),
+            shadow_y: self.shadow_y.min(4),
+            ..self
         }
     }
     /// The machine whose effect amounts these are, if any.
@@ -444,6 +455,25 @@ mod tests {
         assert_eq!(fixed.effect_time(100.123), 3600.0);
         assert!(!Machine::MacSystem2.visuals().effects.is_neutral());
         assert!(!Visuals::default().animated());
+    }
+    #[test]
+    fn machines_turn_on_the_wallpaper_shadow_and_other_themes_leave_it_off() {
+        for machine in Machine::ALL {
+            let v = machine.visuals();
+            assert_eq!(
+                (v.shadow, v.shadow_x, v.shadow_y),
+                (true, 1, 1),
+                "{machine:?}"
+            );
+        }
+        assert!(!Visuals::for_theme(Theme::GreenCrt).shadow);
+        let far = Visuals {
+            shadow_x: 9,
+            shadow_y: 7,
+            ..Visuals::default()
+        }
+        .normalized();
+        assert_eq!((far.shadow_x, far.shadow_y), (4, 4));
     }
     #[test]
     fn stored_values_are_pulled_into_range() {

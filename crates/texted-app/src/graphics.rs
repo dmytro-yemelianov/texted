@@ -30,11 +30,20 @@ pub(crate) struct Draw {
     pub glyph: Option<Arc<CachedGlyph>>,
     pub crop: [f32; 4],
 }
+/// ShaderWallpaper's text shadow: an offset in font pixels and the palette's shadow color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TextShadow {
+    pub x: u8,
+    pub y: u8,
+    pub color: u32,
+}
 #[derive(Default)]
 pub(crate) struct DrawList {
     pub clear: u32,
     pub draws: Vec<Draw>,
     pub cells: Vec<CellCommand>,
+    /// Set by the window per frame and kept across `reset`; terminal cells never get it.
+    pub shadow: Option<TextShadow>,
 }
 impl DrawList {
     pub fn reset(&mut self, clear: u32) {
@@ -314,13 +323,32 @@ impl FontEngine {
             return;
         }
         let glyph = self.glyph(ch);
+        let size = [
+            glyph.width as f32 * self.render_scale,
+            glyph.height as f32 * self.render_scale,
+        ];
+        // Like ShaderWallpaper, a shadow farther than a quarter of the cell is not drawn.
+        let shadow = buffer.shadow.filter(|s| {
+            (s.x > 0 || s.y > 0)
+                && u16::from(s.x) <= (self.face.width / 4).max(1)
+                && u16::from(s.y) <= (self.face.height / 4).max(1)
+        });
+        if let Some(shadow) = shadow {
+            let pixel = self.pixel_px();
+            buffer.push(
+                [
+                    x as f32 + f32::from(shadow.x) * pixel,
+                    y as f32 + f32::from(shadow.y) * pixel,
+                    size[0],
+                    size[1],
+                ],
+                [stride as f32, max_height as f32],
+                shadow.color,
+                Some(glyph.clone()),
+            );
+        }
         buffer.push(
-            [
-                x as f32,
-                y as f32,
-                glyph.width as f32 * self.render_scale,
-                glyph.height as f32 * self.render_scale,
-            ],
+            [x as f32, y as f32, size[0], size[1]],
             [stride as f32, max_height as f32],
             color,
             Some(glyph),
@@ -434,6 +462,47 @@ pub(crate) fn draw_box(
 mod tests {
     use super::*;
     use texted_app::appearance::FontFamily;
+    #[test]
+    fn a_text_shadow_draws_each_glyph_offset_first_in_the_shadow_color() {
+        let mut font = FontEngine::with_typography(Typography {
+            family: FontFamily::Bios,
+            size_px: 8,
+            line_spacing: 100,
+            zoom_percent: 200,
+        });
+        let pixel = font.pixel_px();
+        let mut list = DrawList {
+            shadow: Some(TextShadow {
+                x: 1,
+                y: 2,
+                color: 0x123456,
+            }),
+            ..Default::default()
+        };
+        font.draw_char(&mut list, 400, 400, 10, 20, 'A', 0xffffff);
+        let drawn: Vec<_> = list
+            .draws
+            .iter()
+            .map(|d| (d.rect[0], d.rect[1], d.color))
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                (10.0 + pixel, 20.0 + 2.0 * pixel, 0x123456),
+                (10.0, 20.0, 0xffffff)
+            ]
+        );
+        assert_eq!(list.cells.len(), 1, "terminal cells get no shadow");
+        // ShaderWallpaper skips a shadow farther than a quarter of the cell.
+        list.draws.clear();
+        list.shadow = Some(TextShadow {
+            x: 3,
+            y: 1,
+            color: 0x123456,
+        });
+        font.draw_char(&mut list, 400, 400, 10, 20, 'A', 0xffffff);
+        assert_eq!(list.draws.len(), 1);
+    }
     #[test]
     fn tiny_and_tall_native_strikes_preserve_their_extreme_columns() {
         for (width, height, size) in [(1u16, 1u16, 64u16), (128, 96, 96)] {
