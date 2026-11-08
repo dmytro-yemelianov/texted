@@ -83,6 +83,9 @@ pub(crate) struct App {
     key_function: Option<usize>,
     mouse_function: Option<usize>,
     command_flash: Option<(usize, Instant)>,
+    /// Start of animated screen effects, and the time last drawn; it stops while unfocused.
+    effect_clock: Instant,
+    effect_time: f32,
     // Destroy the main-thread window last, after the renderer and document state.
     // Worker callbacks must notify `wake`, never capture this native window.
     window: Arc<Host>,
@@ -167,8 +170,7 @@ impl App {
         };
         let size = window.inner_size();
         let display =
-            ScreenMapping::new((size.width, size.height), appearance.settings.resolution())
-                .with_crt(appearance.settings.crt);
+            ScreenMapping::new((size.width, size.height), appearance.settings.resolution());
         let w = wake.clone();
         let stats = texted_app::document_stats::DocumentStats::new(move || w());
         session.message = warning;
@@ -213,7 +215,24 @@ impl App {
             key_function: None,
             mouse_function: None,
             command_flash: None,
+            effect_clock: Instant::now(),
+            effect_time: 0.0,
         }
+    }
+    /// Screen effects belong to the window backend; terminals draw the flat picture.
+    fn with_effects(&mut self, mapping: ScreenMapping) -> ScreenMapping {
+        if self.window.is_terminal() {
+            return mapping;
+        }
+        let effects = self.appearance.settings.visual_effects();
+        if !effects.animated() {
+            self.effect_time = 0.0;
+        } else if self.focused {
+            // Wrapped so f32 keeps sub-millisecond precision for the fast flicker term.
+            self.effect_time = self.effect_clock.elapsed().as_secs_f32() % 3600.0;
+        }
+        let pixel = self.font.pixel_px() * mapping.scale().0;
+        mapping.with_effects(effects, self.effect_time, pixel)
     }
     fn resolution(&self) -> Option<(u32, u32)> {
         if self.window.is_cells() {
@@ -1794,8 +1813,10 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        let display = ScreenMapping::new((size.width, size.height), self.resolution())
-            .with_crt(self.appearance.settings.crt);
+        let display = self.with_effects(ScreenMapping::new(
+            (size.width, size.height),
+            self.resolution(),
+        ));
         let (width, scene_height) = display.source;
         let geometry = crate::chrome::Geometry::new(
             width as usize,
@@ -1951,6 +1972,10 @@ impl App {
                     .geometry()
                     .document_point(self.display.to_source_clamped(self.pointer_physical));
                 self.update_cursor();
+                // Noise and flicker move every frame, but only while the window is in use.
+                if display.effects.animated() && self.focused {
+                    self.window.request_redraw();
+                }
             }
             Ok(false) => self.window.request_redraw(),
             Err(error) => {

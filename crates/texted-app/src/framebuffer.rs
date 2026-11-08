@@ -66,8 +66,92 @@ impl Framebuffer {
         }
     }
 }
-/// A simulated tube for limited-resolution screens: curved glass, scanlines, darker corners
-/// and phosphor glow. The window backend draws it; terminals show the flat picture.
+/// Screen effects ported from ShaderWallpaper's shader, with its ranges. Neutral values
+/// (brightness 1, everything else 0) draw the exact picture.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VisualEffects {
+    pub brightness: f32,
+    pub curvature: f32,
+    pub chromatic_aberration: f32,
+    pub afterglow: f32,
+    pub noise: f32,
+    pub flicker: f32,
+    pub scanlines: f32,
+}
+impl Default for VisualEffects {
+    fn default() -> Self {
+        Self::NEUTRAL
+    }
+}
+impl VisualEffects {
+    pub const NEUTRAL: Self = Self {
+        brightness: 1.0,
+        curvature: 0.0,
+        chromatic_aberration: 0.0,
+        afterglow: 0.0,
+        noise: 0.0,
+        flicker: 0.0,
+        scanlines: 0.0,
+    };
+    /// The values tuned in ShaderWallpaper's Visuals tab.
+    pub const WALLPAPER: Self = Self {
+        brightness: 0.96,
+        curvature: 0.014,
+        chromatic_aberration: 0.18,
+        afterglow: 0.12,
+        noise: 0.55,
+        flicker: 0.45,
+        scanlines: 0.42,
+    };
+    /// Pulls every amount into ShaderWallpaper's range; a non-number takes the neutral value.
+    pub fn normalized(self) -> Self {
+        let fit = |value: f32, low: f32, high: f32, neutral: f32| {
+            if value.is_finite() {
+                value.clamp(low, high)
+            } else {
+                neutral
+            }
+        };
+        Self {
+            brightness: fit(self.brightness, 0.5, 1.6, 1.0),
+            curvature: fit(self.curvature, 0.0, 0.08, 0.0),
+            chromatic_aberration: fit(self.chromatic_aberration, 0.0, 1.5, 0.0),
+            afterglow: fit(self.afterglow, 0.0, 1.2, 0.0),
+            noise: fit(self.noise, 0.0, 2.0, 0.0),
+            flicker: fit(self.flicker, 0.0, 2.0, 0.0),
+            scanlines: fit(self.scanlines, 0.0, 1.25, 0.0),
+        }
+    }
+    pub fn is_neutral(&self) -> bool {
+        *self == Self::NEUTRAL
+    }
+    /// Noise and flicker change every frame; without them the picture stays still.
+    pub fn animated(&self) -> bool {
+        self.noise > 0.0 || self.flicker > 0.0
+    }
+    /// The shader's pillow distortion with its slow drift at rest (1 + 0.4 x 0.5).
+    fn pillow(&self) -> f32 {
+        self.curvature * 1.2
+    }
+    /// The picture point shown at screen point `(u, v)`, 0..1 each, as presentation.wgsl bends it.
+    fn bend(&self, (u, v): (f32, f32)) -> (f32, f32) {
+        let (x, y) = (u * 2.0 - 1.0, v * 2.0 - 1.0);
+        let f = 1.0 + self.pillow() * (x * x + y * y);
+        (x * f * 0.5 + 0.5, y * f * 0.5 + 0.5)
+    }
+    /// The inverse of `bend` by fixed-point iteration, which converges fast for small curvature.
+    fn unbend(&self, (u, v): (f32, f32)) -> (f32, f32) {
+        let (tx, ty) = (u * 2.0 - 1.0, v * 2.0 - 1.0);
+        let (mut x, mut y) = (tx, ty);
+        for _ in 0..8 {
+            let f = 1.0 + self.pillow() * (x * x + y * y);
+            (x, y) = (tx / f, ty / f);
+        }
+        (x * 0.5 + 0.5, y * 0.5 + 0.5)
+    }
+}
+/// The CRT effect row: presets, or the `effects` block of appearance.json for Custom.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CrtEffect {
@@ -75,43 +159,49 @@ pub enum CrtEffect {
     Off,
     Subtle,
     Strong,
+    Wallpaper,
+    Custom,
 }
 impl CrtEffect {
-    pub const ALL: [Self; 3] = [Self::Off, Self::Subtle, Self::Strong];
+    pub const ALL: [Self; 5] = [
+        Self::Off,
+        Self::Subtle,
+        Self::Strong,
+        Self::Wallpaper,
+        Self::Custom,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             Self::Off => "Off",
             Self::Subtle => "Subtle",
             Self::Strong => "Strong",
+            Self::Wallpaper => "Wallpaper",
+            Self::Custom => "Custom",
         }
     }
-    /// Curvature, scanline depth, vignette and glow, in the shader's uniform order.
-    pub fn params(self) -> [f32; 4] {
+    /// Subtle and Strong stay still; Wallpaper moves like the desktop it came from.
+    pub fn effects(self, custom: VisualEffects) -> VisualEffects {
+        let neutral = VisualEffects::NEUTRAL;
         match self {
-            Self::Off => [0.0; 4],
-            Self::Subtle => [0.03, 0.25, 0.2, 0.15],
-            Self::Strong => [0.08, 0.5, 0.4, 0.3],
+            Self::Off => neutral,
+            Self::Subtle => VisualEffects {
+                curvature: 0.012,
+                chromatic_aberration: 0.1,
+                afterglow: 0.1,
+                scanlines: 0.3,
+                ..neutral
+            },
+            Self::Strong => VisualEffects {
+                brightness: 1.05,
+                curvature: 0.04,
+                chromatic_aberration: 0.5,
+                afterglow: 0.4,
+                scanlines: 0.8,
+                ..neutral
+            },
+            Self::Wallpaper => VisualEffects::WALLPAPER,
+            Self::Custom => custom.normalized(),
         }
-    }
-    /// The picture point shown at screen point `(u, v)` (0..1 each); presentation.wgsl matches it.
-    fn bend(self, (u, v): (f32, f32)) -> (f32, f32) {
-        let k = self.params()[0];
-        let (x, y) = (u * 2.0 - 1.0, v * 2.0 - 1.0);
-        (
-            x * (1.0 + k * y * y) * 0.5 + 0.5,
-            y * (1.0 + k * x * x) * 0.5 + 0.5,
-        )
-    }
-    /// The inverse of `bend` by fixed-point iteration, which converges fast for small curvature.
-    fn unbend(self, (u, v): (f32, f32)) -> (f32, f32) {
-        let k = self.params()[0];
-        let (tx, ty) = (u * 2.0 - 1.0, v * 2.0 - 1.0);
-        let (mut x, mut y) = (tx, ty);
-        for _ in 0..8 {
-            x = tx / (1.0 + k * y * y);
-            y = ty / (1.0 + k * x * x);
-        }
-        (x * 0.5 + 0.5, y * 0.5 + 0.5)
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -119,7 +209,10 @@ pub struct ScreenMapping {
     pub source: (u32, u32),
     pub destination: (u32, u32, u32, u32),
     pub pixelated: bool,
-    pub crt: CrtEffect,
+    pub effects: VisualEffects,
+    /// Seconds for animated effects, and one font pixel in window pixels for their size.
+    pub effect_time: f32,
+    pub effect_pixel: f32,
 }
 impl ScreenMapping {
     pub fn new(window: (u32, u32), resolution: Option<(u32, u32)>) -> Self {
@@ -129,7 +222,9 @@ impl ScreenMapping {
                 source: (width, height),
                 destination: (0, 0, width, height),
                 pixelated: false,
-                crt: CrtEffect::Off,
+                effects: VisualEffects::NEUTRAL,
+                effect_time: 0.0,
+                effect_pixel: 1.0,
             };
         };
         // Fill one window dimension, preserving the source aspect to physical-pixel precision.
@@ -149,15 +244,20 @@ impl ScreenMapping {
             source: (w, h),
             destination: ((width - dw) / 2, (height - dh) / 2, dw, dh),
             pixelated: true,
-            crt: CrtEffect::Off,
+            effects: VisualEffects::NEUTRAL,
+            effect_time: 0.0,
+            effect_pixel: 1.0,
         }
     }
-    /// The effect applies only to limited-resolution screens, which have a presentation pass.
-    pub fn with_crt(mut self, crt: CrtEffect) -> Self {
-        if self.pixelated {
-            self.crt = crt;
-        }
+    /// Effects for the window backend; native and limited-resolution screens both get them.
+    pub fn with_effects(mut self, effects: VisualEffects, time: f32, pixel: f32) -> Self {
+        self.effects = effects;
+        self.effect_time = time;
+        self.effect_pixel = pixel.max(1.0);
         self
+    }
+    fn bent(self) -> bool {
+        self.effects.curvature > 0.0
     }
     pub fn scale(self) -> (f32, f32) {
         (
@@ -170,8 +270,8 @@ impl ScreenMapping {
         if x < dx as f32 || y < dy as f32 || x >= (dx + w) as f32 || y >= (dy + h) as f32 {
             return None;
         }
-        if self.crt != CrtEffect::Off {
-            let (u, v) = self.crt.bend(self.screen_fraction((x, y)));
+        if self.bent() {
+            let (u, v) = self.effects.bend(self.screen_fraction((x, y)));
             if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                 return None; // Black glass beyond the curved picture.
             }
@@ -188,8 +288,8 @@ impl ScreenMapping {
             (x - self.destination.0 as f32) / sx,
             (y - self.destination.1 as f32) / sy,
         );
-        if self.crt != CrtEffect::Off {
-            let (u, v) = self.crt.bend(self.screen_fraction((x, y)));
+        if self.bent() {
+            let (u, v) = self.effects.bend(self.screen_fraction((x, y)));
             (px, py) = (u * self.source.0 as f32, v * self.source.1 as f32);
         }
         (
@@ -199,9 +299,9 @@ impl ScreenMapping {
     }
     pub fn to_window(self, (x, y): (f32, f32)) -> (f32, f32) {
         let (sx, sy) = self.scale();
-        if self.crt != CrtEffect::Off {
+        if self.bent() {
             let (u, v) = self
-                .crt
+                .effects
                 .unbend((x / self.source.0 as f32, y / self.source.1 as f32));
             let (dx, dy, w, h) = self.destination;
             return (dx as f32 + u * w as f32, dy as f32 + v * h as f32);
@@ -257,33 +357,60 @@ mod tests {
         }
     }
     #[test]
-    fn crt_curvature_maps_clicks_where_the_bent_picture_shows_them() {
-        let flat = ScreenMapping::new((640, 480), Some((640, 480)));
-        let bent = flat.with_crt(CrtEffect::Strong);
-        assert_eq!(bent.to_source((320.0, 240.0)), Some((320.0, 240.0)));
-        // Near a corner the picture is pushed outward, so a click there lands nearer the edge.
-        let (fx, fy) = flat.to_source((40.0, 40.0)).unwrap();
-        let (bx, by) = bent.to_source((40.0, 40.0)).unwrap();
-        assert!(bx < fx && by < fy, "{bx},{by} vs {fx},{fy}");
-        // The very corner shows black glass, not the picture.
-        assert!(bent.to_source((1.0, 1.0)).is_none());
-        // A keyboard-placed popup goes to the window and back to the same scene point.
-        let p = (100.0, 80.0);
-        let q = bent.to_source_clamped(bent.to_window(p));
-        assert!(
-            (p.0 - q.0).abs() < 0.01 && (p.1 - q.1).abs() < 0.01,
-            "{q:?}"
-        );
+    fn curvature_maps_clicks_where_the_bent_picture_shows_them() {
+        let strong = CrtEffect::Strong.effects(VisualEffects::NEUTRAL);
+        // Limited-resolution and Native screens bend the same way.
+        for flat in [
+            ScreenMapping::new((640, 480), Some((640, 480))),
+            ScreenMapping::new((640, 480), None),
+        ] {
+            let bent = flat.with_effects(strong, 0.0, 1.0);
+            assert_eq!(bent.to_source((320.0, 240.0)), Some((320.0, 240.0)));
+            // Near a corner the picture is pushed outward, so a click there lands nearer the edge.
+            let (fx, fy) = flat.to_source((40.0, 40.0)).unwrap();
+            let (bx, by) = bent.to_source((40.0, 40.0)).unwrap();
+            assert!(bx < fx && by < fy, "{bx},{by} vs {fx},{fy}");
+            // The very corner shows black glass, not the picture.
+            assert!(bent.to_source((1.0, 1.0)).is_none());
+            // A keyboard-placed popup goes to the window and back to the same scene point.
+            let p = (100.0, 80.0);
+            let q = bent.to_source_clamped(bent.to_window(p));
+            assert!(
+                (p.0 - q.0).abs() < 0.01 && (p.1 - q.1).abs() < 0.01,
+                "{q:?}"
+            );
+            let off = flat.with_effects(VisualEffects::NEUTRAL, 0.0, 1.0);
+            assert_eq!(off.to_source((40.0, 40.0)), Some((fx, fy)));
+        }
+    }
+    #[test]
+    fn presets_and_custom_values_stay_inside_shaderwallpaper_ranges() {
+        let wallpaper = CrtEffect::Wallpaper.effects(VisualEffects::NEUTRAL);
         assert_eq!(
-            flat.with_crt(CrtEffect::Off).to_source((40.0, 40.0)),
-            Some((fx, fy))
+            wallpaper,
+            VisualEffects {
+                brightness: 0.96,
+                curvature: 0.014,
+                chromatic_aberration: 0.18,
+                afterglow: 0.12,
+                noise: 0.55,
+                flicker: 0.45,
+                scanlines: 0.42,
+            }
         );
-        // Native windows have no presentation pass, so they stay flat.
+        assert!(wallpaper.animated());
+        assert!(!CrtEffect::Strong.effects(wallpaper).animated());
+        assert!(CrtEffect::Off.effects(wallpaper).is_neutral());
+        let wild = VisualEffects {
+            brightness: 9.0,
+            curvature: -1.0,
+            noise: f32::NAN,
+            ..VisualEffects::NEUTRAL
+        };
+        let custom = CrtEffect::Custom.effects(wild);
         assert_eq!(
-            ScreenMapping::new((640, 480), None)
-                .with_crt(CrtEffect::Strong)
-                .crt,
-            CrtEffect::Off
+            (custom.brightness, custom.curvature, custom.noise),
+            (1.6, 0.0, 0.0)
         );
     }
     #[test]

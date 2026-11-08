@@ -562,9 +562,9 @@ impl Renderer {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Texted frame"),
                 });
-        if mapping.pixelated {
-            self.presenter
-                .set_crt(&self.painter.queue, mapping.crt.params());
+        // Native screens take the extra pass only while an effect is on.
+        if mapping.pixelated || !mapping.effects.is_neutral() {
+            self.presenter.set_effects(&self.painter.queue, &mapping);
             let source = self.presenter.source(&self.painter.device, mapping.source);
             self.painter.encode(&mut encoder, source, list.clear);
             self.presenter.encode(&mut encoder, &view, mapping);
@@ -607,7 +607,7 @@ mod tests {
     #[ignore = "Requires a real Metal GPU; run explicitly on a Mac"]
     fn metal_crt_curves_the_picture_and_darkens_its_corners() {
         pollster::block_on(async {
-            use texted_app::framebuffer::{CrtEffect, ScreenMapping};
+            use texted_app::framebuffer::{CrtEffect, ScreenMapping, VisualEffects};
             let adapter = instance()
                 .request_adapter(&wgpu::RequestAdapterOptions::default())
                 .await
@@ -641,8 +641,9 @@ mod tests {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            let mapping = ScreenMapping::new((64, 64), Some((8, 8))).with_crt(CrtEffect::Strong);
-            presenter.set_crt(&painter.queue, mapping.crt.params());
+            let strong = CrtEffect::Strong.effects(VisualEffects::NEUTRAL);
+            let mapping = ScreenMapping::new((64, 64), Some((8, 8))).with_effects(strong, 0.0, 8.0);
+            presenter.set_effects(&painter.queue, &mapping);
             let mut encoder = device.create_command_encoder(&Default::default());
             let source = presenter.source(&device, (8, 8));
             painter.encode(&mut encoder, source, list.clear);
@@ -678,9 +679,10 @@ mod tests {
             let pixel = |x: usize, y: usize| bytes[(y * 64 + x) * 4];
             assert_eq!(pixel(0, 0), 0, "the corner is black glass");
             assert!(pixel(32, 32) > 0x80, "the centre keeps the picture");
+            // Rows alternate every 1.5 window pixels: row 32 is lit, row 33 is a scanline.
             assert!(
-                pixel(4, 32) < pixel(32, 32),
-                "the edges are darker than the centre"
+                pixel(32, 33) < pixel(32, 32),
+                "scanlines darken alternate rows"
             );
             drop(bytes);
             presenter.release();

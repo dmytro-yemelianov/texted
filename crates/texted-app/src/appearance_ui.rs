@@ -1296,7 +1296,7 @@ mod tests {
             ..Default::default()
         });
         let labels: Vec<_> = ui.choices(6).iter().map(|c| c.label.clone()).collect();
-        assert_eq!(labels, ["Off", "Subtle", "Strong"]);
+        assert_eq!(labels, ["Off", "Subtle", "Strong", "Wallpaper", "Custom"]);
         ui.set_open(true);
         ui.open_dropdown(6, 320, 200, true);
         let d = ui.dropdown.unwrap();

@@ -3,8 +3,8 @@ use texted_app::framebuffer::ScreenMapping;
 pub(crate) struct PixelPresenter {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    /// Four floats for the CRT pass; new buffers start zeroed, which draws flat.
-    crt: wgpu::Buffer,
+    /// Sixteen floats for the effect pass; new buffers start zeroed, which draws flat.
+    effects: wgpu::Buffer,
     format: wgpu::TextureFormat,
     target: Option<Target>,
 }
@@ -41,9 +41,9 @@ impl PixelPresenter {
                 },
             ],
         });
-        let crt = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("crt effect"),
-            size: 16,
+        let effects = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("screen effects"),
+            size: 64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -84,7 +84,7 @@ impl PixelPresenter {
         Self {
             pipeline,
             layout,
-            crt,
+            effects,
             format,
             target: None,
         }
@@ -117,7 +117,7 @@ impl PixelPresenter {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: self.crt.as_entire_binding(),
+                        resource: self.effects.as_entire_binding(),
                     },
                 ],
             });
@@ -130,9 +130,28 @@ impl PixelPresenter {
         }
         &self.target.as_ref().unwrap().view
     }
-    /// Curvature, scanlines, vignette and glow for the next presentation; zeros draw it flat.
-    pub fn set_crt(&self, queue: &wgpu::Queue, params: [f32; 4]) {
-        queue.write_buffer(&self.crt, 0, bytemuck::cast_slice(&params));
+    /// Effect amounts, time and pixel size for the next presentation, in presentation.wgsl order.
+    pub fn set_effects(&self, queue: &wgpu::Queue, mapping: &ScreenMapping) {
+        let e = mapping.effects;
+        let params: [f32; 16] = [
+            e.brightness,
+            e.curvature,
+            e.chromatic_aberration,
+            e.afterglow,
+            e.noise,
+            e.flicker,
+            e.scanlines,
+            mapping.effect_time,
+            mapping.effect_pixel,
+            f32::from(u8::from(!e.is_neutral())),
+            f32::from(u8::from(e.animated())),
+            0.0,
+            mapping.destination.2 as f32,
+            mapping.destination.3 as f32,
+            0.0,
+            0.0,
+        ];
+        queue.write_buffer(&self.effects, 0, bytemuck::cast_slice(&params));
     }
     pub fn release(&mut self) {
         self.target = None;

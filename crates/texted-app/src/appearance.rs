@@ -360,7 +360,7 @@ impl MouseCursor {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Appearance {
     pub version: u32,
@@ -368,8 +368,11 @@ pub struct Appearance {
     pub mouse_cursor: MouseCursor,
     pub typography: Typography,
     pub framebuffer: Framebuffer,
-    /// Tube simulation for limited-resolution screens; older files without it load as Off.
+    /// Screen effect preset; older files without it load as Off.
     pub crt: crate::framebuffer::CrtEffect,
+    /// Amounts used when `crt` is Custom, edited in the file like custom colors.
+    #[serde(skip_serializing_if = "crate::framebuffer::VisualEffects::is_neutral")]
+    pub effects: crate::framebuffer::VisualEffects,
     pub pixel_typography: Typography,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub colors: BTreeMap<String, String>,
@@ -383,6 +386,7 @@ impl Default for Appearance {
             typography: Typography::default(),
             framebuffer: Framebuffer::default(),
             crt: Default::default(),
+            effects: Default::default(),
             pixel_typography: Typography {
                 family: FontFamily::Bios,
                 size_px: 8,
@@ -394,6 +398,10 @@ impl Default for Appearance {
     }
 }
 impl Appearance {
+    /// The screen effects to draw: a preset, or the Custom amounts.
+    pub fn visual_effects(&self) -> crate::framebuffer::VisualEffects {
+        self.crt.effects(self.effects)
+    }
     pub fn resolution(&self) -> Option<(u32, u32)> {
         self.framebuffer.resolve(self.theme)
     }
@@ -543,6 +551,28 @@ mod tests {
         let json = serde_json::to_string(&a).unwrap();
         assert!(json.contains(r#""crt":"strong""#), "{json}");
         assert_eq!(serde_json::from_str::<Appearance>(&json).unwrap(), a);
+    }
+    #[test]
+    fn custom_effects_come_from_the_file_and_neutral_ones_are_not_written() {
+        use crate::framebuffer::{CrtEffect, VisualEffects};
+        let file = r#"{"crt":"custom","effects":{"curvature":0.05,"noise":0.3}}"#;
+        let a: Appearance = serde_json::from_str(file).unwrap();
+        assert_eq!(a.crt, CrtEffect::Custom);
+        let effects = a.visual_effects();
+        assert_eq!(
+            (effects.curvature, effects.noise, effects.brightness),
+            (0.05, 0.3, 1.0)
+        );
+        let wallpaper = Appearance {
+            crt: CrtEffect::Wallpaper,
+            ..Default::default()
+        };
+        assert_eq!(wallpaper.visual_effects(), VisualEffects::WALLPAPER);
+        let json = serde_json::to_string(&wallpaper).unwrap();
+        assert!(
+            json.contains(r#""crt":"wallpaper""#) && !json.contains("effects"),
+            "{json}"
+        );
     }
     #[test]
     fn future_versions_unknown_colors_and_invalid_rgb_are_rejected() {

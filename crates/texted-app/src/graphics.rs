@@ -226,6 +226,10 @@ impl FontEngine {
             x += self.char_width_px * factor;
         }
     }
+    /// One pixel of the bitmap face, in scene pixels at the current zoom.
+    pub fn pixel_px(&self) -> f32 {
+        self.scale as f32 * self.render_scale
+    }
     pub fn set_zoom(&mut self, percent: u16, line_spacing: u16) {
         self.render_scale = f32::from(percent.clamp(10, 800)) / 100.0;
         self.char_width_px = f32::from(self.face.width) * self.scale as f32 * self.render_scale;
