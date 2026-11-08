@@ -1,0 +1,394 @@
+//! Native menu adapter. All document actions return through the same typed intent path as keys.
+use texted_app::{
+    commands::{DeleteUnit, EditorCommand},
+    input::{FileIntent, Intent},
+};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuCommand {
+    New,
+    Open,
+    Save,
+    SaveAs,
+    Close,
+    Quit,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    Delete,
+    SelectAll,
+    Block,
+    Find,
+    Replace,
+    Next,
+    Previous,
+    Style,
+    ZoomIn,
+    ZoomOut,
+    ResetSize,
+    Wrap,
+    Lines,
+    Diagnostics,
+}
+impl MenuCommand {
+    pub fn intent(self) -> Intent {
+        use MenuCommand::*;
+        match self {
+            New => Intent::File(FileIntent::New),
+            Open => Intent::File(FileIntent::Open),
+            Save | SaveAs => Intent::File(FileIntent::Save {
+                as_new: self == SaveAs,
+            }),
+            Close | Quit => Intent::File(FileIntent::Close),
+            Undo => Intent::Edit(EditorCommand::Undo),
+            Redo => Intent::Edit(EditorCommand::Redo),
+            Cut | Copy => Intent::Copy { cut: self == Cut },
+            Paste => Intent::Paste,
+            Delete => Intent::Edit(EditorCommand::Delete {
+                backward: false,
+                unit: DeleteUnit::Character,
+            }),
+            SelectAll => Intent::Edit(EditorCommand::SelectAll),
+            Block => Intent::Edit(EditorCommand::ToggleBlock),
+            Find => Intent::Find,
+            Replace => Intent::Replace,
+            Next | Previous => Intent::NextMatch {
+                forward: self == Next,
+            },
+            Style => Intent::ToggleAppearance,
+            ZoomIn | ZoomOut => Intent::Zoom(if self == ZoomIn { 1 } else { -1 }),
+            ResetSize => Intent::ResetFontSize,
+            Wrap => Intent::ToggleWrap,
+            Lines => Intent::ToggleLineNumbers,
+            Diagnostics => Intent::ToggleDiagnostics,
+        }
+    }
+}
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MenuState {
+    pub editable: bool,
+    pub style_available: bool,
+    pub clipboard_available: bool,
+    pub selected: bool,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub has_query: bool,
+    pub wrap: bool,
+    pub lines: bool,
+    pub diagnostics: bool,
+    pub block: bool,
+}
+impl MenuState {
+    pub fn enabled(self, command: MenuCommand) -> bool {
+        use MenuCommand::*;
+        match command {
+            New | Open | Save | SaveAs | Close | Quit => true, // FileFlow owns lifecycle barriers.
+            Style | ZoomIn | ZoomOut | ResetSize => self.style_available,
+            Undo => self.editable && self.can_undo,
+            Redo => self.editable && self.can_redo,
+            Cut | Copy => self.editable && self.clipboard_available && self.selected,
+            Delete => self.editable && self.selected,
+            Paste => self.editable && self.clipboard_available,
+            Next | Previous => self.editable && self.has_query,
+            _ => self.editable,
+        }
+    }
+    fn checked(self, command: MenuCommand) -> Option<bool> {
+        match command {
+            MenuCommand::Wrap => Some(self.wrap),
+            MenuCommand::Lines => Some(self.lines),
+            MenuCommand::Diagnostics => Some(self.diagnostics),
+            MenuCommand::Block => Some(self.block),
+            _ => None,
+        }
+    }
+}
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::*;
+    use crate::AppEvent;
+    use muda::{
+        accelerator::{Accelerator, Code, Modifiers},
+        AboutMetadata, CheckMenuItem, ContextMenu, IsMenuItem, Menu, MenuEvent, MenuItem,
+        MenuItemKind, PredefinedMenuItem, Submenu,
+    };
+    use winit::{
+        event_loop::EventLoopProxy,
+        raw_window_handle::{HasWindowHandle, RawWindowHandle},
+        window::Window,
+    };
+    pub(crate) struct NativeMenus {
+        _bar: Menu,
+        context: Menu,
+        items: Vec<(MenuCommand, MenuItemKind)>,
+        state: Option<MenuState>,
+    }
+    fn native(item: &MenuItemKind) -> &dyn IsMenuItem {
+        match item {
+            MenuItemKind::MenuItem(item) => item,
+            MenuItemKind::Check(item) => item,
+            _ => unreachable!("only editor actions are stored"),
+        }
+    }
+    impl NativeMenus {
+        pub fn new(proxy: EventLoopProxy<AppEvent>) -> Result<Self, String> {
+            let bar = Menu::new();
+            let context = Menu::new();
+            let mut items = Vec::new();
+            let app = Submenu::new("Texted", true);
+            let file = Submenu::new("File", true);
+            let edit = Submenu::new("Edit", true);
+            let search = Submenu::new("Search", true);
+            let view = Submenu::new("View", true);
+            let window = Submenu::new("Window", true);
+            let sep = PredefinedMenuItem::separator;
+            app.append(&PredefinedMenuItem::about(
+                Some("About Texted"),
+                Some(AboutMetadata {
+                    name: Some("Texted".into()),
+                    version: Some(env!("CARGO_PKG_VERSION").into()),
+                    ..Default::default()
+                }),
+            ))
+            .map_err(|e| e.to_string())?;
+            // IDs and shortcuts are registered once; shared items synchronize both menu surfaces.
+            let mut add = |menu: &Submenu,
+                           command,
+                           label,
+                           shortcut: Option<(Modifiers, Code)>,
+                           popup: bool|
+             -> Result<MenuItemKind, String> {
+                let accelerator = shortcut.map(|(mods, code)| Accelerator::new(Some(mods), code));
+                let item = if MenuState::default().checked(command).is_some() {
+                    CheckMenuItem::new(label, false, false, accelerator).kind()
+                } else {
+                    MenuItem::new(label, false, accelerator).kind()
+                };
+                menu.append(native(&item)).map_err(|e| e.to_string())?;
+                if popup {
+                    context.append(native(&item)).map_err(|e| e.to_string())?;
+                }
+                items.push((command, item.clone()));
+                Ok(item)
+            };
+            use MenuCommand::*;
+            let cmd = Modifiers::SUPER;
+            let shift = cmd | Modifiers::SHIFT;
+            let style = add(&app, Style, "Style…", Some((cmd, Code::Comma)), false)?;
+            app.append_items(&[
+                &sep(),
+                &PredefinedMenuItem::services(None),
+                &sep(),
+                &PredefinedMenuItem::hide(None),
+                &PredefinedMenuItem::hide_others(None),
+                &PredefinedMenuItem::show_all(None),
+                &sep(),
+            ])
+            .map_err(|e| e.to_string())?;
+            add(&app, Quit, "Quit Texted", Some((cmd, Code::KeyQ)), false)?;
+            add(&file, New, "New", Some((cmd, Code::KeyN)), false)?;
+            add(&file, Open, "Open…", Some((cmd, Code::KeyO)), false)?;
+            file.append(&sep()).map_err(|e| e.to_string())?;
+            add(&file, Save, "Save", Some((cmd, Code::KeyS)), false)?;
+            add(&file, SaveAs, "Save As…", Some((shift, Code::KeyS)), false)?;
+            file.append(&sep()).map_err(|e| e.to_string())?;
+            add(&file, Close, "Close", Some((cmd, Code::KeyW)), false)?;
+            add(&edit, Undo, "Undo", Some((cmd, Code::KeyZ)), true)?;
+            add(&edit, Redo, "Redo", Some((shift, Code::KeyZ)), true)?;
+            edit.append(&sep()).map_err(|e| e.to_string())?;
+            context.append(&sep()).map_err(|e| e.to_string())?;
+            for (command, label, code) in [
+                (Cut, "Cut", Code::KeyX),
+                (Copy, "Copy", Code::KeyC),
+                (Paste, "Paste", Code::KeyV),
+            ] {
+                add(&edit, command, label, Some((cmd, code)), true)?;
+            }
+            add(&edit, Delete, "Delete Selection", None, true)?;
+            edit.append(&sep()).map_err(|e| e.to_string())?;
+            context.append(&sep()).map_err(|e| e.to_string())?;
+            add(
+                &edit,
+                SelectAll,
+                "Select All",
+                Some((cmd, Code::KeyA)),
+                true,
+            )?;
+            add(
+                &edit,
+                Block,
+                "Column Selection",
+                Some((cmd, Code::KeyB)),
+                false,
+            )?;
+            context.append(&sep()).map_err(|e| e.to_string())?;
+            add(&search, Find, "Find…", Some((cmd, Code::KeyF)), true)?;
+            add(&search, Replace, "Replace…", Some((cmd, Code::KeyR)), true)?;
+            search.append(&sep()).map_err(|e| e.to_string())?;
+            add(&search, Next, "Find Next", Some((cmd, Code::KeyG)), false)?;
+            add(
+                &search,
+                Previous,
+                "Find Previous",
+                Some((shift, Code::KeyG)),
+                false,
+            )?;
+            // Style also appears in View and at the end of the editor context menu.
+            view.append(native(&style)).map_err(|e| e.to_string())?;
+            context.append(&sep()).map_err(|e| e.to_string())?;
+            context.append(native(&style)).map_err(|e| e.to_string())?;
+            add(
+                &view,
+                ZoomIn,
+                "Increase Font Size",
+                Some((cmd, Code::Equal)),
+                false,
+            )?;
+            add(
+                &view,
+                ZoomOut,
+                "Decrease Font Size",
+                Some((cmd, Code::Minus)),
+                false,
+            )?;
+            add(
+                &view,
+                ResetSize,
+                "Reset Font Size",
+                Some((cmd, Code::Digit0)),
+                false,
+            )?;
+            view.append(&sep()).map_err(|e| e.to_string())?;
+            add(
+                &view,
+                Wrap,
+                "Word Wrap",
+                Some((Modifiers::ALT, Code::KeyZ)),
+                false,
+            )?;
+            add(&view, Lines, "Line Numbers", Some((cmd, Code::KeyL)), false)?;
+            add(
+                &view,
+                Diagnostics,
+                "Diagnostics",
+                Some((Modifiers::empty(), Code::F3)),
+                false,
+            )?;
+            window
+                .append_items(&[
+                    &PredefinedMenuItem::minimize(None),
+                    &PredefinedMenuItem::maximize(Some("Zoom")),
+                    &PredefinedMenuItem::fullscreen(None),
+                    &sep(),
+                    &PredefinedMenuItem::bring_all_to_front(None),
+                ])
+                .map_err(|e| e.to_string())?;
+            bar.append_items(&[&app, &file, &edit, &search, &view, &window])
+                .map_err(|e| e.to_string())?;
+            let commands: Vec<_> = items
+                .iter()
+                .map(|(command, item)| (item.id().clone(), *command))
+                .collect();
+            let proxy = std::sync::Mutex::new(proxy);
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                if let Some((_, command)) = commands.iter().find(|(id, _)| *id == event.id) {
+                    let _ = proxy
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .send_event(AppEvent::Menu(*command));
+                }
+            }));
+            bar.init_for_nsapp();
+            window.set_as_windows_menu_for_nsapp();
+            Ok(Self {
+                _bar: bar,
+                context,
+                items,
+                state: None,
+            })
+        }
+        pub fn update(&mut self, state: MenuState) {
+            if self.state == Some(state) {
+                return;
+            }
+            for (command, item) in &self.items {
+                let enabled = state.enabled(*command);
+                match item {
+                    MenuItemKind::MenuItem(item) => item.set_enabled(enabled),
+                    MenuItemKind::Check(item) => {
+                        item.set_enabled(enabled);
+                        item.set_checked(state.checked(*command).unwrap_or(false));
+                    }
+                    _ => unreachable!("only editor actions are stored"),
+                }
+            }
+            self.state = Some(state);
+        }
+        pub fn invalidate(&mut self) {
+            // Native check items toggle before the queued intent is validated.
+            self.state = None;
+        }
+        pub fn show_context(&self, window: &Window, (x, y): (f32, f32)) {
+            if let Ok(handle) = window.window_handle() {
+                if let RawWindowHandle::AppKit(handle) = handle.as_raw() {
+                    // Main thread; the live Window owns the NSView throughout native menu tracking.
+                    // muda converts physical client coordinates using this NSView's backing scale.
+                    unsafe {
+                        self.context.show_context_menu_for_nsview(
+                            handle.ns_view.as_ptr(),
+                            Some(
+                                muda::dpi::PhysicalPosition::new(f64::from(x), f64::from(y)).into(),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+#[cfg(target_os = "macos")]
+pub(crate) use mac::NativeMenus;
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct NativeMenus;
+#[cfg(not(target_os = "macos"))]
+impl NativeMenus {
+    pub fn new(_: winit::event_loop::EventLoopProxy<crate::AppEvent>) -> Result<Self, String> {
+        Ok(Self)
+    }
+    pub fn update(&mut self, _: MenuState) {}
+    pub fn invalidate(&mut self) {}
+    pub fn show_context(&self, _: &winit::window::Window, _: (f32, f32)) {}
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unavailable_actions_cannot_mutate_documents_but_lifecycle_keeps_its_barriers() {
+        let locked = MenuState::default();
+        for command in [
+            MenuCommand::Undo,
+            MenuCommand::Cut,
+            MenuCommand::Paste,
+            MenuCommand::Style,
+        ] {
+            assert!(!locked.enabled(command));
+        }
+        assert!(locked.enabled(MenuCommand::Save));
+        let mut state = MenuState {
+            editable: true,
+            clipboard_available: true,
+            ..locked
+        };
+        assert!(state.enabled(MenuCommand::Paste));
+        assert!(!state.enabled(MenuCommand::Copy));
+        assert!(!state.enabled(MenuCommand::Undo));
+        state.selected = true;
+        state.can_undo = true;
+        assert!(state.enabled(MenuCommand::Copy));
+        assert!(state.enabled(MenuCommand::Undo));
+        state.clipboard_available = false;
+        assert!(!state.enabled(MenuCommand::Cut));
+        assert!(!state.enabled(MenuCommand::Paste));
+    }
+}

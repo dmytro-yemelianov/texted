@@ -44,7 +44,7 @@ mod mac {
                 );
                 PROXY.with(|p| {
                     if let Some(proxy) = p.get() {
-                        let _ = proxy.send_event(AppEvent(Action::OpenPath(path)));
+                        let _ = proxy.send_event(AppEvent::Document(Action::OpenPath(path)));
                     }
                 });
             }
@@ -60,7 +60,7 @@ mod mac {
     ) -> usize {
         PROXY.with(|p| {
             if let Some(proxy) = p.get() {
-                let _ = proxy.send_event(AppEvent(Action::Close));
+                let _ = proxy.send_event(AppEvent::Document(Action::Close));
             }
         });
         0 // NSTerminateCancel: Rust's guarded close will exit the event loop after the user decides.

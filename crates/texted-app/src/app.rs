@@ -1,11 +1,13 @@
 //! Native shell: routes events to controllers and paints immutable published state.
 use crate::{
     appearance_ui::{self, AppearanceUi},
+    context_menu::{self, ContextRequest, ContextStep},
     documents::Action,
     editor_view::{self, ViewModel},
     file_flow::FileFlow,
     gpu,
     graphics::{DrawList, FontEngine},
+    menus::{MenuCommand, MenuState, NativeMenus},
     mouse::Mouse,
     search_ui::{self, BarHit, SearchUi},
     transfers::{submit, Transfers},
@@ -49,12 +51,15 @@ pub(crate) struct App {
     files: FileFlow,
     message: Option<String>,
     snap_after: Option<u64>,
+    menus: NativeMenus,
+    context: Option<ContextRequest>,
 }
 impl App {
     pub fn new(
         window: Arc<Window>,
         renderer: gpu::Renderer,
         initial: Option<std::path::PathBuf>,
+        menus: NativeMenus,
     ) -> Self {
         let w = window.clone();
         let buffer = BufferService::new(move || w.request_redraw());
@@ -101,6 +106,8 @@ impl App {
             files,
             message: warning,
             snap_after: None,
+            menus,
+            context: None,
         }
     }
     fn report(&mut self, result: Result<(), String>) {
@@ -128,7 +135,9 @@ impl App {
                 ),
         ));
         match event {
-            Event::UserEvent(AppEvent(action)) => {
+            Event::UserEvent(AppEvent::Menu(command)) => self.menu_command(command),
+            Event::UserEvent(AppEvent::Document(action)) => {
+                self.context = None;
                 let result = self.files.enqueue(action);
                 self.report(result);
             }
@@ -143,15 +152,18 @@ impl App {
     fn window_event(&mut self, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                self.context = None;
                 let result = self.files.enqueue(Action::Close);
                 self.report(result);
             }
             WindowEvent::DroppedFile(path) => {
+                self.context = None;
                 let result = self.files.enqueue(Action::OpenPath(path));
                 self.report(result);
             }
             WindowEvent::ModifiersChanged(mods) => self.modifiers = mods.state(),
             WindowEvent::Resized(_) => {
+                self.context = None;
                 self.viewport.input(true);
                 self.window.request_redraw();
             }
@@ -162,6 +174,7 @@ impl App {
             WindowEvent::MouseWheel { delta, .. }
                 if !self.files.locked() && !self.appearance.open =>
             {
+                self.context = None;
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (
                         f64::from(x) * f64::from(self.font.char_width_px) * 3.0,
@@ -186,11 +199,18 @@ impl App {
                 button: MouseButton::Left,
                 ..
             } => self.pointer_button(state),
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => self.context_click(),
+            WindowEvent::Focused(false) => self.context = None,
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
     }
     fn keyboard(&mut self, event: KeyEvent) {
+        self.context = None;
         let state = &self.search.state;
         let context = SearchContext {
             open: state.mode != SearchBarMode::Closed,
@@ -269,6 +289,10 @@ impl App {
         self.window.request_redraw();
     }
     fn intent(&mut self, intent: Intent) {
+        if matches!(intent, Intent::ContextMenu) {
+            self.context_keyboard();
+            return;
+        }
         if matches!(
             intent,
             Intent::ToggleAppearance | Intent::Zoom(_) | Intent::ResetFontSize
@@ -359,6 +383,108 @@ impl App {
         }
         self.window.request_redraw();
     }
+    fn menu_state(&self) -> MenuState {
+        let p = self.buffer.client.latest();
+        MenuState {
+            editable: !self.locked(),
+            style_available: !self.failed && !self.files.locked(),
+            clipboard_available: !self.transfers.busy(),
+            selected: context_menu::has_selection(&p),
+            can_undo: p.can_undo,
+            can_redo: p.can_redo,
+            has_query: !self.search.state.find_query.is_empty(),
+            wrap: self.viewport.wrap,
+            lines: self.viewport.line_numbers,
+            diagnostics: self.hud,
+            block: p.selection.mode == texted_app::selection::SelectionMode::Block,
+        }
+    }
+    fn menu_command(&mut self, command: MenuCommand) {
+        self.context = None;
+        self.menus.invalidate();
+        // Validate again at delivery: a native menu may have tracked while workers completed.
+        if self.menu_state().enabled(command) {
+            self.intent(command.intent());
+        }
+    }
+    fn context_keyboard(&mut self) {
+        if self.locked() || self.transfers.busy() {
+            return;
+        }
+        let Some(frame) = &self.viewport.current else {
+            return;
+        };
+        let rect = frame.layout.caret_rect;
+        let x = rect.x.max(frame.config.text_x());
+        let y = (rect.y + rect.height + 2.0).clamp(0.0, frame.text_height.saturating_sub(1) as f32);
+        let p = self.buffer.client.latest();
+        let _ = self.search.handle(&Intent::SearchClose, p.snapshot.clone());
+        self.context = Some(ContextRequest {
+            position: (x, y),
+            point: (0, 0),
+            document: p.document,
+            after: self.buffer.client.barrier(),
+            positioned: true,
+        });
+        self.window.request_redraw();
+    }
+    fn context_click(&mut self) {
+        self.context = None;
+        let (x, y) = self.mouse.position;
+        if self.locked()
+            || self.transfers.busy()
+            || self
+                .viewport
+                .current
+                .as_ref()
+                .is_none_or(|f| x < f.config.text_x() || y < 0.0 || y >= f.text_height as f32)
+            || self.viewport.bar.is_some_and(|bar| bar.contains(x, y))
+            || search_ui::hit(
+                self.search.state.mode,
+                self.window.inner_size().width as f32,
+                x,
+                y,
+            )
+            .is_some()
+        {
+            return;
+        }
+        self.mouse.dragging = false;
+        self.viewport.horizontal.end_drag();
+        // A document popup targets the document, including Paste when the search bar was open.
+        let _ = self.search.handle(
+            &Intent::SearchClose,
+            self.buffer.client.latest().snapshot.clone(),
+        );
+        self.context = Some(ContextRequest {
+            position: (x, y),
+            point: self.viewport.point(x, y),
+            document: self.buffer.client.latest().document,
+            after: self.buffer.client.barrier(),
+            positioned: false,
+        });
+        self.window.request_redraw();
+    }
+    fn poll_context(&mut self) {
+        let Some(mut request) = self.context else {
+            return;
+        };
+        self.context = None;
+        if self.locked() || self.transfers.busy() {
+            return;
+        }
+        match request.advance(&self.buffer.client) {
+            Ok(ContextStep::Wait) => self.context = Some(request),
+            Ok(ContextStep::Cancel) => {}
+            Ok(ContextStep::Show) => {
+                self.viewport.input(false);
+                self.menus.update(self.menu_state());
+                self.menus.show_context(&self.window, request.position);
+                self.window.request_redraw();
+            }
+            Err(error) => self.report(Err(error)),
+        }
+    }
     fn pointer_move(&mut self, x: f32, y: f32) {
         self.mouse.position = (x, y);
         if self.locked() {
@@ -374,6 +500,7 @@ impl App {
         }
     }
     fn pointer_button(&mut self, state: ElementState) {
+        self.context = None;
         if state == ElementState::Released {
             self.mouse.dragging = false;
             self.viewport.horizontal.end_drag();
@@ -473,6 +600,7 @@ impl App {
         }
         if self.files.reset {
             self.files.reset = false;
+            self.context = None;
             self.viewport.reset();
             self.search.reset();
             self.mouse = Mouse::new();
@@ -530,6 +658,8 @@ impl App {
             )
         };
         self.window.set_title(&title);
+        self.menus.update(self.menu_state());
+        self.poll_context();
         if self.viewport.blink.elapsed() >= Duration::from_millis(500)
             || self.search.state.pending
             || published.busy.is_some()
