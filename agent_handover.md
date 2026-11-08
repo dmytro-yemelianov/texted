@@ -20,11 +20,16 @@ The `feat/native-menus` branch adds macOS application menus (Texted, File, Edit,
 
 `feat/platform-framebuffer` builds on the native-menu branch and adds real fixed-resolution GPU canvases. Style's Screen/Resolution row defaults to Auto by theme, with Native and explicit platform presets. `framebuffer.rs` owns bounded resolutions and presentation/input transforms; `presentation.rs` caches one GPU texture and presents exact texels, with integer scaling and letterboxing. The last successful frame's transform governs clicks, drags, pixel-wheel events and context-menu positions. Compact Style/search/status controls fit the smallest 256×192 canvas. Existing version-1 preferences load with Auto and separate 8 px pixel typography; native typography stays intact. See [framebuffer details and primary references](docs/framebuffer.md). Local validation passed 105 Rust tests, Clippy, formatting, two packaging tests and both explicit Metal tests. Native checks confirmed C64/ZX raster changes, Native bypass, compact controls, pointer mapping, restart persistence and unchanged document bytes. No release tag is created.
 
+## Style dropdowns
+
+`feat/style-dropdowns` builds on the framebuffer branch. All five Style selectors now open lists: theme, resolution, font, size and spacing. `dropdown.rs` owns bounded popup geometry, disabled-item navigation and fractional wheel scrolling; `appearance_ui.rs` owns typed choices and commits. Click/Enter/Space opens a list; Up/Down, Home/End and Page Up/Down navigate; Enter commits; Escape/outside clicks dismiss the list first. Hover/browsing does not change settings, choosing the current theme preserves custom colors, and disabled fonts cannot be applied. Popup drawing and hit testing share geometry, including at 256×192. Closing Style, keyboard file actions and zoom/reset dismiss stale popup state. Validation: 111 Rust tests, formatting and Clippy passed. Native verification covered full theme/resolution lists, direct mouse selection, keyboard selection/cancellation, and the complete ten-theme list at 256×192; document bytes remained unchanged.
+
 ## Component map
 
 | Component | Owner / invariant |
 |---|---|
 | `main.rs`, `app.rs` | Bootstrap and native adaptation/scheduling; no editing algorithms or blocking buffer replies |
+| `dropdown.rs` | Bounded list geometry/navigation shared by native-sized and compact Style controls |
 | `menus.rs`, `context_menu.rs` | Native actions/state and selection-aware popup invocation; shared intent dispatch |
 | `input.rs`, `commands.rs` | Physical-key shortcuts and typed intents, windowless |
 | `editing.rs`, `selection.rs`, `mouse.rs` | Canonical editor/drag transitions and selection values; shell mouse state tracks only gestures |

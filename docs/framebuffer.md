@@ -21,7 +21,7 @@ The scene is laid out and drawn at the selected canvas size. A second GPU pass r
 
 One shared `ScreenMapping` handles presentation, pointer/drag coordinates, pixel-wheel deltas and native context-menu positioning. Clicks on letterboxing do not select text or activate controls. The last successfully presented mapping remains authoritative until the next successful frame. Changing resolution cancels pending popups and drag gestures, then recomputes viewport/search geometry.
 
-Style and search use shared compact paint/hit geometry in framebuffer mode; every control fits 256×192. The compact status bar shows caret position, wrapping/column-selection mode and canvas dimensions. Cmd+L still hides the gutter when more text columns are needed.
+Style and search use shared compact paint/hit geometry in framebuffer mode; every control fits 256×192. Style fields open dropdown lists with the current value marked. The complete theme and resolution lists fit the smallest canvas; longer size lists scroll. Mouse, wheel and keyboard selection use the same popup geometry. Unavailable fonts are visible and disabled. Browsing, Escape and outside-click dismissal do not apply changes. The compact status bar shows caret position, wrapping/column-selection mode and canvas dimensions. Cmd+L still hides the gutter when more text columns are needed.
 
 ## Settings
 
