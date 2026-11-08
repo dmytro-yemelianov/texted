@@ -81,6 +81,15 @@ impl SearchUi {
                 self.state.navigate(snap, true);
             }
             Intent::NextMatch { forward } => self.state.navigate(snap, *forward),
+            Intent::ToggleIgnoreCase | Intent::ToggleWholeWord => {
+                let mut options = self.state.options;
+                if matches!(intent, Intent::ToggleIgnoreCase) {
+                    options.ignore_case = !options.ignore_case;
+                } else {
+                    options.whole_word = !options.whole_word;
+                }
+                self.state.set_options(options, snap);
+            }
             Intent::SearchText(text) => return Some(self.append(text, snap)),
             Intent::SearchBackspace => {
                 if self.state.active_field == 0 {

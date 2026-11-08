@@ -390,6 +390,8 @@ impl App {
                 open: self.session.search.state.mode != SearchBarMode::Closed,
                 replace: self.session.search.state.mode == SearchBarMode::Replace,
                 replacement_field: self.session.search.state.active_field == 1,
+                ignore_case: self.session.search.state.options.ignore_case,
+                whole_word: self.session.search.state.options.whole_word,
             },
             appearance: self.appearance.open,
             dialog: self.dialogs.open(),
@@ -840,6 +842,8 @@ impl App {
             open: state.mode != SearchBarMode::Closed,
             replace: state.mode == SearchBarMode::Replace,
             replacement_field: state.active_field == 1,
+            ignore_case: state.options.ignore_case,
+            whole_word: state.options.whole_word,
         };
         if self.popup.is_some() {
             let state = self.menu_state();
@@ -1212,6 +1216,7 @@ impl App {
                         Command::Replace {
                             query: self.session.search.state.find_query.clone(),
                             replacement: self.session.search.state.replace_query.clone(),
+                            options: self.session.search.state.options,
                             all,
                         },
                     );

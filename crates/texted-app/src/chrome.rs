@@ -144,6 +144,18 @@ impl Commands {
                     if context.wrap { "on" } else { "off" }
                 ),
                 I::Find => "Find text (Cmd+F)".into(),
+                I::ToggleIgnoreCase => if context.search.ignore_case {
+                    "Capital letters are ignored. Click to match case"
+                } else {
+                    "Capital letters must match. Click to ignore case"
+                }
+                .into(),
+                I::ToggleWholeWord => if context.search.whole_word {
+                    "Only whole words match. Click to match inside words too"
+                } else {
+                    "Matches inside words count. Click to match whole words only"
+                }
+                .into(),
                 I::Replace => "Find and replace text (Cmd+R)".into(),
                 I::File(F::Close) => "Close this tab; ask to save changed text (Cmd+W)".into(),
                 I::File(F::Quit) => "Quit; check all changed tabs (Cmd+Q)".into(),
@@ -191,6 +203,22 @@ impl Commands {
                 I::Zoom(delta) => (if delta > 0 { "+10%" } else { "-10%" }, true),
                 I::ResetFontSize => ("100%", true),
                 I::SearchClose | I::Cancel => ("Back", true),
+                I::ToggleIgnoreCase => (
+                    if context.search.ignore_case {
+                        "NoCs"
+                    } else {
+                        "Case"
+                    },
+                    true,
+                ),
+                I::ToggleWholeWord => (
+                    if context.search.whole_word {
+                        "Word"
+                    } else {
+                        "Part"
+                    },
+                    true,
+                ),
                 I::ContextMenu => ("Menu", context.editable),
                 I::AcceptDialog => (context.dialog_accept, true),
                 I::CancelDialog => ("Back", true),
@@ -226,7 +254,7 @@ impl Commands {
                     .unwrap_or(6)
             });
         } else if context.search.open {
-            items.sort_by_key(|(i, _)| if matches!(i, 2 | 3 | 9) { 0 } else { 1 });
+            items.sort_by_key(|(i, _)| if matches!(i, 2..=5 | 9) { 0 } else { 1 });
         }
         Self { items, tips }
     }
@@ -475,6 +503,34 @@ mod tests {
             cursor: (3, 9),
             wrap: true,
         }
+    }
+    #[test]
+    fn search_offers_case_and_whole_word_switches_that_show_their_state() {
+        use texted_app::input::Intent as I;
+        use winit::keyboard::ModifiersState as M;
+        let mut c = context();
+        c.search.open = true;
+        assert!(matches!(
+            command(4, &c, M::empty()),
+            Some(I::ToggleIgnoreCase)
+        ));
+        assert!(matches!(
+            command(5, &c, M::empty()),
+            Some(I::ToggleWholeWord)
+        ));
+        let items = Commands::new(&c, M::empty()).items;
+        assert!(items.contains(&(4, "Case".into())), "{items:?}");
+        assert!(items.contains(&(5, "Part".into())), "{items:?}");
+        c.search.ignore_case = true;
+        c.search.whole_word = true;
+        let items = Commands::new(&c, M::empty()).items;
+        assert!(items.contains(&(4, "NoCs".into())), "{items:?}");
+        assert!(items.contains(&(5, "Word".into())), "{items:?}");
+        c.search.open = false;
+        assert!(matches!(
+            command(4, &c, M::empty()),
+            Some(I::File(texted_app::input::FileIntent::Open))
+        ));
     }
     #[test]
     fn command_labels_follow_search_appearance_and_modifier_layers() {

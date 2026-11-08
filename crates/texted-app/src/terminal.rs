@@ -606,6 +606,49 @@ mod tests {
         }
         app.tick();
     }
+    /// Ticks and redraws until the frame shows `expected`.
+    fn wait_for_text(app: &mut App, expected: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.tick();
+            app.redraw();
+            let text = app.rendered_grid().unwrap().text();
+            if text.contains(expected) {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never showed {expected:?}:\n{text}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    #[test]
+    fn search_switches_on_function_keys_change_what_matches() {
+        let dir = std::env::temp_dir().join(format!("texted-search-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cats.txt");
+        std::fs::write(&path, "Кіт кіт кітки КІТ\n").unwrap();
+        let (_, mut app) = application(100, 30, vec![path], None, None);
+        settle(&mut app);
+        let find = Key::Character("f".into());
+        app.key(&KeyInput {
+            physical: PhysicalKey::Code(KeyCode::KeyF),
+            logical: &find,
+            text: None,
+            modifiers: ModifiersState::SUPER,
+        });
+        app.paste_text("кіт".into());
+        let text = wait_for_text(&mut app, "/2");
+        assert!(text.contains("Case") && text.contains("Part"), "{text}");
+        press(&mut app, NamedKey::F5);
+        let text = wait_for_text(&mut app, "/4");
+        assert!(text.contains("NoCs"), "{text}");
+        press(&mut app, NamedKey::F6);
+        let text = wait_for_text(&mut app, "/3");
+        assert!(text.contains("Word"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn quitting_keeps_unsaved_tabs_and_the_next_start_restores_them() {
         let dir = std::env::temp_dir().join(format!("texted-hot-exit-{}", std::process::id()));

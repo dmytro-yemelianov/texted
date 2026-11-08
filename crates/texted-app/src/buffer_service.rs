@@ -47,6 +47,7 @@ pub enum Command {
         query: String,
         replacement: String,
         all: bool,
+        options: texted_buffer::search::SearchOptions,
     },
     DeleteContext(EditContext),
     PasteContext {
@@ -423,13 +424,15 @@ impl Actor {
                         query,
                         replacement,
                         all,
+                        options,
                     } => {
-                        if let Some(plan) = texted_buffer::replacement::plan(
+                        if let Some(plan) = texted_buffer::replacement::plan_with(
                             &snapshot,
                             &query,
                             &replacement,
                             all,
                             snapshot.cursor_offset,
+                            options,
                             cancelled,
                         )
                         .map_err(|e| format!("Replacement failed: {e:?}"))?

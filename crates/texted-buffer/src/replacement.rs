@@ -1,6 +1,6 @@
 //! Atomic replacement planning over immutable snapshots, with bounded generated growth.
 use crate::{
-    search::{ScanState, SearchError, SearchSession},
+    search::{ScanState, SearchError, SearchOptions, SearchSession},
     BufferSnapshot,
 };
 use ropey::{Rope, RopeBuilder, RopeSlice};
@@ -53,7 +53,27 @@ pub fn plan(
     start: usize,
     cancelled: impl Fn() -> bool,
 ) -> Result<Option<ReplacementPlan>, PlanError> {
-    let session = match SearchSession::new(snapshot.clone(), query, &cancelled) {
+    plan_with(
+        snapshot,
+        query,
+        replacement,
+        all,
+        start,
+        SearchOptions::default(),
+        cancelled,
+    )
+}
+/// Plans with the same matching rules the search bar shows.
+pub fn plan_with(
+    snapshot: &BufferSnapshot,
+    query: &str,
+    replacement: &str,
+    all: bool,
+    start: usize,
+    options: SearchOptions,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<ReplacementPlan>, PlanError> {
+    let session = match SearchSession::with_options(snapshot.clone(), query, options, &cancelled) {
         Ok(s) => s,
         Err(SearchError::Empty) => return Ok(None),
         Err(e) => return Err(PlanError::Query(e)),
@@ -168,6 +188,16 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn replace_all_uses_the_search_bar_matching_rules() {
+        let snap = TextBuffer::from_string("Кіт кіт кітки КІТ".into()).create_snapshot();
+        let options = SearchOptions {
+            ignore_case: true,
+            whole_word: true,
+        };
+        let p = plan_with(&snap, "кіт", "пес", true, 0, options, || false).unwrap();
+        assert_eq!(p.unwrap().content.to_string(), "пес пес кітки пес");
     }
     #[test]
     fn cancellation_and_preflight_leave_original_snapshot_unchanged() {

@@ -13,12 +13,21 @@ pub enum FileIntent {
 pub enum Intent {
     Edit(EditorCommand),
     File(FileIntent),
-    Copy { cut: bool },
+    Copy {
+        cut: bool,
+    },
     Paste,
     Find,
     Replace,
-    NextMatch { forward: bool },
-    ReplaceMatch { all: bool },
+    NextMatch {
+        forward: bool,
+    },
+    /// Search switches; they rerun the current query.
+    ToggleIgnoreCase,
+    ToggleWholeWord,
+    ReplaceMatch {
+        all: bool,
+    },
     SearchText(String),
     SearchBackspace,
     SearchTab,
@@ -35,10 +44,16 @@ pub enum Intent {
     AcceptAppearance,
     AcceptDialog,
     CancelDialog,
-    NavigateDialog { forward: bool },
+    NavigateDialog {
+        forward: bool,
+    },
     ResetAppearance,
-    BrowseAppearance { forward: bool },
-    NextTab { forward: bool },
+    BrowseAppearance {
+        forward: bool,
+    },
+    NextTab {
+        forward: bool,
+    },
     Cancel,
 }
 #[derive(Clone, Copy, Default)]
@@ -46,6 +61,8 @@ pub struct SearchContext {
     pub open: bool,
     pub replace: bool,
     pub replacement_field: bool,
+    pub ignore_case: bool,
+    pub whole_word: bool,
 }
 pub struct KeyInput<'a> {
     pub physical: PhysicalKey,
@@ -187,6 +204,8 @@ pub fn function_key_for(
         1 => Intent::File(FileIntent::Save { as_new: shift }),
         2 if search.open || shift => Intent::NextMatch { forward: !shift },
         3 if search.replace => Intent::ReplaceMatch { all: shift },
+        4 if search.open => Intent::ToggleIgnoreCase,
+        5 if search.open => Intent::ToggleWholeWord,
         9 if search.open => Intent::SearchClose,
         _ => return function_key(index),
     })
