@@ -8,3 +8,4 @@ pub mod connectors;
 pub mod geom;
 #[cfg(test)]
 pub mod model_font;
+pub mod vectorize;
