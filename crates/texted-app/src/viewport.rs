@@ -370,8 +370,8 @@ mod tests {
                     out.sort();
                     return out;
                 }
-                for (rel, a, b) in selection.missing {
-                    tables.fill(rel, a, b, &glyphs);
+                for need in selection.missing {
+                    tables.supply(need, &glyphs);
                 }
             }
         };

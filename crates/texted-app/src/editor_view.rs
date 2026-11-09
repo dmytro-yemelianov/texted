@@ -954,6 +954,8 @@ mod tests {
                 mech: Mech::Fuse,
                 cost: 0.0,
                 keys: Vec::new(),
+                path: Vec::new(),
+                probe: Default::default(),
                 sprite: Arc::new(Sprite {
                     origin,
                     width: size[0],

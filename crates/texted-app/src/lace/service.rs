@@ -15,7 +15,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 
 use super::layer::{select, Placed, Row, Settings};
-use super::table::{Relation, Tables};
+use super::table::{Need, Tables};
 use super::vectorize::FaceMetrics;
 use crate::bitmap_fonts::BitmapFace;
 
@@ -35,12 +35,10 @@ pub struct FaceKey {
     pub serifs: bool,
 }
 
-type Pair = (Relation, char, char);
-
 struct Request {
     key: FaceKey,
     glyphs: BitmapFace,
-    pairs: Vec<Pair>,
+    needs: Vec<Need>,
     epoch: u64,
 }
 
@@ -64,8 +62,8 @@ struct Shared {
 pub struct LaceService {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
-    /// The last request sent, so a frame that needs the same pairs sends nothing.
-    requested: Option<(FaceKey, Vec<Pair>)>,
+    /// The last request sent, so a frame that needs the same work sends nothing.
+    requested: Option<(FaceKey, Vec<Need>)>,
     shown: Shown,
 }
 
@@ -188,7 +186,7 @@ impl LaceService {
 
     /// Ask for `missing` in the tables of `face`, whose bitmaps are `glyphs`. A new
     /// key is always sent, even with nothing missing, so its tables get published.
-    pub fn request(&mut self, face: FaceKey, glyphs: BitmapFace, missing: &[Pair]) {
+    pub fn request(&mut self, face: FaceKey, glyphs: BitmapFace, missing: &[Need]) {
         debug_assert_eq!(face.id, glyphs.id());
         let same_key = self.requested.as_ref().is_some_and(|(k, _)| *k == face);
         if same_key
@@ -205,7 +203,7 @@ impl LaceService {
         slots.pending = Some(Request {
             key: face,
             glyphs,
-            pairs: missing.to_vec(),
+            needs: missing.to_vec(),
             epoch,
         });
         self.requested = Some((face, missing.to_vec()));
@@ -223,7 +221,7 @@ impl LaceService {
     }
 }
 
-/// Fill the request's pairs into the kept tables for its key and return a copy to
+/// Fill the request's needs into the kept tables for its key and return a copy to
 /// publish, or `None` when the face cannot be measured or the key went stale.
 fn fill(
     kept: &mut Vec<(FaceKey, Tables)>,
@@ -240,14 +238,14 @@ fn fill(
         }
     };
     let mut done = true;
-    for &(rel, a, b) in &request.pairs {
+    for &need in &request.needs {
         if !current() {
             done = false;
             break;
         }
-        tables.fill(rel, a, b, &rows);
+        tables.supply(need, &rows);
     }
-    let snapshot = done.then(|| Arc::new(tables.clone()));
+    let snapshot = done.then(|| Arc::new(tables.snapshot()));
     // Filled entries stay valid for their key, even when the work was cut short.
     kept.push((request.key, tables));
     if kept.len() > KEPT {
@@ -277,6 +275,7 @@ mod tests {
     use crate::appearance::FontFamily;
     use crate::bitmap_fonts::face;
     use crate::lace::ligatures::Mech;
+    use crate::lace::table::Relation;
     use crate::lace::vectorize::FaceMetrics;
     use std::sync::mpsc::{channel, Receiver};
     use std::time::{Duration, Instant};
@@ -313,7 +312,7 @@ mod tests {
     fn worker_builds_tables_and_wakes() {
         let (mut s, recv) = service();
         let vga = face(FontFamily::Vga);
-        s.request(key(vga), vga, &[(Relation::H, 'f', 'i')]);
+        s.request(key(vga), vga, &[Need::Pair(Relation::H, 'f', 'i')]);
         wait_until(&recv, Duration::from_secs(2), || {
             s.tables(key(vga)).is_some()
         });
@@ -328,7 +327,9 @@ mod tests {
         let (vga, bios) = (face(FontFamily::Vga), face(FontFamily::Bios));
         let many: Vec<_> = [Relation::H, Relation::V, Relation::Dr, Relation::Dl]
             .into_iter()
-            .flat_map(|rel| ('a'..='z').flat_map(move |a| ('a'..='z').map(move |b| (rel, a, b))))
+            .flat_map(|rel| {
+                ('a'..='z').flat_map(move |a| ('a'..='z').map(move |b| Need::Pair(rel, a, b)))
+            })
             .collect();
         // Hold the worker once it has taken the VGA request, switch to BIOS, then let it go.
         let (started, taken) = channel();
@@ -339,7 +340,7 @@ mod tests {
         }));
         s.request(key(vga), vga, &many);
         taken.recv_timeout(Duration::from_secs(5)).unwrap();
-        s.request(key(bios), bios, &[(Relation::H, 'f', 'i')]);
+        s.request(key(bios), bios, &[Need::Pair(Relation::H, 'f', 'i')]);
         release.send(()).unwrap();
 
         let rows = |c| bios.glyph(c).map(<[u8]>::to_vec);
@@ -358,16 +359,16 @@ mod tests {
         assert!(s.tables(key(vga)).is_none());
         // The VGA batch was dropped before its first pair: back on VGA, only the newly
         // requested pair is filled.
-        s.request(key(vga), vga, &[(Relation::H, 'a', 'a')]);
+        s.request(key(vga), vga, &[Need::Pair(Relation::H, 'a', 'a')]);
         wait_until(&recv, Duration::from_secs(5), || {
             s.tables(key(vga)).is_some()
         });
         let t = s.tables(key(vga)).unwrap();
         let filled: Vec<_> = many
             .iter()
-            .filter(|p| t.get(p.0, p.1, p.2).is_some())
+            .filter(|n| matches!(n, Need::Pair(rel, a, b) if t.get(*rel, *a, *b).is_some()))
             .collect();
-        assert_eq!(filled, [&(Relation::H, 'a', 'a')]);
+        assert_eq!(filled, [&Need::Pair(Relation::H, 'a', 'a')]);
     }
 
     #[test]

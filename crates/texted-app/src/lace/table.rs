@@ -26,13 +26,52 @@ pub struct Entry {
     pub mech: Mech,
     pub cost: f32,
     pub keys: Vec<Key>,
+    /// The connecting polyline in model units, in the first letter's frame: x from its
+    /// cell's left edge, y up from its baseline.
+    pub path: Vec<V2>,
+    /// What the grid's clearance check reads of `path`.
+    pub probe: Probe,
     pub sprite: Arc<Sprite>,
     pub trim: Option<(Side, u16, Prim)>,
     pub drop: Vec<(Side, u16)>,
     pub absorb: Option<(Side, u16)>,
 }
 
-#[derive(Clone)]
+/// A path must stay this far (model units) from the ink of the other cells around
+/// its pair...
+pub const CLEARANCE: f32 = 0.4;
+/// ...except within this distance of its two ends, where it joins its letters.
+pub const END_ZONE: f32 = 0.7;
+/// How far (model units) a glyph's strokes may lie outside its pixel rows at `k`
+/// units per pixel. Traced strokes, their fillets and restored bars run through
+/// pixel centres or inside the ink; only a dot (radius 0.7 about the middle of its
+/// pixels, at least half a pixel inside) can reach past it. 0.05 covers rounding.
+fn stray(k: f32) -> f32 {
+    (0.7 - 0.5 * k).max(0.0) + 0.05
+}
+
+/// The part of a path the clearance check tests, worked out when the entry is built.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Probe {
+    /// Path points farther than [`END_ZONE`] from both ends (none for a straight join).
+    pub points: Vec<V2>,
+    /// Their bounding box `[x0, y0, x1, y1]`.
+    pub bbox: [f32; 4],
+    /// Whether a point comes near enough to the row above the upper cell (`[0]`) or
+    /// the row below the lower cell (`[1]`) for any glyph there to block it; when not,
+    /// the choice of this entry never depends on that row.
+    pub reach: [bool; 2],
+}
+
+/// Work a selection needs from the worker before it can be final.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Need {
+    /// The entries for `a` then `b` in a relation.
+    Pair(Relation, char, char),
+    /// The strokes of a character beside a ligature, for the clearance check.
+    Glyph(char),
+}
+
 pub struct Tables {
     metrics: FaceMetrics,
     serifs: bool,
@@ -50,6 +89,42 @@ impl Tables {
             glyphs: BTreeMap::new(),
             entries: BTreeMap::new(),
         }
+    }
+
+    /// A copy to publish: the same entries and glyphs.
+    pub fn snapshot(&self) -> Self {
+        Self {
+            metrics: self.metrics,
+            serifs: self.serifs,
+            cell: self.cell,
+            glyphs: self.glyphs.clone(),
+            entries: self.entries.clone(),
+        }
+    }
+
+    /// Fill what `need` asks for (worker side).
+    pub fn supply(&mut self, need: Need, rows: &impl Fn(char) -> Option<Vec<u8>>) {
+        match need {
+            Need::Pair(rel, a, b) => self.fill(rel, a, b, rows),
+            Need::Glyph(c) => {
+                self.glyph(c, rows);
+            }
+        }
+    }
+
+    /// The strokes of `c` if they were worked out: `Some(None)` when the face lacks it.
+    pub fn strokes(&self, c: char) -> Option<Option<&Glyph>> {
+        self.glyphs.get(&c).map(Option::as_deref)
+    }
+
+    /// Where the cell `rows` below and `cols` right of a letter puts its frame, in
+    /// that letter's frame (y up).
+    pub fn offset(&self, rows: isize, cols: isize) -> V2 {
+        let k = self.metrics.k;
+        [
+            cols as f32 * f32::from(self.cell[0]) * k,
+            -(rows as f32) * f32::from(self.cell[1]) * k,
+        ]
     }
 
     /// The glyph of `c`, vectorised on first use; `None` when the face lacks it.
@@ -110,15 +185,23 @@ impl Tables {
             }
         }
         let drop_y = f32::from(self.metrics.baseline) * k;
+        // The lower cell's row: the first letter's for in-row relations.
+        let lower = match rel {
+            Relation::H | Relation::S(_) => 0.0,
+            Relation::V | Relation::Dr | Relation::Dl => -row,
+        };
         let out = best
             .into_values()
             .map(|c| {
-                let path: Vec<V2> = c.path.iter().map(|p| [p[0], p[1] - drop_y]).collect();
+                let from_top: Vec<V2> = c.path.iter().map(|p| [p[0], p[1] - drop_y]).collect();
+                let probe = self.probe(&c.path, lower);
                 Arc::new(Entry {
                     mech: c.mech,
                     cost: c.cost,
                     keys: c.keys,
-                    sprite: Arc::new(rasterize(&path, k)),
+                    path: c.path,
+                    probe,
+                    sprite: Arc::new(rasterize(&from_top, k)),
                     trim: c.trim,
                     drop: c.drop,
                     absorb: c.absorb,
@@ -130,6 +213,52 @@ impl Tables {
 
     pub fn get(&self, rel: Relation, a: char, b: char) -> Option<&[Arc<Entry>]> {
         self.entries.get(&(rel, a, b)).map(Vec::as_slice)
+    }
+
+    /// The clearance probe of `path`, whose lower cell's frame sits `lower` below the
+    /// first letter's. A glyph's strokes lie within its pixel rows, give or take
+    /// [`stray`], so a neighbour row's ink is at least that far into its own row.
+    fn probe(&self, path: &[V2], lower: f32) -> Probe {
+        let (Some(&s), Some(&e)) = (path.first(), path.last()) else {
+            return Probe::default();
+        };
+        let far = |p: &V2, q: V2| (p[0] - q[0]).hypot(p[1] - q[1]) >= END_ZONE;
+        let points: Vec<V2> = path
+            .iter()
+            .filter(|p| far(p, s) && far(p, e))
+            .copied()
+            .collect();
+        if points.is_empty() {
+            return Probe::default();
+        }
+        let mut bbox = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for p in &points {
+            bbox = [
+                bbox[0].min(p[0]),
+                bbox[1].min(p[1]),
+                bbox[2].max(p[0]),
+                bbox[3].max(p[1]),
+            ];
+        }
+        let k = self.metrics.k;
+        let row = f32::from(self.cell[1]) * k;
+        let (top, bottom) = (
+            f32::from(self.metrics.baseline) * k + stray(k),
+            (f32::from(self.metrics.baseline) - f32::from(self.metrics.height)) * k - stray(k),
+        );
+        Probe {
+            reach: [
+                bbox[3] + CLEARANCE > bottom + row,
+                bbox[1] - CLEARANCE < top + lower - row,
+            ],
+            points,
+            bbox,
+        }
     }
 }
 
@@ -147,6 +276,65 @@ mod tests {
         let f = face(FontFamily::Vga);
         let m = FaceMetrics::measure(rows, f.width, f.height).unwrap();
         Tables::new(m, false, [8, 16])
+    }
+
+    /// The clearance probe's `reach` relies on every stroke lying within its glyph's
+    /// pixel rows, give or take `stray`; check it on every bundled face, letters and
+    /// the other characters a document puts beside them.
+    #[test]
+    fn strokes_stay_within_their_rows() {
+        let chars: Vec<char> = ('!'..='~')
+            .chain('А'..='я')
+            .chain("ҐґЄєІіЇї«»—–…№₴".chars())
+            .collect();
+        for family in FontFamily::ALL {
+            let f = face(family);
+            let rows = move |c: char| f.glyph(c).map(<[u8]>::to_vec);
+            let m = FaceMetrics::measure(rows, f.width, f.height).unwrap();
+            let (top, bottom) = (
+                f32::from(m.baseline) * m.k + stray(m.k),
+                (f32::from(m.baseline) - f32::from(m.height)) * m.k - stray(m.k),
+            );
+            // Serifs kept: every ink pixel is vectorised.
+            let mut t = Tables::new(m, true, [f.width, f.height]);
+            for &c in &chars {
+                t.supply(Need::Glyph(c), &rows);
+                let Some(Some(g)) = t.strokes(c) else {
+                    continue;
+                };
+                for p in &g.prims {
+                    let b = crate::lace::geom::bbox(std::slice::from_ref(p));
+                    assert!(
+                        b[1] >= bottom && b[3] <= top,
+                        "{} {c:?}: {b:?} outside {bottom}..{top}",
+                        family.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn probes_skip_the_ends_and_know_which_rows_they_reach() {
+        let t = tables();
+        let k = t.metrics.k;
+        // A straight join has nothing to probe.
+        let straight = t.probe(&[[0.0, 0.0], [10.0, 0.0]], 0.0);
+        assert_eq!(straight, Probe::default());
+        // A path along the x-height: only its middle is probed, and it reaches no row.
+        let path: Vec<V2> = (0..=10).map(|i| [i as f32, 8.0]).collect();
+        let mid = t.probe(&path, 0.0);
+        assert_eq!(mid.points.first(), Some(&[1.0, 8.0]));
+        assert_eq!(mid.points.last(), Some(&[9.0, 8.0]));
+        assert_eq!(mid.reach, [false, false]);
+        // At the cell's top edge it reaches the row above; at its bottom edge, the row
+        // below; a lower cell one row down moves that row down too.
+        let at = |y: f32| t.probe(&[[0.0, y], [2.0, y], [4.0, y]], 0.0).reach;
+        assert_eq!(at(12.0 * k), [true, false]);
+        assert_eq!(at(-4.0 * k), [false, true]);
+        let down = |y: f32| t.probe(&[[0.0, y], [2.0, y], [4.0, y]], -16.0 * k).reach;
+        assert_eq!(down(-4.0 * k), [false, false]);
+        assert_eq!(down(-20.0 * k), [false, true]);
     }
 
     #[test]
@@ -249,21 +437,10 @@ mod tests {
             .find(|e| e.mech == Mech::Fuse)
             .expect("ff fuse");
         let s = &e.sprite;
-        // Recompute the entry's path from the generator (entries do not keep it).
+        // The entry's path in font pixels, y down from the cell's top.
         let m = t.metrics;
-        let glyph = |c| {
-            let r = strip_serifs(&rows(c).unwrap(), m.width, m.height);
-            analyse(vectorize(&r, &m))
-        };
-        let g = glyph('f');
-        let cw = 8.0 * m.k;
-        let cands = in_word(&g, &g, cw, (cw - cw + 2.5).max(0.75 * cw));
-        let c = cands
-            .iter()
-            .find(|c| c.mech == Mech::Fuse && c.cost == e.cost)
-            .expect("matching candidate");
         let base = f32::from(m.baseline);
-        let px: Vec<[f32; 2]> = c
+        let px: Vec<[f32; 2]> = e
             .path
             .iter()
             .map(|p| [p[0] / m.k, base - p[1] / m.k])

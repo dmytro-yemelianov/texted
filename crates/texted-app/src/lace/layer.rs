@@ -1,15 +1,18 @@
 //! Selection of ligatures over the visible grid.
 //!
 //! Only the visible cells are looked at, tables are never computed here (pairs
-//! that are not filled yet are reported in [`Selection::missing`]), and every
-//! random choice is keyed by document position, so scrolling does not change
-//! which connections are drawn.
+//! and glyphs that are not filled yet are reported in [`Selection::missing`]), and
+//! every random choice is keyed by document position, so scrolling does not change
+//! which connections are drawn. A table entry only knows its two cells, so a
+//! candidate is also checked against the ink of the other cells around its pair.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
+use super::connectors::Glyph;
+use super::geom::{dist_prim, V2};
 use super::ligatures::{Key, Side};
-use super::table::{Entry, Relation, Tables};
+use super::table::{Entry, Need, Probe, Relation, Tables, CLEARANCE};
 
 /// One visible row, top to bottom; matches `VisibleLine`.
 pub struct Row<'a> {
@@ -38,8 +41,8 @@ pub struct Placed {
 #[derive(Debug, Default)]
 pub struct Selection {
     pub placed: Vec<Placed>,
-    /// Pairs the worker still has to fill, without duplicates.
-    pub missing: Vec<(Relation, char, char)>,
+    /// Pairs and glyphs the worker still has to fill, sorted, without duplicates.
+    pub missing: Vec<Need>,
 }
 
 type Cell = (usize, usize);
@@ -111,7 +114,7 @@ struct Grid<'a> {
     tables: &'a Tables,
     seed: u32,
     cands: Vec<Cand>,
-    missing: BTreeSet<(Relation, char, char)>,
+    missing: BTreeSet<Need>,
 }
 
 impl Grid<'_> {
@@ -128,7 +131,7 @@ impl Grid<'_> {
             return;
         };
         let Some(list) = self.tables.get(rel, a, b) else {
-            self.missing.insert((rel, a, b));
+            self.missing.insert(Need::Pair(rel, a, b));
             return;
         };
         let row = &self.rows[g.0];
@@ -153,7 +156,7 @@ impl Grid<'_> {
                 .then(a.entry.cost.total_cmp(&b.entry.cost))
                 .then(a.hash.total_cmp(&b.hash))
         });
-        for c in self.cands.drain(..) {
+        for c in std::mem::take(&mut self.cands) {
             if c.rel != Relation::H && c.hash >= density {
                 continue;
             }
@@ -171,7 +174,7 @@ impl Grid<'_> {
                     keys.push(Res::Band(c.g.0, doc / 2));
                 }
             }
-            if keys.iter().any(|k| used.contains(k)) {
+            if keys.iter().any(|k| used.contains(k)) || !self.clear(&c) {
                 continue;
             }
             used.extend(keys);
@@ -183,6 +186,80 @@ impl Grid<'_> {
             });
         }
     }
+}
+
+impl Grid<'_> {
+    /// The prototype's `clearOfOthers`: the path's probe points stay at least
+    /// [`CLEARANCE`] from the strokes of every other occupied (non-blank) cell in the
+    /// rows and columns around the pair. The row above the pair and the row below it
+    /// are read only when the probe reaches them ([`Probe::reach`]); nothing there
+    /// could block it otherwise. Rows outside `rows` count as empty. A neighbour whose
+    /// strokes are not worked out yet blocks the path and is listed as missing.
+    fn clear(&mut self, c: &Cand) -> bool {
+        let probe = &c.entry.probe;
+        if probe.points.is_empty() {
+            return true;
+        }
+        let (upper, lower) = (c.g.0.min(c.h.0), c.g.0.max(c.h.0));
+        let first = upper.saturating_sub(usize::from(probe.reach[0]));
+        let last = lower + usize::from(probe.reach[1]);
+        let (left, right) = (c.g.1.min(c.h.1).saturating_sub(1), c.g.1.max(c.h.1) + 1);
+        let mut clear = true;
+        for r in first..=last {
+            let Some(row) = self.chars.get(r) else {
+                continue;
+            };
+            for col in left..=right {
+                let Some(&ch) = row.get(col) else {
+                    continue;
+                };
+                if (r, col) == c.g || (r, col) == c.h || ch.is_whitespace() {
+                    continue;
+                }
+                let glyph = match self.tables.strokes(ch) {
+                    Some(Some(glyph)) => glyph,
+                    Some(None) => continue,
+                    None => {
+                        self.missing.insert(Need::Glyph(ch));
+                        clear = false;
+                        continue;
+                    }
+                };
+                let at = self
+                    .tables
+                    .offset(r as isize - c.g.0 as isize, col as isize - c.g.1 as isize);
+                if blocks(glyph, at, probe) {
+                    return false;
+                }
+            }
+        }
+        clear
+    }
+}
+
+/// Whether a probe point lies within [`CLEARANCE`] of `glyph` drawn at `at`.
+fn blocks(glyph: &Glyph, at: V2, probe: &Probe) -> bool {
+    // The box is sampled on arcs; the extra 0.1 covers what sampling misses.
+    let pad = CLEARANCE + 0.1;
+    let b = glyph.bbox;
+    let (x0, y0, x1, y1) = (
+        b[0] + at[0] - pad,
+        b[1] + at[1] - pad,
+        b[2] + at[0] + pad,
+        b[3] + at[1] + pad,
+    );
+    let p = probe.bbox;
+    if p[2] < x0 || p[0] > x1 || p[3] < y0 || p[1] > y1 {
+        return false;
+    }
+    probe.points.iter().any(|p| {
+        (x0..=x1).contains(&p[0])
+            && (y0..=y1).contains(&p[1])
+            && glyph
+                .prims
+                .iter()
+                .any(|q| dist_prim(q, [p[0] - at[0], p[1] - at[1]]) < CLEARANCE)
+    })
 }
 
 /// Choose the ligatures for the visible rows.
@@ -300,8 +377,8 @@ mod tests {
             if sel.missing.is_empty() {
                 return (sel, n);
             }
-            for (rel, a, b) in sel.missing {
-                t.fill(rel, a, b, &rows_of);
+            for need in sel.missing {
+                t.supply(need, &rows_of);
             }
         }
         panic!("selection never settled");
@@ -587,6 +664,39 @@ mod tests {
                 assert!(c != 2 && c != 3, "{p:?} touches an empty cell");
             }
         }
+    }
+
+    #[test]
+    fn a_tail_that_crosses_a_third_letter_is_rejected() {
+        let mut t = tables();
+        let s = settings(1.0, 1);
+        let joined = |t: &mut Tables, top: &str| -> Vec<Placed> {
+            let rows = [
+                Row {
+                    line: 0,
+                    start_col: 0,
+                    text: top,
+                },
+                Row {
+                    line: 1,
+                    start_col: 0,
+                    text: " d",
+                },
+            ];
+            settle(t, &rows, &s).0.placed
+        };
+        // Alone, g's descender reaches d below and to the right with a tail.
+        let alone = joined(&mut t, "g ");
+        let tail = alone
+            .iter()
+            .find(|p| (p.row, p.col, p.rel) == (0, 0, Relation::Dr))
+            .expect("g joins d");
+        assert_eq!(tail.entry.mech, crate::lace::ligatures::Mech::Tail);
+        // With a p beside g nothing else claims g or d, yet the tail is rejected...
+        assert!(joined(&mut t, "gp").is_empty());
+        // ...because it passes through p's descender.
+        let p = t.strokes('p').flatten().expect("p is vectorised");
+        assert!(blocks(p, t.offset(0, 1), &tail.entry.probe));
     }
 
     #[test]
