@@ -6,6 +6,7 @@
 
 pub mod connectors;
 pub mod geom;
+pub mod ligatures;
 #[cfg(test)]
 pub mod model_font;
 pub mod vectorize;
