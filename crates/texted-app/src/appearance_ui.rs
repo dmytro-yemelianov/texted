@@ -43,7 +43,14 @@ const BORDER: usize = SHADOW + 3;
 const CORNER: usize = BORDER + 1;
 const INSET_X: usize = BORDER + 2;
 const INSET_Y: usize = BORDER + 3;
-const FIELDS: usize = BORDER + 4;
+/// The lace layer's rows.
+const LACE: usize = INSET_Y + 1;
+const LACE_DENSITY: usize = INSET_Y + 2;
+const LACE_STRENGTH: usize = INSET_Y + 3;
+const LACE_SPACING: usize = INSET_Y + 4;
+const LACE_SERIFS: usize = INSET_Y + 5;
+const LACE_SEED: usize = INSET_Y + 6;
+const FIELDS: usize = LACE_SEED + 1;
 /// The most rows shown at once; small screens show fewer, and pages scroll.
 const ROWS: usize = 7;
 struct Panel {
@@ -196,6 +203,14 @@ enum Value {
     Corner(u8),
     /// A panel inset in font pixels; `true` is horizontal.
     Inset(bool, u8),
+    Lace(bool),
+    /// Lace density in twentieths, 0 to 20.
+    LaceDensity(u8),
+    /// Lace strength in twentieths, 1 to 20.
+    LaceStrength(u8),
+    LaceSpacing(u8),
+    LaceSerifs(bool),
+    LaceSeed(u8),
 }
 struct Choice {
     label: String,
@@ -232,8 +247,18 @@ pub(crate) struct AppearanceUi {
     previews: Vec<(FontFamily, FontEngine, u64)>,
     preview_clock: u64,
     font_choices: RefCell<Option<(String, Arc<Vec<Choice>>)>>,
+    /// Why the current face cannot carry lace, if it cannot.
+    lace_unavailable: Option<String>,
 }
 impl AppearanceUi {
+    /// Tells the Lace row whether the face can carry lace; `Some(reason)` blocks turning it on.
+    #[allow(
+        dead_code,
+        reason = "the lace worker reports the face's verdict from Task 7"
+    )]
+    pub fn set_lace_unavailable(&mut self, reason: Option<String>) {
+        self.lace_unavailable = reason;
+    }
     pub fn new(mut settings: Appearance) -> Self {
         settings.typography.normalize();
         settings.pixel_typography.normalize();
@@ -259,6 +284,7 @@ impl AppearanceUi {
             previews: Vec::new(),
             preview_clock: 0,
             font_choices: RefCell::new(None),
+            lace_unavailable: None,
         }
     }
     pub fn set_terminal_graphics(&mut self, enabled: bool) {
@@ -460,6 +486,14 @@ impl AppearanceUi {
             CORNER => Value::Corner(self.settings.visuals().corner_inset),
             INSET_X => Value::Inset(true, self.settings.visuals().inset_x),
             INSET_Y => Value::Inset(false, self.settings.visuals().inset_y),
+            LACE => Value::Lace(self.settings.visuals().lace.enabled),
+            LACE_DENSITY => Value::LaceDensity(twentieths(self.settings.visuals().lace.density)),
+            LACE_STRENGTH => {
+                Value::LaceStrength(twentieths(self.settings.visuals().lace.strength).max(1))
+            }
+            LACE_SPACING => Value::LaceSpacing(self.settings.visuals().lace.spacing),
+            LACE_SERIFS => Value::LaceSerifs(self.settings.visuals().lace.serifs),
+            LACE_SEED => Value::LaceSeed(self.settings.visuals().lace.seed as u8),
             field => {
                 let index = field - FIRST_EFFECT;
                 let effect = Effect::ALL[index];
@@ -510,6 +544,15 @@ impl AppearanceUi {
                 }
             }
         }
+        if let Value::LaceDensity(n) | Value::LaceStrength(n) = self.selected(field) {
+            if !self.cell_backend && !self.terminal_graphics && cells > GAUGE + text.chars().count()
+            {
+                return format!(
+                    "{} {text}",
+                    texted_app::visuals::meter(f32::from(n) / 20.0, GAUGE)
+                );
+            }
+        }
         text
     }
     /// What a Visuals row shows for its current value.
@@ -530,6 +573,14 @@ impl AppearanceUi {
                 pixels.to_string()
             }
             Value::Border(border) => border.name().into(),
+            Value::Lace(_) => match &self.lace_unavailable {
+                Some(reason) => format!("Unavailable: {reason}"),
+                None => if v.lace.enabled { "On" } else { "Off" }.into(),
+            },
+            Value::LaceDensity(n) | Value::LaceStrength(n) => format!("{:.2}", f32::from(n) / 20.0),
+            Value::LaceSpacing(n) => format!("{n} {}", if n == 1 { "cell" } else { "cells" }),
+            Value::LaceSerifs(on) => if on { "Strokes" } else { "Ignored" }.into(),
+            Value::LaceSeed(n) => n.to_string(),
             _ => String::new(),
         }
     }
@@ -637,6 +688,37 @@ impl AppearanceUi {
             INSET_X | INSET_Y => (0..=8)
                 .map(|n| Choice::new(n.to_string(), Value::Inset(row == INSET_X, n)))
                 .collect(),
+            LACE => [false, true]
+                .into_iter()
+                .map(|on| Choice::new(if on { "On" } else { "Off" }.into(), Value::Lace(on)))
+                .collect(),
+            LACE_DENSITY => (0..=20)
+                .map(|n| Choice::new(format!("{:.2}", f32::from(n) / 20.0), Value::LaceDensity(n)))
+                .collect(),
+            LACE_STRENGTH => (1..=20)
+                .map(|n| {
+                    Choice::new(
+                        format!("{:.2}", f32::from(n) / 20.0),
+                        Value::LaceStrength(n),
+                    )
+                })
+                .collect(),
+            LACE_SPACING => (1..=3)
+                .map(|n| {
+                    let label = format!("{n} {}", if n == 1 { "cell" } else { "cells" });
+                    Choice::new(label, Value::LaceSpacing(n))
+                })
+                .collect(),
+            LACE_SERIFS => [false, true]
+                .into_iter()
+                .map(|on| {
+                    let label = if on { "Strokes" } else { "Ignored" };
+                    Choice::new(label.into(), Value::LaceSerifs(on))
+                })
+                .collect(),
+            LACE_SEED => (1..=32)
+                .map(|n| Choice::new(n.to_string(), Value::LaceSeed(n)))
+                .collect(),
             SHADOW_X | SHADOW_Y => (0..=4)
                 .map(|n| Choice::new(n.to_string(), Value::Offset(row == SHADOW_X, n)))
                 .collect(),
@@ -733,6 +815,14 @@ impl AppearanceUi {
             Value::Corner(n) => self.visuals_mut().corner_inset = n,
             Value::Inset(true, n) => self.visuals_mut().inset_x = n,
             Value::Inset(false, n) => self.visuals_mut().inset_y = n,
+            // A face that cannot carry lace keeps it off.
+            Value::Lace(true) if self.lace_unavailable.is_some() => {}
+            Value::Lace(on) => self.visuals_mut().lace.enabled = on,
+            Value::LaceDensity(n) => self.visuals_mut().lace.density = f32::from(n) / 20.0,
+            Value::LaceStrength(n) => self.visuals_mut().lace.strength = f32::from(n) / 20.0,
+            Value::LaceSpacing(n) => self.visuals_mut().lace.spacing = n,
+            Value::LaceSerifs(on) => self.visuals_mut().lace.serifs = on,
+            Value::LaceSeed(n) => self.visuals_mut().lace.seed = u32::from(n),
             Value::Font(font) => {
                 let t = self.settings.editor_typography_mut();
                 let zoom = t.scale_percent();
@@ -1377,6 +1467,10 @@ impl AppearanceUi {
     }
 }
 /// Row titles; compact ones fit seven 8-pixel cells.
+/// A 0 to 1 amount as whole twentieths, the step of the lace rows.
+fn twentieths(amount: f32) -> u8 {
+    (amount * 20.0).round().clamp(0.0, 20.0) as u8
+}
 fn field_title(field: usize, compact: bool) -> &'static str {
     if (FIRST_EFFECT..SHADOW).contains(&field) {
         let effect = Effect::ALL[field - FIRST_EFFECT];
@@ -1387,8 +1481,28 @@ fn field_title(field: usize, compact: bool) -> &'static str {
         };
     }
     const COMPACT: [&str; FIELDS - Effect::ALL.len()] = [
-        "Theme", "Screen", "Font", "Size", "Spacing", "Cursor", "Preset", "FPS", "Time", "Shadow",
-        "Shad X", "Shad Y", "Border", "Corner", "Inset X", "Inset Y",
+        "Theme",
+        "Screen",
+        "Font",
+        "Size",
+        "Spacing",
+        "Cursor",
+        "Preset",
+        "FPS",
+        "Time",
+        "Shadow",
+        "Shad X",
+        "Shad Y",
+        "Border",
+        "Corner",
+        "Inset X",
+        "Inset Y",
+        "Lace",
+        "Lace dens",
+        "Lace str",
+        "Lace gap",
+        "Lace serif",
+        "Lace seed",
     ];
     const FULL: [&str; FIELDS - Effect::ALL.len()] = [
         "Theme",
@@ -1407,6 +1521,12 @@ fn field_title(field: usize, compact: bool) -> &'static str {
         "Corner inset",
         "Inset X",
         "Inset Y",
+        "Lace",
+        "Lace density",
+        "Lace strength",
+        "Lace spacing",
+        "Lace serifs",
+        "Lace pattern",
     ];
     let index = if field >= SHADOW {
         field - Effect::ALL.len()
@@ -1839,6 +1959,59 @@ mod tests {
             (Border::Double, 24, 3, 1)
         );
         assert_eq!(ui.field_text(BORDER), "Double ═║");
+    }
+    #[test]
+    fn visuals_page_lists_the_lace_rows() {
+        let titles: Vec<&str> = (INSET_Y..FIELDS).map(|f| field_title(f, false)).collect();
+        assert_eq!(
+            titles,
+            [
+                "Inset Y",
+                "Lace",
+                "Lace density",
+                "Lace strength",
+                "Lace spacing",
+                "Lace serifs",
+                "Lace pattern"
+            ]
+        );
+        assert_eq!(FIELDS, INSET_Y + 7);
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        assert_eq!(ui.field_text(LACE), "Off");
+        pick(&mut ui, LACE, "On");
+        pick(&mut ui, LACE_DENSITY, "0.85");
+        pick(&mut ui, LACE_STRENGTH, "0.50");
+        pick(&mut ui, LACE_SPACING, "2 cells");
+        pick(&mut ui, LACE_SERIFS, "Strokes");
+        pick(&mut ui, LACE_SEED, "17");
+        let l = ui.settings.visuals().lace;
+        assert!(l.enabled && l.serifs);
+        assert_eq!((l.spacing, l.seed), (2, 17));
+        assert!((l.density - 0.85).abs() < 1e-6 && (l.strength - 0.5).abs() < 1e-6);
+        assert_eq!(ui.field_text(LACE), "On");
+        assert_eq!(ui.field_text(LACE_DENSITY), "0.85");
+        assert_eq!(ui.field_text(LACE_SPACING), "2 cells");
+        assert_eq!(ui.field_text(LACE_SERIFS), "Strokes");
+        assert_eq!(ui.choices(LACE_DENSITY).len(), 21);
+        assert_eq!(ui.choices(LACE_STRENGTH).len(), 20);
+        assert_eq!(ui.choices(LACE_SEED).len(), 32);
+        assert!(ui.shown_text(LACE_DENSITY, 40).starts_with("████"));
+    }
+    #[test]
+    fn an_unavailable_face_blocks_the_lace_row() {
+        let reason = "cell 4×6 is outside 6–32 × 8–64";
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        ui.set_lace_unavailable(Some(reason.into()));
+        assert_eq!(ui.field_text(LACE), format!("Unavailable: {reason}"));
+        let on = Choice::new("On".into(), Value::Lace(true));
+        ui.choose(&on);
+        assert!(!ui.settings.visuals().lace.enabled);
+        ui.set_lace_unavailable(None);
+        assert_eq!(ui.field_text(LACE), "Off");
+        ui.choose(&on);
+        assert!(ui.settings.visuals().lace.enabled);
     }
     #[test]
     fn terminals_show_visuals_as_window_only() {
