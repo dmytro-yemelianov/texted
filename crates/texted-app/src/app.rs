@@ -1932,12 +1932,9 @@ impl App {
                 // The rows `paint_text` draws (a prefix of the visible lines) and one hidden
                 // row beyond each edge, so connections across the edges do not depend on
                 // what is on screen.
-                let line_height = self.font.line_height_px as usize;
                 let lines = &frame.layout.visible_lines;
-                let drawn = lines
-                    .iter()
-                    .take_while(|l| l.y_px as usize + line_height <= frame.text_height)
-                    .count();
+                let drawn =
+                    editor_view::drawn_rows(lines, self.font.line_height_px, frame.text_height);
                 let edges = crate::viewport::edge_rows(&p.snapshot, &frame.config, &lines[..drawn]);
                 let rows = crate::viewport::lace_rows(&edges, &lines[..drawn]);
                 let settings = layer::Settings {
