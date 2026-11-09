@@ -696,9 +696,13 @@ impl AppearanceUi {
             INSET_X | INSET_Y => (0..=8)
                 .map(|n| Choice::new(n.to_string(), Value::Inset(row == INSET_X, n)))
                 .collect(),
+            // A face that cannot carry lace shows On disabled.
             LACE => [false, true]
                 .into_iter()
-                .map(|on| Choice::new(if on { "On" } else { "Off" }.into(), Value::Lace(on)))
+                .map(|on| Choice {
+                    enabled: !on || self.lace_unavailable.is_none(),
+                    ..Choice::new(if on { "On" } else { "Off" }.into(), Value::Lace(on))
+                })
                 .collect(),
             LACE_DENSITY => (0..=20)
                 .map(|n| Choice::new(format!("{:.2}", f32::from(n) / 20.0), Value::LaceDensity(n)))
@@ -2012,11 +2016,24 @@ mod tests {
         ui.set_open(true);
         ui.set_lace_unavailable(Some(reason.into()));
         assert_eq!(ui.field_text(LACE), format!("Unavailable: {reason}"));
+        // On is listed but disabled; Off stays selectable.
+        let enabled = |ui: &AppearanceUi| -> Vec<(String, bool)> {
+            let choices = ui.choices(LACE);
+            choices
+                .iter()
+                .map(|c| (c.label.clone(), c.enabled))
+                .collect()
+        };
+        assert_eq!(
+            enabled(&ui),
+            [("Off".to_string(), true), ("On".to_string(), false)]
+        );
         let on = Choice::new("On".into(), Value::Lace(true));
         ui.choose(&on);
         assert!(!ui.settings.visuals().lace.enabled);
         ui.set_lace_unavailable(None);
         assert_eq!(ui.field_text(LACE), "Off");
+        assert!(enabled(&ui).iter().all(|c| c.1));
         ui.choose(&on);
         assert!(ui.settings.visuals().lace.enabled);
     }
