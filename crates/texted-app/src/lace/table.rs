@@ -174,40 +174,68 @@ mod tests {
         assert_eq!(t.get(Relation::H, 'f', 'i').unwrap(), before.as_slice());
     }
 
+    /// The spec's classic pairs and the mechanisms that count as reproducing each.
+    const CLASSIC: [(&str, &[Mech]); 11] = [
+        ("ff", &[Mech::Fuse]),
+        ("fi", &[Mech::Hook]),
+        ("fl", &[Mech::Hook]),
+        ("ft", &[Mech::Fuse, Mech::Hook]),
+        ("Th", &[Mech::BarStem, Mech::Fuse]),
+        ("ct", &[Mech::Arch]),
+        ("st", &[Mech::Arch]),
+        ("sp", &[Mech::Arch]),
+        ("ст", &[Mech::Arch]),
+        ("тт", &[Mech::Fuse]),
+        ("пт", &[Mech::Fuse, Mech::BarStem]),
+    ];
+
+    /// Classic pairs whose `H` table, serifs ignored, holds a reproducing mechanism.
+    fn classic_pairs(family: FontFamily) -> Vec<&'static str> {
+        let f = face(family);
+        let rows = move |c: char| f.glyph(c).map(<[u8]>::to_vec);
+        let m = FaceMetrics::measure(rows, f.width, f.height).unwrap();
+        let mut t = Tables::new(m, false, [f.width, f.height]);
+        CLASSIC
+            .iter()
+            .filter(|(p, want)| {
+                let mut it = p.chars();
+                let (a, b) = (it.next().unwrap(), it.next().unwrap());
+                t.fill(Relation::H, a, b, &rows);
+                let got = t.get(Relation::H, a, b).unwrap();
+                got.iter().any(|e| want.contains(&e.mech))
+            })
+            .map(|(p, _)| *p)
+            .collect()
+    }
+
+    /// Baseline, not a target: VGA meets the spec's 11/11 and the other bundled faces
+    /// are pinned where they stand, so a regression fails and an improvement passes.
+    #[test]
+    fn bundled_faces_keep_their_classic_pair_baseline() {
+        for (family, floor) in [
+            (FontFamily::Vga, 11),
+            (FontFamily::Bios, 10),
+            (FontFamily::Ega, 10),
+            (FontFamily::Spleen, 8),
+            (FontFamily::SpleenSmall, 5),
+        ] {
+            let got = classic_pairs(family);
+            assert!(
+                got.len() >= floor,
+                "{}: {} of 11 ({got:?}), baseline {floor}",
+                family.name(),
+                got.len()
+            );
+        }
+    }
+
     #[test]
     fn vga_tables_reproduce_the_classic_pairs() {
-        let cases: [(&str, &[Mech]); 11] = [
-            ("ff", &[Mech::Fuse]),
-            ("fi", &[Mech::Hook]),
-            ("fl", &[Mech::Hook]),
-            ("ft", &[Mech::Fuse, Mech::Hook]),
-            ("Th", &[Mech::BarStem, Mech::Fuse]),
-            ("ct", &[Mech::Arch]),
-            ("st", &[Mech::Arch]),
-            ("sp", &[Mech::Arch]),
-            ("ст", &[Mech::Arch]),
-            ("тт", &[Mech::Fuse]),
-            ("пт", &[Mech::Fuse, Mech::BarStem]),
-        ];
-        let mut t = tables();
-        let mut ok = 0;
-        for (p, want) in cases {
-            let mut it = p.chars();
-            let (a, b) = (it.next().unwrap(), it.next().unwrap());
-            t.fill(Relation::H, a, b, &rows);
-            let got: Vec<Mech> = t
-                .get(Relation::H, a, b)
-                .unwrap()
-                .iter()
-                .map(|e| e.mech)
-                .collect();
-            if want.iter().any(|m| got.contains(m)) {
-                ok += 1;
-            } else {
-                eprintln!("{p}: wanted {want:?}, got {got:?}");
-            }
-        }
-        assert_eq!(ok, 11);
+        assert_eq!(
+            classic_pairs(FontFamily::Vga),
+            CLASSIC.map(|(p, _)| p),
+            "VGA must reproduce all eleven"
+        );
     }
 
     #[test]
