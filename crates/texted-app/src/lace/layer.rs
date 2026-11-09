@@ -18,7 +18,7 @@ pub struct Row<'a> {
     pub text: &'a str,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub density: f32,
     pub spacing: u8,

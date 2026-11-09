@@ -2,6 +2,7 @@
 use crate::{
     graphics::{draw_box, draw_rect, DrawList, FontEngine},
     horizontal_scroll::{Scrollbar, BAR_HEIGHT},
+    lace::layer::Placed,
     search_ui::{CLOSE_X, NEXT_X, PANEL_WIDTH, PREVIOUS_X},
 };
 use std::time::{Duration, Instant};
@@ -32,6 +33,10 @@ pub(crate) struct ViewModel<'a> {
     pub gpu_name: &'a str,
     pub frame_start: Instant,
     pub layout_time: Duration,
+    /// Lace connections for the rows of `layout.visible_lines` (`Placed::row` indexes them).
+    pub lace: Option<&'a [Placed]>,
+    /// How far the lace colour goes from the background towards the text, 0 to 1.
+    pub lace_strength: f32,
 }
 pub(crate) fn paint(
     buffer: &mut DrawList,
@@ -43,6 +48,7 @@ pub(crate) fn paint(
     paint_gutter(buffer, model);
     paint_search(buffer, model);
     paint_selection(buffer, font_engine, model);
+    paint_lace(buffer, font_engine, model);
     paint_text(buffer, font_engine, model);
     paint_caret(buffer, font_engine, model);
     if model.search_state.mode != SearchBarMode::Closed {
@@ -213,6 +219,55 @@ fn paint_selection(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &
             }
         }
     }
+}
+
+/// The lace under the text: each placed sprite as a glyph quad on the text's pixel
+/// grid, clipped to the text area, in the background colour moved `lace_strength`
+/// of the way to the text colour.
+fn paint_lace(buffer: &mut DrawList, font: &mut FontEngine, model: &ViewModel<'_>) {
+    let Some(placed) = model.lace.filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let color = mix(model.palette.bg, model.palette.text, model.lace_strength);
+    let pixel = font.pixel_px();
+    // Column x accumulated and rounded as `draw_string` places glyphs, so faces whose
+    // width lands on half pixels round the same way as the text.
+    let columns = placed.iter().map(|p| p.col).max().unwrap_or(0) + 1;
+    let mut xs = Vec::with_capacity(columns);
+    let mut x = model.text_start_x as f32;
+    for _ in 0..columns {
+        xs.push(x.round());
+        x += font.char_width_px;
+    }
+    let area = [
+        model.text_start_x as f32,
+        0.0,
+        model.width as f32,
+        model.text_height as f32,
+    ];
+    for p in placed {
+        let Some(line) = model.layout.visible_lines.get(p.row) else {
+            continue;
+        };
+        let sprite = &p.entry.sprite;
+        if sprite.width == 0 || sprite.height == 0 {
+            continue;
+        }
+        let glyph = font.sprite_glyph(sprite);
+        let x = xs[p.col] + sprite.origin[0] as f32 * pixel;
+        // Text glyphs sit two pixels below the row's top, as in `paint_text`.
+        let y = (line.y_px as usize + 2) as f32 + sprite.origin[1] as f32 * pixel;
+        let size = [sprite.width as f32 * pixel, sprite.height as f32 * pixel];
+        buffer.push_within([x, y, size[0], size[1]], area, color, Some(glyph));
+    }
+}
+
+/// Each channel of `from` moved `t` of the way to `to`.
+fn mix(from: u32, to: u32, t: f32) -> u32 {
+    [16, 8, 0].iter().fold(0, |out, &shift| {
+        let (a, b) = (((from >> shift) & 255) as f32, ((to >> shift) & 255) as f32);
+        out | (((a + (b - a) * t).round().clamp(0.0, 255.0) as u32) << shift)
+    })
 }
 
 fn paint_text(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &ViewModel<'_>) {
@@ -821,5 +876,150 @@ impl<'a> SnapshotLines<'a> {
     }
     pub(crate) fn get(&self, line: usize) -> Option<ropey::RopeSlice<'a>> {
         (line < self.len()).then(|| self.0.line(line))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        graphics::Draw,
+        lace::{
+            ligatures::Mech,
+            sprite::Sprite,
+            table::{Entry, Relation},
+        },
+        viewport::Viewport,
+    };
+    use std::sync::Arc;
+    use texted_app::appearance::{Appearance, FontFamily, Palette, Typography};
+
+    fn placed(row: usize, col: usize, origin: [i32; 2], size: [u32; 2]) -> Placed {
+        Placed {
+            row,
+            col,
+            rel: Relation::H,
+            entry: Arc::new(Entry {
+                mech: Mech::Fuse,
+                cost: 0.0,
+                keys: Vec::new(),
+                sprite: Arc::new(Sprite {
+                    origin,
+                    width: size[0],
+                    height: size[1],
+                    coverage: vec![255; (size[0] * size[1]) as usize],
+                }),
+                trim: None,
+                drop: Vec::new(),
+                absorb: None,
+            }),
+        }
+    }
+
+    /// Paints `text` in VGA at `zoom` percent with `lace` at strength 0.35.
+    fn painted(text: &str, zoom: u16, lace: &[Placed]) -> (DrawList, Palette) {
+        let snapshot = texted_buffer::TextBuffer::from_string(text.into()).create_snapshot();
+        let mut font = FontEngine::with_typography(Typography {
+            family: FontFamily::Vga,
+            size_px: 16,
+            line_spacing: 100,
+            zoom_percent: zoom,
+        });
+        let mut ui = FontEngine::new(16.0);
+        let mut viewport = Viewport::new(|| {});
+        let frame = viewport.prepare(&snapshot, &font, 800, 400);
+        let palette = Appearance::default().palette().unwrap();
+        let (selection, search) = (SelectionState::default(), SearchState::default());
+        let mut list = DrawList::default();
+        paint(
+            &mut list,
+            &mut font,
+            &mut ui,
+            &ViewModel {
+                palette: &palette,
+                snap: &snapshot,
+                layout: &frame.layout,
+                config: &frame.config,
+                selection: &selection,
+                search_state: &search,
+                compact: false,
+                width: 800,
+                height: 400,
+                text_height: frame.text_height,
+                gutter_w: frame.gutter_w,
+                line_digits: frame.line_digits,
+                text_start_x: frame.text_start_x,
+                show_line_numbers: viewport.line_numbers,
+                caret_visible: false,
+                current_scrollbar: None,
+                show_perf_hud: false,
+                gpu_name: "",
+                frame_start: Instant::now(),
+                layout_time: Duration::ZERO,
+                lace: Some(lace),
+                lace_strength: 0.35,
+            },
+        );
+        (list, palette)
+    }
+
+    /// Glyph quads whose bitmap has `size` font pixels, with their places in the list.
+    fn quads(list: &DrawList, size: [u32; 2]) -> Vec<(usize, &Draw)> {
+        list.draws
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                d.glyph
+                    .as_ref()
+                    .is_some_and(|g| [g.width, g.height] == size)
+            })
+            .collect()
+    }
+
+    fn text_quads<'a>(list: &'a DrawList, palette: &Palette) -> Vec<(usize, &'a Draw)> {
+        list.draws
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.glyph.is_some() && d.color == palette.text)
+            .collect()
+    }
+
+    #[test]
+    fn lace_draws_before_text() {
+        let lace = [
+            placed(0, 0, [2, 4], [3, 5]),
+            placed(0, 7, [5, 9], [3, 5]),
+            placed(1, 1, [-1, 12], [3, 5]),
+        ];
+        let (list, palette) = painted("office staff\nfifth", 100, &lace);
+        let strokes = quads(&list, [3, 5]);
+        assert_eq!(strokes.len(), lace.len());
+        let first_text = text_quads(&list, &palette)[0].0;
+        let at: Vec<usize> = strokes.iter().map(|(i, _)| *i).collect();
+        assert!(at.iter().all(|&i| i < first_text), "{at:?} vs {first_text}");
+        // Each channel goes 35 % of the way from the background to the text colour.
+        let channel = |c: u32, shift: u32| ((c >> shift) & 255) as f32;
+        let want = [16, 8, 0].iter().fold(0, |out, &shift| {
+            let (bg, text) = (channel(palette.bg, shift), channel(palette.text, shift));
+            out | (((bg + (text - bg) * 0.35).round() as u32) << shift)
+        });
+        assert_ne!(want, palette.bg);
+        assert!(strokes.iter().all(|(_, d)| d.color == want), "{want:06x}");
+    }
+
+    #[test]
+    fn sprites_align_with_text_at_fractional_zoom() {
+        let text = "abcdefghijklmnopqrstuvwxyz".repeat(2);
+        let lace: Vec<Placed> = (0..text.len())
+            .map(|col| placed(0, col, [0, 0], [1, 1]))
+            .collect();
+        let (list, palette) = painted(&text, 110, &lace);
+        let strokes = quads(&list, [1, 1]);
+        let glyphs = text_quads(&list, &palette);
+        assert_eq!(strokes.len(), text.len());
+        for (col, ((_, s), (_, g))) in strokes.iter().zip(&glyphs).enumerate() {
+            assert_eq!(s.rect[..2], g.rect[..2], "column {col}");
+            assert!((s.rect[2] - 1.1).abs() < 1e-4, "{:?}", s.rect);
+        }
     }
 }

@@ -252,10 +252,6 @@ pub(crate) struct AppearanceUi {
 }
 impl AppearanceUi {
     /// Tells the Lace row whether the face can carry lace; `Some(reason)` blocks turning it on.
-    #[allow(
-        dead_code,
-        reason = "the lace worker reports the face's verdict from Task 7"
-    )]
     pub fn set_lace_unavailable(&mut self, reason: Option<String>) {
         self.lace_unavailable = reason;
     }

@@ -10,6 +10,7 @@ use texted_app::{
     appearance::Typography,
     bitmap_fonts::{self, BitmapFace},
     cell_grid::{self, CellCommand, CellGrid},
+    lace::sprite::Sprite,
 };
 
 static NEXT_FONT_ID: AtomicU64 = AtomicU64::new(1);
@@ -131,14 +132,24 @@ impl DrawList {
         color: u32,
         glyph: Option<Arc<CachedGlyph>>,
     ) {
+        self.push_within(rect, [0.0, 0.0, bounds[0], bounds[1]], color, glyph);
+    }
+    /// `push`, clipped to the `[left, top, right, bottom]` area instead of the bounds.
+    pub(crate) fn push_within(
+        &mut self,
+        rect: [f32; 4],
+        area: [f32; 4],
+        color: u32,
+        glyph: Option<Arc<CachedGlyph>>,
+    ) {
         let [x, y, w, h] = rect;
         if w <= 0.0 || h <= 0.0 {
             return;
         }
-        let left = x.max(0.0);
-        let top = y.max(0.0);
-        let right = (x + w).min(bounds[0]);
-        let bottom = (y + h).min(bounds[1]);
+        let left = x.max(area[0]);
+        let top = y.max(area[1]);
+        let right = (x + w).min(area[2]);
+        let bottom = (y + h).min(area[3]);
         if right <= left || bottom <= top {
             return;
         }
@@ -169,6 +180,10 @@ pub struct FontEngine {
     cache_bytes: usize,
     preview_id: u64,
     preview_cache: HashMap<(u32, u32, u32), Arc<CachedGlyph>>,
+    /// Lace sprites as glyphs, by the sprite's address; holding the sprite keeps that
+    /// address from being reused while its glyph key is cached.
+    sprites: HashMap<usize, (Arc<Sprite>, Arc<CachedGlyph>)>,
+    sprite_id: u64,
 }
 impl FontEngine {
     pub fn for_cells() -> Self {
@@ -205,7 +220,36 @@ impl FontEngine {
             cache_bytes: 0,
             preview_id: NEXT_FONT_ID.fetch_add(1, Ordering::Relaxed),
             preview_cache: HashMap::new(),
+            sprites: HashMap::new(),
+            sprite_id: NEXT_FONT_ID.fetch_add(1, Ordering::Relaxed),
         }
+    }
+    /// The bitmap strike the editor text is drawn with.
+    pub fn face(&self) -> BitmapFace {
+        self.face
+    }
+    /// Names the strike: its records' address and its cell size.
+    pub fn face_id(&self) -> (usize, u16, u16) {
+        self.face.id()
+    }
+    /// A lace sprite as a glyph bitmap in font pixels, with a key of its own.
+    pub(crate) fn sprite_glyph(&mut self, sprite: &Arc<Sprite>) -> Arc<CachedGlyph> {
+        let at = Arc::as_ptr(sprite) as usize;
+        if let Some((_, glyph)) = self.sprites.get(&at) {
+            return glyph.clone();
+        }
+        if self.sprites.len() >= MAX_CACHED_GLYPHS {
+            self.sprites.clear();
+            self.sprite_id = NEXT_FONT_ID.fetch_add(1, Ordering::Relaxed);
+        }
+        let glyph = Arc::new(CachedGlyph {
+            key: GlyphKey(self.sprite_id, self.sprites.len() as u32),
+            width: sprite.width,
+            height: sprite.height,
+            coverage: sprite.coverage.clone(),
+        });
+        self.sprites.insert(at, (sprite.clone(), glyph.clone()));
+        glyph
     }
     /// Small picker specimen; downsampling is nearest-texel and never changes document masks.
     pub fn draw_preview(

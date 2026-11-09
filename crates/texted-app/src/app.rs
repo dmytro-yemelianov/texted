@@ -23,6 +23,11 @@ use texted_app::{
     commands::EditorCommand,
     framebuffer::ScreenMapping,
     input::{self, Intent, KeyInput, SearchContext},
+    lace::{
+        layer,
+        service::{FaceId, FaceKey, LaceService},
+        vectorize::FaceMetrics,
+    },
     preferences::{self, Preferences},
     search::SearchBarMode,
 };
@@ -77,6 +82,9 @@ pub(crate) struct App {
     pointer_physical: (f32, f32),
     panel_help: crate::status_ui::PanelHelp,
     stats: texted_app::document_stats::DocumentStats,
+    lace: LaceService,
+    /// The editor face lace was last measured on, and what the measurement said.
+    lace_face: Option<(FaceId, Result<FaceMetrics, String>)>,
     pointer_inside: bool,
     focused: bool,
     command_hover: Option<usize>,
@@ -173,8 +181,10 @@ impl App {
             ScreenMapping::new((size.width, size.height), appearance.settings.resolution());
         let w = wake.clone();
         let stats = texted_app::document_stats::DocumentStats::new(move || w());
+        let w = wake.clone();
+        let lace = LaceService::new(move || w());
         session.message = warning;
-        Self {
+        let mut app = Self {
             session,
             wake,
             dialogs,
@@ -209,6 +219,8 @@ impl App {
             pointer_physical: (0.0, 0.0),
             panel_help: crate::status_ui::PanelHelp::new(),
             stats,
+            lace,
+            lace_face: None,
             pointer_inside: false,
             focused: false,
             command_hover: None,
@@ -217,7 +229,24 @@ impl App {
             command_flash: None,
             effect_time: 0.0,
             next_effect_frame: None,
+        };
+        app.refresh_lace_face();
+        app
+    }
+    /// Measures the editor face for lace when it changed, and tells the Visuals page
+    /// whether the face can carry it. Cell terminals draw no lace.
+    fn refresh_lace_face(&mut self) {
+        if self.window.is_cells() {
+            return;
         }
+        let id = self.font.face_id();
+        if self.lace_face.as_ref().is_none_or(|(at, _)| *at != id) {
+            let face = self.font.face();
+            let rows = |c| face.glyph(c).map(<[u8]>::to_vec);
+            self.lace_face = Some((id, FaceMetrics::measure(rows, face.width, face.height)));
+        }
+        let reason = self.lace_face.as_ref().and_then(|(_, m)| m.clone().err());
+        self.appearance.set_lace_unavailable(reason);
     }
     /// Screen effects belong to the window backend; terminals draw the flat picture.
     fn with_effects(&mut self, mapping: ScreenMapping) -> ScreenMapping {
@@ -997,6 +1026,8 @@ impl App {
                 }
             }
         }
+        // A reset clears the Visuals page's verdict, and a new font may change it.
+        self.refresh_lace_face();
         self.update_cursor();
         self.window.request_redraw();
     }
@@ -1886,6 +1917,43 @@ impl App {
                 corner_inset: visuals.corner_inset,
             }),
         };
+        // Lace only when it is on and the face can carry it; never on cell terminals.
+        let lace = visuals.lace;
+        let placed = match &self.lace_face {
+            Some((id, Ok(metrics))) if lace.enabled && *id == self.font.face_id() => {
+                let key = FaceKey {
+                    id: *id,
+                    cell: [
+                        metrics.width,
+                        (self.font.line_height_px / self.font.pixel_px()).round() as u16,
+                    ],
+                    serifs: lace.serifs,
+                };
+                // The rows `paint_text` draws: a prefix of the visible lines.
+                let line_height = self.font.line_height_px as usize;
+                let rows: Vec<layer::Row> = frame
+                    .layout
+                    .visible_lines
+                    .iter()
+                    .take_while(|l| l.y_px as usize + line_height <= frame.text_height)
+                    .map(|l| layer::Row {
+                        line: l.line_index,
+                        start_col: l.start_col,
+                        text: &l.text,
+                    })
+                    .collect();
+                let settings = layer::Settings {
+                    density: lace.density,
+                    spacing: lace.spacing,
+                    seed: lace.seed,
+                };
+                Some(
+                    self.lace
+                        .place(key, self.font.face(), *metrics, &rows, settings),
+                )
+            }
+            _ => None,
+        };
         editor_view::paint(
             &mut self.draws,
             &mut self.font,
@@ -1914,6 +1982,8 @@ impl App {
                 gpu_name: self.renderer.description(),
                 frame_start: start,
                 layout_time: frame.layout_time,
+                lace: placed,
+                lace_strength: lace.strength,
             },
         );
         self.draws.translate(0.0, geometry.document_top() as f32);

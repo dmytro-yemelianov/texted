@@ -143,3 +143,21 @@ Validation: 252 Rust tests (6 opt-in ignored), strict Clippy/formatting, four Py
 ## Release v0.3.0
 
 `v0.3.0` is the first release after `v0.2.0` and packages PRs #7–#16: themes and typography, native menus, platform framebuffers, Style dropdowns, aspect-fit scaling, bundled bitmap fonts and the Verba library, tabs and the command panel, the terminal cell grid and Kitty graphics, and #16 above. Next candidates recorded in the known limits: syntax highlighting (none in the tree), grapheme/complex-script shaping, IME composition and memory-mapped loading.
+
+## Lace layer (2026-11-10)
+
+`feat/lace` adds an opt-in Visuals layer that joins the document's own letters with connecting strokes drawn under the text ([design](docs/superpowers/specs/2026-11-09-lace-design.md), [plan](docs/superpowers/plans/2026-11-09-lace.md); the prototype's outputs are the expected answers). The document's glyphs are drawn exactly as before; only stroke sprites are added between the selection highlight and the text.
+
+| Module | Owner / invariant |
+|---|---|
+| `lace/geom.rs`, `lace/connectors.rs` | Lines, arcs and dots in model units (x-height 8, y up from the glyph's own baseline); where a stroke may continue out of a letter |
+| `lace/vectorize.rs` | Bitmap glyph → strokes (Scale2x, thinning, tracing), serif stripping, `FaceMetrics::measure` (its error is the Visuals page's "Unavailable" reason) |
+| `lace/ligatures.rs` | Mechanisms (shared stroke, fuse, bar onto stem, hook, arch, rail, swash, stem, tail) with cost and the connector keys they use |
+| `lace/table.rs`, `lace/sprite.rs` | Per face, cell and serif setting: `(relation, a, b)` → cheapest entry per connector set, each with a one-font-pixel sprite |
+| `lace/layer.rs` | Stable local selection over the visible rows; random draws keyed by document line/column and seed; lists unfilled pairs instead of computing them |
+| `lace/service.rs` | One worker, latest request wins: fills requested pairs, publishes an `Arc<Tables>` per `FaceKey`, wakes through the `Wake` closure, drops work for a stale key; `place` reuses the last selection while rows, tables and settings are unchanged |
+| `graphics.rs`, `editor_view.rs`, `app.rs` | `FontEngine::face/face_id` and a sprite→glyph cache with its own keys; `paint_lace` places sprites on the text's rounded column x, clipped to the text area, in `bg + (text − bg) × strength`; the app measures the face on every appearance change and draws lace only when it is enabled and the face is available |
+
+Cell-only terminals (ANSI) get no lace; Kitty graphics terminals get it through the shared `DrawList`/raster path. The Tables cell is `[face width, round(line height / font pixel)]` font pixels, so unusual line spacing can leave between-row strokes up to half a font pixel off. Connections to rows outside the drawn rows are not selected, so the first and last visible rows gain their upward/downward strokes only when the neighbour row scrolls in.
+
+Validation: 297 workspace tests (texted-app 239, 6 opt-in ignored), strict Clippy/formatting, four Python regressions and four Metal readbacks. Native check through the Kitty path (a PTY peer reassembling tiles): lace on differs from lace off only in lace-coloured pixels and keeps every text pixel; scrolled frames match the unscrolled one on every row except the top row's strokes from the row above; serifs as strokes are denser; BIOS 8×8 draws lace; ANSI output is byte-identical with lace on and off. The GUI build opened VGA, BIOS and serif settings and quit cleanly through the system quit event.

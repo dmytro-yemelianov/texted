@@ -23,6 +23,10 @@ impl BitmapFace {
             data,
         })
     }
+    /// Names the strike: its records' address and the cell size. Records are never freed.
+    pub fn id(self) -> (usize, u16, u16) {
+        (self.data.as_ptr() as usize, self.width, self.height)
+    }
     pub fn glyph(self, ch: char) -> Option<&'static [u8]> {
         let stride = 4 + usize::from(self.height) * usize::from(self.width.div_ceil(8));
         let mut low = 0;
