@@ -6,7 +6,8 @@
 //! for another face (or cell, or serif setting) drops the work in progress, so a
 //! frame never gets tables built for a different face. [`LaceService::place`] keeps
 //! the last selection while its rows, tables and settings stay the same, so a
-//! redraw that changes nothing (a caret blink, an effect frame) selects nothing.
+//! redraw that changes nothing (a caret blink, an effect frame) selects nothing, and
+//! otherwise its [`Selector`] chooses again only the rows and bands that changed.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -14,7 +15,7 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 
-use super::layer::{select, Placed, Row, Settings};
+use super::layer::{Placed, Row, Selector, Settings};
 use super::table::{Need, Tables};
 use super::vectorize::FaceMetrics;
 use crate::bitmap_fonts::BitmapFace;
@@ -64,6 +65,8 @@ pub struct LaceService {
     worker: Option<JoinHandle<()>>,
     /// The last request sent, so a frame that needs the same work sends nothing.
     requested: Option<(FaceKey, Vec<Need>)>,
+    /// Keeps each row's and band's choice, so a frame chooses again only what changed.
+    selector: Selector,
     shown: Shown,
 }
 
@@ -145,6 +148,7 @@ impl LaceService {
             shared,
             worker: Some(worker),
             requested: None,
+            selector: Selector::default(),
             shown: Shown::default(),
         }
     }
@@ -170,7 +174,7 @@ impl LaceService {
                     &empty
                 }
             };
-            let selection = select(rows, on, &settings);
+            let selection = self.selector.select(rows, on, &settings);
             self.request(face, glyphs, &selection.missing);
             self.shown = Shown {
                 made_from: Some((face, tables, settings)),
@@ -245,7 +249,7 @@ fn fill(
         }
         tables.supply(need, &rows);
     }
-    let snapshot = done.then(|| Arc::new(tables.snapshot()));
+    let snapshot = done.then(|| tables.snapshot());
     // Filled entries stay valid for their key, even when the work was cut short.
     kept.push((request.key, tables));
     if kept.len() > KEPT {

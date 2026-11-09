@@ -2,6 +2,7 @@
 //! ligatures that can join them, each with its stroke sprite.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::connectors::{analyse, Glyph};
@@ -72,12 +73,19 @@ pub enum Need {
     Glyph(char),
 }
 
+/// Numbers each new [`Tables`].
+static LINEAGE: AtomicU64 = AtomicU64::new(0);
+
 pub struct Tables {
     metrics: FaceMetrics,
     serifs: bool,
     cell: [u16; 2],
     glyphs: BTreeMap<char, Option<Arc<Glyph>>>,
     entries: BTreeMap<(Relation, char, char), Vec<Arc<Entry>>>,
+    /// Shared by these tables and their snapshots; new tables get a new one.
+    lineage: u64,
+    /// How many glyphs and entry lists went in so far.
+    filled: u64,
 }
 
 impl Tables {
@@ -88,18 +96,29 @@ impl Tables {
             cell,
             glyphs: BTreeMap::new(),
             entries: BTreeMap::new(),
+            lineage: LINEAGE.fetch_add(1, Ordering::Relaxed) + 1,
+            filled: 0,
         }
     }
 
-    /// A copy to publish: the same entries and glyphs.
-    pub fn snapshot(&self) -> Self {
-        Self {
+    /// A copy to publish: the same entries and glyphs, never filled further.
+    pub fn snapshot(&self) -> Arc<Self> {
+        Arc::new(Self {
             metrics: self.metrics,
             serifs: self.serifs,
             cell: self.cell,
             glyphs: self.glyphs.clone(),
             entries: self.entries.clone(),
-        }
+            lineage: self.lineage,
+            filled: self.filled,
+        })
+    }
+
+    /// `(lineage, filled)`. Tables only grow and only the original is filled, so of
+    /// two stamps with the same lineage the larger holds everything the smaller did,
+    /// entry for entry.
+    pub fn stamp(&self) -> (u64, u64) {
+        (self.lineage, self.filled)
     }
 
     /// Fill what `need` asks for (worker side).
@@ -142,6 +161,7 @@ impl Tables {
             Arc::new(analyse(vectorize(&r, &self.metrics)))
         });
         self.glyphs.insert(c, g.clone());
+        self.filled += 1;
         g
     }
 
@@ -157,6 +177,7 @@ impl Tables {
         if self.entries.contains_key(&(rel, a, b)) {
             return;
         }
+        self.filled += 1;
         let (Some(g), Some(h)) = (self.glyph(a, rows), self.glyph(b, rows)) else {
             self.entries.insert((rel, a, b), Vec::new());
             return;
