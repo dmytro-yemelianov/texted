@@ -11,6 +11,7 @@ pub mod editing;
 pub mod font_library;
 pub mod framebuffer;
 pub mod input;
+pub mod lace;
 pub mod preferences;
 pub mod search;
 pub mod selection;
