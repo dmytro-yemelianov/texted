@@ -203,6 +203,9 @@ pub fn biarc(p1: V2, t1: V2, p2: V2, t2: V2) -> Option<Biarc> {
     let a2 = arc_points(p2, neg(t2), j);
     let mut pts = a1.pts;
     pts.extend(a2.pts[..a2.pts.len() - 1].iter().rev());
+    // f32 error in the recomputed centre can move the ends; pin them to the inputs.
+    pts[0] = p1;
+    *pts.last_mut().unwrap() = p2;
     let length = pts.windows(2).map(|w| dist(w[0], w[1])).sum();
     Some(Biarc {
         pts,
@@ -866,22 +869,140 @@ mod tests {
                         + prim_len(&g.prims[qi as usize])
                         - prim_len(&kept);
                     assert!(removed <= 0.25 * ink + 1e-3, "removed {removed} of {ink}");
+                    // The kept arc is a sub-range of the original arc.
+                    let (
+                        Prim::Arc {
+                            c: oc,
+                            r: or,
+                            a0,
+                            a1,
+                            ..
+                        },
+                        Prim::Arc {
+                            c: kc,
+                            r: kr,
+                            a0: k0,
+                            a1: k1,
+                            ..
+                        },
+                    ) = (g.prims[qi as usize], kept)
+                    else {
+                        panic!("trim of a non-arc");
+                    };
+                    assert!(oc == kc && or == kr, "kept arc moved");
+                    assert!(
+                        k0 >= a0 - 1e-3 && k1 <= a1 + 1e-3 && k0 < k1,
+                        "kept arc outside the original"
+                    );
+                    // The bridge starts at the cut end of the kept arc.
+                    let start = c.path[0];
+                    let (e0, e1) = (arc_point(kc, kr, k0), arc_point(kc, kr, k1));
+                    let cut = match ((k0 - a0).abs() > 1e-3, (a1 - k1).abs() > 1e-3) {
+                        (true, false) => e0,
+                        (false, true) => e1,
+                        (false, false) => {
+                            if dist(start, e0) < dist(start, e1) {
+                                e0
+                            } else {
+                                e1
+                            }
+                        }
+                        (true, true) => panic!("both ends of the arc were cut"),
+                    };
+                    assert!(
+                        dist(start, cut) < 1e-3,
+                        "bridge does not start at the cut: {start:?} {cut:?} {:?} {kept:?} {:?}",
+                        g.prims[qi as usize],
+                        c.drop
+                    );
+                    // Dropped strokes lie on the chain between the cut and a free end:
+                    // they touch nothing outside the chain and the trimmed arc.
+                    let chain: Vec<usize> = c
+                        .drop
+                        .iter()
+                        .map(|(_, d)| *d as usize)
+                        .chain([qi as usize])
+                        .collect();
+                    let mut free_end = c.drop.is_empty();
                     for (_, d) in &c.drop {
-                        let dp = &g.prims[*d as usize];
-                        for (_, e) in ends(dp) {
-                            let n = g
-                                .prims
-                                .iter()
-                                .enumerate()
-                                .filter(|(i, q)| *i != *d as usize && dist_prim(q, e) < 0.05)
-                                .count();
-                            assert!(n <= 1, "dropped stroke {d} touches a junction");
+                        for (_, e) in ends(&g.prims[*d as usize]) {
+                            let others: Vec<usize> = (0..g.prims.len())
+                                .filter(|i| *i != *d as usize && dist_prim(&g.prims[*i], e) < 0.05)
+                                .collect();
+                            assert!(others.len() <= 1, "dropped stroke {d} touches a junction");
+                            assert!(
+                                others.iter().all(|i| chain.contains(i)),
+                                "dropped stroke {d} touches the rest"
+                            );
+                            free_end |= others.is_empty();
                         }
                     }
+                    assert!(free_end, "chain has no free end");
                     checked += 1;
                 }
             }
         }
         assert!(checked > 100, "only {checked} reroutes checked");
+    }
+
+    fn only(c: &[Candidate], m: Mech, cost: f32) -> &Candidate {
+        c.iter()
+            .find(|c| c.mech == m && (c.cost - cost).abs() < 0.01)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {m:?} at {cost}: {:?}",
+                    c.iter().map(|c| (c.mech, c.cost)).collect::<Vec<_>>()
+                )
+            })
+    }
+
+    fn near(a: V2, b: V2) -> bool {
+        dist(a, b) < 1e-3
+    }
+
+    #[test]
+    fn rail_and_swash_across_a_space() {
+        // Prototype, dx 18, gap 10: тт has a rail and a straight swash joining g's ray 1 to h's ray 0.
+        let (g, h) = (mg('т'), mg('т'));
+        let c = across_space(&g, &h, 18.0, 10.0);
+        let rail = only(&c, Mech::Rail, 10.0);
+        assert_eq!(rail.path.len(), 2);
+        assert!(near(rail.path[0], g.rays[1].p));
+        assert!(near(rail.path[1], add(h.rays[0].p, [18.0, 0.0])));
+        only(&c, Mech::Swash, 10.0);
+        // ст: a swash leaves the cut arc of с (cut from 90 degrees) straight to the stem top of т.
+        let (g, h) = (mg('с'), mg('т'));
+        let c = across_space(&g, &h, 18.0, 10.0);
+        let sw = only(&c, Mech::Swash, 14.0);
+        let Some((Side::G, 0, Prim::Arc { c: ac, r, a0, .. })) = sw.trim else {
+            panic!("no trim")
+        };
+        assert_eq!(a0, 90.0);
+        assert!(near(sw.path[0], arc_point(ac, r, a0)));
+        assert!(near(
+            *sw.path.last().unwrap(),
+            add(h.rays[0].p, [18.0, 0.0])
+        ));
+    }
+
+    #[test]
+    fn stem_and_tail_between_rows() {
+        // Prototype, rows 20 apart: a descender continues straight into a stem below.
+        let (g, h) = (mg('р'), mg('m'));
+        let c = between_rows(&g, &h, 0.0, -20.0, 20.0);
+        let stem = only(&c, Mech::Stem, 8.0);
+        assert_eq!(stem.path.len(), 2);
+        assert!(near(stem.path[0], g.rays[0].p));
+        assert!(near(stem.path[1], add(h.rays[1].p, [0.0, -20.0])));
+        // C above c, one column right: a bent bridge from the lower end of C to c's lower stroke end.
+        let (g, h) = (mg('C'), mg('d'));
+        let c = between_rows(&g, &h, 9.0, -20.0, 20.0);
+        let tail = only(&c, Mech::Tail, 23.30);
+        assert!(tail.path.len() > 2 && tail.trim.is_none());
+        assert!(near(tail.path[0], g.rays[0].p));
+        assert!(near(
+            *tail.path.last().unwrap(),
+            add(h.rays[1].p, [9.0, -20.0])
+        ));
     }
 }
