@@ -382,9 +382,13 @@ impl AppearanceUi {
     pub fn reset(&mut self) {
         if self.visuals_page() {
             self.cancel_preview();
-            let time = self.settings.visuals().time;
+            let (time, lace) = {
+                let v = self.settings.visuals();
+                (v.time, v.lace)
+            };
             self.settings.visuals = Some(Visuals {
                 time,
+                lace,
                 ..Visuals::for_theme(self.settings.theme)
             });
         } else {
@@ -774,9 +778,14 @@ impl AppearanceUi {
                     self.settings.theme = theme;
                     self.settings.colors.clear();
                     // Like applying a machine in ShaderWallpaper, a theme brings its visuals.
-                    let time = self.settings.visuals().time;
+                    // Lace is not part of a theme's look.
+                    let (time, lace) = {
+                        let v = self.settings.visuals();
+                        (v.time, v.lace)
+                    };
                     self.settings.visuals = Some(Visuals {
                         time,
+                        lace,
                         ..Visuals::for_theme(theme)
                     });
                 }
@@ -788,6 +797,7 @@ impl AppearanceUi {
                     // A machine brings its timing and chrome, as in ShaderWallpaper.
                     Some(Preset::Machine(machine)) => Visuals {
                         time: v.time,
+                        lace: v.lace,
                         ..machine.visuals()
                     },
                     // Pixel SSH's presets only set the effects.
@@ -2012,6 +2022,28 @@ mod tests {
         assert_eq!(ui.field_text(LACE), "Off");
         ui.choose(&on);
         assert!(ui.settings.visuals().lace.enabled);
+    }
+    #[test]
+    fn theme_and_machine_changes_keep_the_lace_settings() {
+        use crate::visuals::Machine;
+        let mut ui = AppearanceUi::new(Appearance::default());
+        ui.set_open(true);
+        pick(&mut ui, LACE, "On");
+        pick(&mut ui, LACE_DENSITY, "0.85");
+        pick(&mut ui, LACE_SPACING, "3 cells");
+        pick(&mut ui, LACE_SEED, "9");
+        let lace = ui.settings.visuals().lace;
+        assert!(lace.enabled);
+        let other = Theme::ALL
+            .into_iter()
+            .find(|t| *t != ui.settings.theme)
+            .unwrap();
+        pick(&mut ui, 0, other.name());
+        assert_eq!(ui.settings.visuals().lace, lace);
+        pick(&mut ui, PRESET, Preset::Machine(Machine::AtariSt).name());
+        assert_eq!(ui.settings.visuals().lace, lace);
+        ui.reset();
+        assert_eq!(ui.settings.visuals().lace, lace);
     }
     #[test]
     fn terminals_show_visuals_as_window_only() {
