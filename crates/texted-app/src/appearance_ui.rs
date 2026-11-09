@@ -51,6 +51,12 @@ const LACE_SPACING: usize = INSET_Y + 4;
 const LACE_SERIFS: usize = INSET_Y + 5;
 const LACE_SEED: usize = INSET_Y + 6;
 const FIELDS: usize = LACE_SEED + 1;
+/// Whether a Visuals row only works in a window. Graphics terminals draw lace through
+/// the shared raster, so only cell terminals lose the Lace rows.
+fn window_only(field: usize, cell_backend: bool, terminal_graphics: bool) -> bool {
+    field >= STYLE_FIELDS
+        && (cell_backend || (terminal_graphics && !(LACE..=LACE_SEED).contains(&field)))
+}
 /// The most rows shown at once; small screens show fewer, and pages scroll.
 const ROWS: usize = 7;
 struct Panel {
@@ -504,7 +510,7 @@ impl AppearanceUi {
     }
     /// A row's value text, including what terminals manage themselves.
     fn field_text(&self, field: usize) -> String {
-        if field >= STYLE_FIELDS && (self.cell_backend || self.terminal_graphics) {
+        if window_only(field, self.cell_backend, self.terminal_graphics) {
             return "Window only".into();
         }
         if self.cell_backend && field != 0 {
@@ -545,8 +551,7 @@ impl AppearanceUi {
             }
         }
         if let Value::LaceDensity(n) | Value::LaceStrength(n) = self.selected(field) {
-            if !self.cell_backend && !self.terminal_graphics && cells > GAUGE + text.chars().count()
-            {
+            if !self.cell_backend && cells > GAUGE + text.chars().count() {
                 return format!(
                     "{} {text}",
                     texted_app::visuals::meter(f32::from(n) / 20.0, GAUGE)
@@ -586,7 +591,10 @@ impl AppearanceUi {
     }
     fn choices(&self, row: usize) -> Arc<Vec<Choice>> {
         // Terminals draw their own pointer, and their pictures skip the effect pass.
-        if (self.cell_backend && row != 0) || (self.terminal_graphics && row >= 5) {
+        if (self.cell_backend && row != 0)
+            || (self.terminal_graphics && row == 5)
+            || window_only(row, self.cell_backend, self.terminal_graphics)
+        {
             return Arc::new(vec![Choice {
                 label: if row >= STYLE_FIELDS {
                     "Window only".into()
@@ -2047,6 +2055,29 @@ mod tests {
         ui.set_cell_backend(true);
         assert!(ui.choices(PRESET).iter().all(|c| !c.enabled));
         assert_eq!(ui.field_text(FIRST_EFFECT), "Window only");
+    }
+    #[test]
+    fn graphics_terminals_keep_the_lace_rows_and_cell_terminals_do_not() {
+        let lace_rows = LACE..=LACE_SEED;
+        let mut cells = AppearanceUi::new(Appearance::default());
+        cells.set_cell_backend(true);
+        for row in lace_rows.clone() {
+            assert_eq!(cells.field_text(row), "Window only", "row {row}");
+            assert!(cells.choices(row).iter().all(|c| !c.enabled), "row {row}");
+        }
+        // Kitty terminals draw lace through the shared raster; the effect rows stay gated.
+        let mut kitty = AppearanceUi::new(Appearance::default());
+        kitty.set_terminal_graphics(true);
+        kitty.set_open(true);
+        assert_eq!(kitty.field_text(FIRST_EFFECT), "Window only");
+        assert!(kitty.choices(PRESET).iter().all(|c| !c.enabled));
+        for row in lace_rows {
+            assert_ne!(kitty.field_text(row), "Window only", "row {row}");
+            assert!(kitty.choices(row).iter().any(|c| c.enabled), "row {row}");
+        }
+        pick(&mut kitty, LACE, "On");
+        assert!(kitty.settings.visuals().lace.enabled);
+        assert!(kitty.shown_text(LACE_DENSITY, 40).starts_with('█'));
     }
     #[test]
     fn compact_lists_commit_clicked_values_and_outside_clicks_dismiss_only_the_list() {

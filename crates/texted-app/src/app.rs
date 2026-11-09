@@ -1919,7 +1919,7 @@ impl App {
         };
         // Lace only when it is on and the face can carry it; never on cell terminals.
         let lace = visuals.lace;
-        let placed = match &self.lace_face {
+        let lace_layer = match &self.lace_face {
             Some((id, Ok(metrics))) if lace.enabled && *id == self.font.face_id() => {
                 let key = FaceKey {
                     id: *id,
@@ -1929,28 +1929,29 @@ impl App {
                     ],
                     serifs: lace.serifs,
                 };
-                // The rows `paint_text` draws: a prefix of the visible lines.
+                // The rows `paint_text` draws (a prefix of the visible lines) and one hidden
+                // row beyond each edge, so connections across the edges do not depend on
+                // what is on screen.
                 let line_height = self.font.line_height_px as usize;
-                let rows: Vec<layer::Row> = frame
-                    .layout
-                    .visible_lines
+                let lines = &frame.layout.visible_lines;
+                let drawn = lines
                     .iter()
                     .take_while(|l| l.y_px as usize + line_height <= frame.text_height)
-                    .map(|l| layer::Row {
-                        line: l.line_index,
-                        start_col: l.start_col,
-                        text: &l.text,
-                    })
-                    .collect();
+                    .count();
+                let edges = crate::viewport::edge_rows(&p.snapshot, &frame.config, &lines[..drawn]);
+                let rows = crate::viewport::lace_rows(&edges, &lines[..drawn]);
                 let settings = layer::Settings {
                     density: lace.density,
                     spacing: lace.spacing,
                     seed: lace.seed,
                 };
-                Some(
-                    self.lace
+                Some(editor_view::LaceLayer {
+                    placed: self
+                        .lace
                         .place(key, self.font.face(), *metrics, &rows, settings),
-                )
+                    first_row: -isize::from(edges[0].is_some()),
+                    strength: lace.strength,
+                })
             }
             _ => None,
         };
@@ -1982,8 +1983,7 @@ impl App {
                 gpu_name: self.renderer.description(),
                 frame_start: start,
                 layout_time: frame.layout_time,
-                lace: placed,
-                lace_strength: lace.strength,
+                lace: lace_layer,
             },
         );
         self.draws.translate(0.0, geometry.document_top() as f32);

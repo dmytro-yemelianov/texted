@@ -33,10 +33,17 @@ pub(crate) struct ViewModel<'a> {
     pub gpu_name: &'a str,
     pub frame_start: Instant,
     pub layout_time: Duration,
-    /// Lace connections for the rows of `layout.visible_lines` (`Placed::row` indexes them).
-    pub lace: Option<&'a [Placed]>,
-    /// How far the lace colour goes from the background towards the text, 0 to 1.
-    pub lace_strength: f32,
+    pub lace: Option<LaceLayer<'a>>,
+}
+/// The lace to draw under the text.
+pub(crate) struct LaceLayer<'a> {
+    /// Connections; `Placed::row` counts the selected rows, which start at `first_row`.
+    pub placed: &'a [Placed],
+    /// The first selected row's place in `layout.visible_lines`: −1 when the hidden row
+    /// above leads. Rows outside the visible lines sit one line height beyond them.
+    pub first_row: isize,
+    /// How far the colour goes from the background towards the text, 0 to 1.
+    pub strength: f32,
 }
 pub(crate) fn paint(
     buffer: &mut DrawList,
@@ -222,13 +229,26 @@ fn paint_selection(buffer: &mut DrawList, font_engine: &mut FontEngine, model: &
 }
 
 /// The lace under the text: each placed sprite as a glyph quad on the text's pixel
-/// grid, clipped to the text area, in the background colour moved `lace_strength`
-/// of the way to the text colour.
+/// grid, clipped to the text area, in the background colour moved `strength` of the
+/// way to the text colour.
 fn paint_lace(buffer: &mut DrawList, font: &mut FontEngine, model: &ViewModel<'_>) {
-    let Some(placed) = model.lace.filter(|p| !p.is_empty()) else {
+    let Some(lace) = &model.lace else {
         return;
     };
-    let color = mix(model.palette.bg, model.palette.text, model.lace_strength);
+    let lines = &model.layout.visible_lines;
+    let (placed, Some(first)) = (lace.placed, lines.first()) else {
+        return;
+    };
+    // A selected row's top: a visible line's, or one line height beyond them.
+    let step = font.line_height_px;
+    let row_top = |row: usize| {
+        let at = lace.first_row + row as isize;
+        match usize::try_from(at).ok().and_then(|at| lines.get(at)) {
+            Some(line) => (line.y_px as usize) as f32,
+            None => first.y_px + at as f32 * step,
+        }
+    };
+    let color = mix(model.palette.bg, model.palette.text, lace.strength);
     let pixel = font.pixel_px();
     // Column x accumulated and rounded as `draw_string` places glyphs, so faces whose
     // width lands on half pixels round the same way as the text.
@@ -246,9 +266,6 @@ fn paint_lace(buffer: &mut DrawList, font: &mut FontEngine, model: &ViewModel<'_
         model.text_height as f32,
     ];
     for p in placed {
-        let Some(line) = model.layout.visible_lines.get(p.row) else {
-            continue;
-        };
         let sprite = &p.entry.sprite;
         if sprite.width == 0 || sprite.height == 0 {
             continue;
@@ -256,7 +273,7 @@ fn paint_lace(buffer: &mut DrawList, font: &mut FontEngine, model: &ViewModel<'_
         let glyph = font.sprite_glyph(sprite);
         let x = xs[p.col] + sprite.origin[0] as f32 * pixel;
         // Text glyphs sit two pixels below the row's top, as in `paint_text`.
-        let y = (line.y_px as usize + 2) as f32 + sprite.origin[1] as f32 * pixel;
+        let y = row_top(p.row) + 2.0 + sprite.origin[1] as f32 * pixel;
         let size = [sprite.width as f32 * pixel, sprite.height as f32 * pixel];
         buffer.push_within([x, y, size[0], size[1]], area, color, Some(glyph));
     }
@@ -916,8 +933,8 @@ mod tests {
         }
     }
 
-    /// Paints `text` in VGA at `zoom` percent with `lace` at strength 0.35.
-    fn painted(text: &str, zoom: u16, lace: &[Placed]) -> (DrawList, Palette) {
+    /// Paints `text` in VGA at `zoom` percent with `lace` from `first_row` at strength 0.35.
+    fn painted(text: &str, zoom: u16, lace: &[Placed], first_row: isize) -> (DrawList, Palette) {
         let snapshot = texted_buffer::TextBuffer::from_string(text.into()).create_snapshot();
         let mut font = FontEngine::with_typography(Typography {
             family: FontFamily::Vga,
@@ -956,8 +973,11 @@ mod tests {
                 gpu_name: "",
                 frame_start: Instant::now(),
                 layout_time: Duration::ZERO,
-                lace: Some(lace),
-                lace_strength: 0.35,
+                lace: Some(LaceLayer {
+                    placed: lace,
+                    first_row,
+                    strength: 0.35,
+                }),
             },
         );
         (list, palette)
@@ -991,7 +1011,7 @@ mod tests {
             placed(0, 7, [5, 9], [3, 5]),
             placed(1, 1, [-1, 12], [3, 5]),
         ];
-        let (list, palette) = painted("office staff\nfifth", 100, &lace);
+        let (list, palette) = painted("office staff\nfifth", 100, &lace, 0);
         let strokes = quads(&list, [3, 5]);
         assert_eq!(strokes.len(), lace.len());
         let first_text = text_quads(&list, &palette)[0].0;
@@ -1013,7 +1033,7 @@ mod tests {
         let lace: Vec<Placed> = (0..text.len())
             .map(|col| placed(0, col, [0, 0], [1, 1]))
             .collect();
-        let (list, palette) = painted(&text, 110, &lace);
+        let (list, palette) = painted(&text, 110, &lace, 0);
         let strokes = quads(&list, [1, 1]);
         let glyphs = text_quads(&list, &palette);
         assert_eq!(strokes.len(), text.len());
@@ -1021,5 +1041,24 @@ mod tests {
             assert_eq!(s.rect[..2], g.rect[..2], "column {col}");
             assert!((s.rect[2] - 1.1).abs() < 1e-4, "{:?}", s.rect);
         }
+    }
+
+    #[test]
+    fn hidden_rows_draw_one_line_beyond_the_visible_ones() {
+        // Rows: hidden above, the two visible lines, hidden below.
+        let lace = [
+            placed(0, 0, [0, 13], [1, 4]),
+            placed(1, 0, [0, 0], [2, 2]),
+            placed(3, 0, [0, 0], [3, 3]),
+        ];
+        let (list, _) = painted("office\nfifth", 100, &lace, -1);
+        let at = |size| quads(&list, size)[0].1.rect;
+        // 16 px above the first line, two below its top, 13 down: one pixel above the
+        // text area, which clips it.
+        let clipped = at([1, 4]);
+        assert_eq!([clipped[1], clipped[3]], [0.0, 3.0]);
+        assert_eq!(at([2, 2])[1], 2.0);
+        assert_eq!(at([3, 3])[1], 2.0 * 16.0 + 2.0);
+        assert_eq!(at([1, 4])[0], at([3, 3])[0]);
     }
 }

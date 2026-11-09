@@ -56,6 +56,9 @@ struct Shared {
     wake: Condvar,
     /// Bumped whenever the requested key changes; work from an older epoch is dropped.
     epoch: AtomicU64,
+    /// Runs once on the worker after it takes a request, before it fills anything.
+    #[cfg(test)]
+    test_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 pub struct LaceService {
@@ -104,6 +107,8 @@ impl LaceService {
             slots: Mutex::new(Slots::default()),
             wake: Condvar::new(),
             epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            test_hook: Mutex::new(None),
         });
         let work = shared.clone();
         let worker = thread::spawn(move || {
@@ -119,6 +124,13 @@ impl LaceService {
                     }
                     slots.pending.take().unwrap()
                 };
+                #[cfg(test)]
+                {
+                    let hook = work.test_hook.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
                 let current = || work.epoch.load(Ordering::Relaxed) == request.epoch;
                 let Some(tables) = fill(&mut kept, &request, current) else {
                     continue;
@@ -314,15 +326,21 @@ mod tests {
     fn stale_tables_are_ignored_after_a_face_change() {
         let (mut s, recv) = service();
         let (vga, bios) = (face(FontFamily::Vga), face(FontFamily::Bios));
-        // Seconds of work, so the switch lands while the worker is still on VGA.
         let many: Vec<_> = [Relation::H, Relation::V, Relation::Dr, Relation::Dl]
             .into_iter()
             .flat_map(|rel| ('a'..='z').flat_map(move |a| ('a'..='z').map(move |b| (rel, a, b))))
             .collect();
+        // Hold the worker once it has taken the VGA request, switch to BIOS, then let it go.
+        let (started, taken) = channel();
+        let (release, gate) = channel::<()>();
+        *s.shared.test_hook.lock().unwrap() = Some(Box::new(move || {
+            started.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(30)).unwrap();
+        }));
         s.request(key(vga), vga, &many);
-        // Let the worker start on it.
-        std::thread::sleep(Duration::from_millis(50));
+        taken.recv_timeout(Duration::from_secs(5)).unwrap();
         s.request(key(bios), bios, &[(Relation::H, 'f', 'i')]);
+        release.send(()).unwrap();
 
         let rows = |c| bios.glyph(c).map(<[u8]>::to_vec);
         let metrics = FaceMetrics::measure(rows, bios.width, bios.height).unwrap();
@@ -330,34 +348,26 @@ mod tests {
         want.fill(Relation::H, 'f', 'i', &rows);
         let want = want.get(Relation::H, 'f', 'i').unwrap().to_vec();
 
-        // Every BIOS frame sees BIOS tables or none, never the VGA work.
-        let mut check = || {
-            let Some(t) = s.tables(key(bios)) else {
-                return false;
-            };
-            assert_eq!(t.get(Relation::H, 'f', 'i'), Some(want.as_slice()));
-            assert!(t.get(Relation::H, 'a', 'b').is_none(), "VGA pairs in BIOS");
-            assert!(s.tables(key(vga)).is_none());
-            true
-        };
-        wait_until(&recv, Duration::from_secs(5), &mut check);
-        // Late VGA results must not replace the BIOS snapshot.
-        let grace = Instant::now() + Duration::from_millis(300);
-        while let Some(left) = grace.checked_duration_since(Instant::now()) {
-            let _ = recv.recv_timeout(left);
-            assert!(check(), "BIOS tables were replaced");
-        }
-        // The VGA batch was dropped, not finished: back on VGA, most of it is still unfilled.
+        // A BIOS frame sees BIOS tables or none, never the VGA work.
+        wait_until(&recv, Duration::from_secs(5), || {
+            s.tables(key(bios)).is_some()
+        });
+        let t = s.tables(key(bios)).unwrap();
+        assert_eq!(t.get(Relation::H, 'f', 'i'), Some(want.as_slice()));
+        assert!(t.get(Relation::H, 'a', 'b').is_none(), "VGA pairs in BIOS");
+        assert!(s.tables(key(vga)).is_none());
+        // The VGA batch was dropped before its first pair: back on VGA, only the newly
+        // requested pair is filled.
         s.request(key(vga), vga, &[(Relation::H, 'a', 'a')]);
         wait_until(&recv, Duration::from_secs(5), || {
             s.tables(key(vga)).is_some()
         });
         let t = s.tables(key(vga)).unwrap();
-        let filled = many
+        let filled: Vec<_> = many
             .iter()
             .filter(|p| t.get(p.0, p.1, p.2).is_some())
-            .count();
-        assert!(filled < many.len() / 2, "{filled} of {} filled", many.len());
+            .collect();
+        assert_eq!(filled, [&(Relation::H, 'a', 'a')]);
     }
 
     #[test]
