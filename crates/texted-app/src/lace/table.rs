@@ -236,9 +236,10 @@ impl Tables {
         self.entries.get(&(rel, a, b)).map(Vec::as_slice)
     }
 
-    /// The clearance probe of `path`, whose lower cell's frame sits `lower` below the
-    /// first letter's. A glyph's strokes lie within its pixel rows, give or take
-    /// [`stray`], so a neighbour row's ink is at least that far into its own row.
+    /// The clearance probe of `path`, whose lower cell's frame is `lower` units up
+    /// from the first letter's (0 within a row, minus a row's height between rows). A
+    /// glyph's strokes lie within its pixel rows, give or take [`stray`], so a
+    /// neighbour row's ink stays at least that far inside its own row.
     fn probe(&self, path: &[V2], lower: f32) -> Probe {
         let (Some(&s), Some(&e)) = (path.first(), path.last()) else {
             return Probe::default();
