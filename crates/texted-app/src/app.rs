@@ -1929,13 +1929,18 @@ impl App {
                     ],
                     serifs: lace.serifs,
                 };
-                // The rows `paint_text` draws (a prefix of the visible lines) and one hidden
-                // row beyond each edge, so connections across the edges do not depend on
-                // what is on screen.
+                // The rows `paint_text` draws (a prefix of the visible lines) and hidden rows
+                // beyond each edge, so connections across the edges do not depend on what
+                // is on screen.
                 let lines = &frame.layout.visible_lines;
                 let drawn =
                     editor_view::drawn_rows(lines, self.font.line_height_px, frame.text_height);
-                let edges = crate::viewport::edge_rows(&p.snapshot, &frame.config, &lines[..drawn]);
+                let edges = crate::viewport::edge_rows(
+                    &p.snapshot,
+                    &frame.config,
+                    &lines[..drawn],
+                    crate::viewport::LACE_MARGIN,
+                );
                 let rows = crate::viewport::lace_rows(&edges, &lines[..drawn]);
                 let settings = layer::Settings {
                     density: lace.density,
@@ -1946,7 +1951,7 @@ impl App {
                     placed: self
                         .lace
                         .place(key, self.font.face(), *metrics, &rows, settings),
-                    first_row: -isize::from(edges[0].is_some()),
+                    first_row: -(edges[0].len() as isize),
                     strength: lace.strength,
                 })
             }

@@ -39,8 +39,9 @@ pub(crate) struct ViewModel<'a> {
 pub(crate) struct LaceLayer<'a> {
     /// Connections; `Placed::row` counts the selected rows, which start at `first_row`.
     pub placed: &'a [Placed],
-    /// The first selected row's place in `layout.visible_lines`: −1 when the hidden row
-    /// above leads. Rows outside the visible lines sit one line height beyond them.
+    /// The first selected row's place in `layout.visible_lines`: minus the number of
+    /// hidden rows above. Rows outside the visible lines sit whole line heights beyond
+    /// them.
     pub first_row: isize,
     /// How far the colour goes from the background towards the text, 0 to 1.
     pub strength: f32,
@@ -1099,15 +1100,17 @@ mod tests {
 
     #[test]
     fn hidden_rows_draw_only_their_connections_into_the_drawn_rows() {
-        // Rows: hidden above, the two drawn lines, hidden below.
+        // Rows: two hidden above, the two drawn lines, two hidden below.
         let lace = [
-            joined(Relation::V, 0, 0, [0, 13], [1, 6]),
-            placed(0, 1, [0, 13], [1, 4]),
-            placed(1, 0, [0, 0], [2, 2]),
-            joined(Relation::V, 2, 0, [0, 10], [4, 12]),
-            placed(3, 0, [0, 0], [3, 3]),
+            joined(Relation::V, 0, 0, [0, 13], [5, 5]),
+            joined(Relation::V, 1, 0, [0, 13], [1, 6]),
+            placed(1, 1, [0, 13], [1, 4]),
+            placed(2, 0, [0, 0], [2, 2]),
+            joined(Relation::V, 3, 0, [0, 10], [4, 12]),
+            placed(4, 0, [0, 0], [3, 3]),
+            joined(Relation::Dr, 4, 0, [0, 0], [6, 2]),
         ];
-        let (list, _) = painted("office\nfifth", 100, &lace, -1);
+        let (list, _) = painted("office\nfifth", 100, &lace, -2);
         let at = |size| quads(&list, size).first().map(|q| q.1.rect);
         // The drawn rows' glyphs span 2..34: two pixels below the row tops, two rows.
         // From 16 px above the first line, two below its top and 13 down: clipped to
@@ -1119,9 +1122,12 @@ mod tests {
         // From the second line's top + 2 + 10 = 28, cut where its glyphs end.
         let out = at([4, 12]).expect("connection into the row below");
         assert_eq!([out[1], out[3]], [28.0, 6.0]);
-        // A hidden row's own connections are never drawn.
+        // A hidden row's own connections, and those between hidden rows, are never
+        // drawn.
         assert_eq!(at([1, 4]), None);
         assert_eq!(at([3, 3]), None);
+        assert_eq!(at([5, 5]), None);
+        assert_eq!(at([6, 2]), None);
     }
 
     #[test]

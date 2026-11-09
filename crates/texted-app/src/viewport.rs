@@ -7,7 +7,7 @@ use crate::{
 use std::time::{Duration, Instant};
 use texted_app::lace::layer::Row;
 use texted_buffer::BufferSnapshot;
-use texted_layout::{LayoutEngine, ViewportConfig, ViewportLayout, VisibleLine, WrapRows};
+use texted_layout::{LayoutEngine, ViewportConfig, ViewportLayout, VisibleLine};
 pub(crate) struct Frame {
     pub layout: ViewportLayout,
     pub config: ViewportConfig,
@@ -204,16 +204,25 @@ impl Viewport {
     }
 }
 
-/// The rows just above and just below `drawn`, laid out as `compute_layout` lays out
-/// visible rows. Lace selects over them too, so connections across the window's top
-/// and bottom edges stay put while rows scroll in and out.
+/// How many hidden rows lace selects over beyond each edge of the drawn rows. A
+/// connection touching a drawn row depends on the in-row choices of the row next to
+/// it, and those on the ink of the row after that (the clearance check), so two rows
+/// keep the edges' connections exactly as they are when those rows are on screen.
+pub(crate) const LACE_MARGIN: usize = 2;
+
+/// Up to `margin` rows above `drawn` (top to bottom) and below it, laid out as
+/// `compute_layout` lays out visible rows, one line height apart. Lace selects over
+/// them too, so connections across the window's top and bottom edges stay put while
+/// rows scroll in and out.
 pub(crate) fn edge_rows(
     snap: &BufferSnapshot,
     config: &ViewportConfig,
     drawn: &[VisibleLine],
-) -> [Option<VisibleLine>; 2] {
-    // Wrap row `wrap` of `line`, whose row breaks are `rows`, as `compute_layout` builds it.
-    let row = |line: usize, wrap: usize, rows: &WrapRows, y_px: f32| {
+    margin: usize,
+) -> [Vec<VisibleLine>; 2] {
+    // Wrap row `wrap` of `line`, as `compute_layout` builds it.
+    let row = |line: usize, wrap: usize, y_px: f32| {
+        let rows = config.wrap_rows(snap, line);
         let text = snap.line(line);
         let len = text.len_chars();
         let (start, end) = if config.word_wrap {
@@ -233,46 +242,59 @@ pub(crate) fn edge_rows(
         }
     };
     // Which wrap row of its line a drawn row is; without wrapping every line is one row.
-    let wrap_of = |l: &VisibleLine, rows: &WrapRows| {
+    let wrap_of = |l: &VisibleLine| {
         if config.word_wrap {
-            rows.row_of(l.start_col)
+            config.wrap_rows(snap, l.line_index).row_of(l.start_col)
         } else {
             0
         }
     };
-    let step = config.line_height_px;
-    let above = drawn.first().and_then(|first| {
-        let rows = config.wrap_rows(snap, first.line_index);
-        let y = first.y_px - step;
-        match wrap_of(first, &rows) {
-            0 if first.line_index == 0 => None,
-            0 => {
-                let line = first.line_index - 1;
-                let rows = config.wrap_rows(snap, line);
-                Some(row(line, rows.count() - 1, &rows, y))
-            }
-            wrap => Some(row(first.line_index, wrap - 1, &rows, y)),
-        }
-    });
-    let below = drawn.last().and_then(|last| {
-        let y = last.y_px + step;
-        if last.continues {
-            let rows = config.wrap_rows(snap, last.line_index);
-            Some(row(last.line_index, wrap_of(last, &rows) + 1, &rows, y))
-        } else if last.line_index + 1 < snap.total_lines {
-            let line = last.line_index + 1;
-            Some(row(line, 0, &config.wrap_rows(snap, line), y))
+    let count = |line: usize| config.wrap_rows(snap, line).count();
+    let before = |(line, wrap): (usize, usize)| match wrap {
+        0 if line == 0 => None,
+        0 => Some((line - 1, count(line - 1) - 1)),
+        wrap => Some((line, wrap - 1)),
+    };
+    let after = |(line, wrap): (usize, usize)| {
+        if wrap + 1 < count(line) {
+            Some((line, wrap + 1))
+        } else if line + 1 < snap.total_lines {
+            Some((line + 1, 0))
         } else {
             None
         }
-    });
+    };
+    let step = config.line_height_px;
+    let mut above = Vec::new();
+    if let Some(first) = drawn.first() {
+        let mut at = (first.line_index, wrap_of(first));
+        for i in 1..=margin {
+            let Some(next) = before(at) else {
+                break;
+            };
+            above.push(row(next.0, next.1, first.y_px - step * i as f32));
+            at = next;
+        }
+        above.reverse();
+    }
+    let mut below = Vec::new();
+    if let Some(last) = drawn.last() {
+        let mut at = (last.line_index, wrap_of(last));
+        for i in 1..=margin {
+            let Some(next) = after(at) else {
+                break;
+            };
+            below.push(row(next.0, next.1, last.y_px + step * i as f32));
+            at = next;
+        }
+    }
     [above, below]
 }
 
-/// The rows lace selects over, top to bottom: the hidden row above, the drawn rows and
-/// the hidden row below, where they exist.
+/// The rows lace selects over, top to bottom: the hidden rows above, the drawn rows
+/// and the hidden rows below.
 pub(crate) fn lace_rows<'a>(
-    edges: &'a [Option<VisibleLine>; 2],
+    edges: &'a [Vec<VisibleLine>; 2],
     drawn: &'a [VisibleLine],
 ) -> Vec<Row<'a>> {
     edges[0]
@@ -344,7 +366,7 @@ mod tests {
         // Every connection as (upper row, lower row, column, relation, entry), filling
         // the tables until nothing is missing.
         let joined = |f: &Frame, tables: &mut Tables| -> Vec<Joined> {
-            let edges = edge_rows(&snapshot, &f.config, &f.layout.visible_lines);
+            let edges = edge_rows(&snapshot, &f.config, &f.layout.visible_lines, LACE_MARGIN);
             let rows = lace_rows(&edges, &f.layout.visible_lines);
             let row_id = |r: &Row| (r.line, r.start_col);
             loop {
@@ -376,28 +398,34 @@ mod tests {
             }
         };
         let (mut across_top, mut across_bottom) = (0, 0);
-        for (wrap, top) in [(true, (1, 0)), (true, (1, 1)), (false, (1, 0))] {
+        let m = LACE_MARGIN;
+        // Every top whose wider frame still ends before the last line.
+        let tops =
+            (0..5).flat_map(|line| [(true, (line, 0)), (true, (line, 1)), (false, (line, 0))]);
+        for (wrap, top) in tops {
             let n = 6;
-            // `wide` shows one row more above and below than `narrow`.
-            let wide = frame(wrap, top, n + 2);
-            let second = &wide.layout.visible_lines[1];
+            // `wide` shows `m` rows more above and below than `narrow`.
+            let wide = frame(wrap, top, n + 2 * m);
+            let start = &wide.layout.visible_lines[m];
             let wrap_row = if wrap {
                 wide.config
-                    .wrap_rows(&snapshot, second.line_index)
-                    .row_of(second.start_col)
+                    .wrap_rows(&snapshot, start.line_index)
+                    .row_of(start.start_col)
             } else {
                 0
             };
-            let narrow = frame(wrap, (second.line_index, wrap_row), n);
+            let narrow = frame(wrap, (start.line_index, wrap_row), n);
             let rows = &narrow.layout.visible_lines;
             assert_eq!(rows.len(), n);
-            assert_eq!(id(&rows[0]), id(second));
-            // The hidden rows are the rows `wide` shows there, one line height away.
-            let edges = edge_rows(&snapshot, &narrow.config, rows);
+            assert_eq!(id(&rows[0]), id(start));
+            // The hidden rows are the rows `wide` shows there, line heights away.
+            let edges = edge_rows(&snapshot, &narrow.config, rows, m);
             let shown = &wide.layout.visible_lines;
-            for (edge, at, y) in [(&edges[0], 0, -16.0), (&edges[1], n + 1, n as f32 * 16.0)] {
-                let mut edge = edge.clone().expect("a row beyond the edge");
-                assert_eq!(edge.y_px, y);
+            assert_eq!((edges[0].len(), edges[1].len()), (m, m));
+            let hidden = edges[0].iter().zip(0..).chain(edges[1].iter().zip(n + m..));
+            for (edge, at) in hidden {
+                let mut edge = edge.clone();
+                assert_eq!(edge.y_px, (at as f32 - m as f32) * 16.0);
                 edge.y_px = shown[at].y_px;
                 assert_eq!(format!("{edge:?}"), format!("{:?}", shown[at]));
             }
