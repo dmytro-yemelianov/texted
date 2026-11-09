@@ -221,19 +221,73 @@ mod tests {
             .find(|e| e.mech == Mech::Fuse)
             .expect("ff fuse");
         let s = &e.sprite;
-        assert!(s.width > 0);
-        // The crossbar is font row 6 and the bridge runs along it.
+        // Recompute the entry's path from the generator (entries do not keep it).
+        let m = t.metrics;
+        let glyph = |c| {
+            let r = strip_serifs(&rows(c).unwrap(), m.width, m.height);
+            analyse(vectorize(&r, &m))
+        };
+        let g = glyph('f');
+        let cw = 8.0 * m.k;
+        let cands = in_word(&g, &g, cw, (cw - cw + 2.5).max(0.75 * cw));
+        let c = cands
+            .iter()
+            .find(|c| c.mech == Mech::Fuse && c.cost == e.cost)
+            .expect("matching candidate");
+        let base = f32::from(m.baseline);
+        let px: Vec<[f32; 2]> = c
+            .path
+            .iter()
+            .map(|p| [p[0] / m.k, base - p[1] / m.k])
+            .collect();
+        let (first, last) = (px[0], px[px.len() - 1]);
+        let (x_lo, x_hi) = (
+            first[0].min(last[0]).floor() as i32,
+            first[0].max(last[0]).floor() as i32,
+        );
+        // Pixels on the crossbar row, and all of them between the bar ends.
         let on_bar: Vec<i32> = (s.origin[0]..s.origin[0] + s.width as i32)
             .filter(|&x| s.lit(x, 6))
             .collect();
         assert!(!on_bar.is_empty(), "no pixel on row 6: {s:?}");
-        // The bridge reaches into the second cell (x >= 8) from the first.
-        assert!(s.origin[0] < 8 && s.origin[0] + s.width as i32 > 8, "{s:?}");
-        // Nothing outside the sprite box is lit, and the box is tight.
-        assert!(s.coverage.iter().all(|&c| c == 0 || c == 255));
-        let m = t.metrics;
-        let (lo, hi) = (s.origin[1], s.origin[1] + s.height as i32);
-        assert!(lo >= 0 && hi <= i32::from(m.baseline) + 2, "{s:?}");
+        assert!(
+            on_bar.iter().all(|&x| x >= x_lo && x <= x_hi),
+            "row 6 pixels {on_bar:?} outside bar ends {x_lo}..={x_hi}"
+        );
+        assert!(
+            x_lo < 8 && x_hi >= 8,
+            "bar ends {x_lo}..{x_hi} do not span the cells"
+        );
+        // No lit pixel outside the path's bbox expanded by one pixel.
+        let min = |i: usize| {
+            px.iter()
+                .map(|p| p[i])
+                .fold(f32::INFINITY, f32::min)
+                .floor() as i32
+                - 1
+        };
+        let max = |i: usize| {
+            px.iter()
+                .map(|p| p[i])
+                .fold(f32::NEG_INFINITY, f32::max)
+                .floor() as i32
+                + 1
+        };
+        let mut lit = 0;
+        for r in 0..s.height as i32 {
+            for col in 0..s.width as i32 {
+                if s.coverage[(r as u32 * s.width + col as u32) as usize] == 0 {
+                    continue;
+                }
+                lit += 1;
+                let (x, y) = (s.origin[0] + col, s.origin[1] + r);
+                assert!(
+                    x >= min(0) && x <= max(0) && y >= min(1) && y <= max(1),
+                    "lit ({x},{y}) outside bbox"
+                );
+            }
+        }
+        assert!(lit > 0);
     }
 
     #[test]
