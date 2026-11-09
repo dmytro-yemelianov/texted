@@ -1480,11 +1480,11 @@ impl AppearanceUi {
         }
     }
 }
-/// Row titles; compact ones fit seven 8-pixel cells.
 /// A 0 to 1 amount as whole twentieths, the step of the lace rows.
 fn twentieths(amount: f32) -> u8 {
     (amount * 20.0).round().clamp(0.0, 20.0) as u8
 }
+/// Row titles; compact ones fit seven 8-pixel cells.
 fn field_title(field: usize, compact: bool) -> &'static str {
     if (FIRST_EFFECT..SHADOW).contains(&field) {
         let effect = Effect::ALL[field - FIRST_EFFECT];
@@ -1495,28 +1495,10 @@ fn field_title(field: usize, compact: bool) -> &'static str {
         };
     }
     const COMPACT: [&str; FIELDS - Effect::ALL.len()] = [
-        "Theme",
-        "Screen",
-        "Font",
-        "Size",
-        "Spacing",
-        "Cursor",
-        "Preset",
-        "FPS",
-        "Time",
-        "Shadow",
-        "Shad X",
-        "Shad Y",
-        "Border",
-        "Corner",
-        "Inset X",
-        "Inset Y",
-        "Lace",
-        "Lace dens",
-        "Lace str",
-        "Lace gap",
-        "Lace serif",
-        "Lace seed",
+        "Theme", "Screen", "Font", "Size", "Spacing", "Cursor", "Preset", "FPS", "Time", "Shadow",
+        "Shad X", "Shad Y", "Border", "Corner", "Inset X", "Inset Y",
+        // The Lace rows, as "L …" like "Shad X".
+        "Lace", "L dens", "L str", "L gap", "L serif", "L seed",
     ];
     const FULL: [&str; FIELDS - Effect::ALL.len()] = [
         "Theme",
@@ -2011,6 +1993,17 @@ mod tests {
         assert_eq!(ui.choices(LACE_STRENGTH).len(), 20);
         assert_eq!(ui.choices(LACE_SEED).len(), 32);
         assert!(ui.shown_text(LACE_DENSITY, 40).starts_with("████"));
+    }
+    #[test]
+    fn compact_titles_fit_seven_cells_and_differ_on_each_page() {
+        for page in [0..STYLE_FIELDS, STYLE_FIELDS..FIELDS] {
+            let titles: Vec<&str> = page.map(|f| field_title(f, true)).collect();
+            for t in &titles {
+                assert!(t.chars().count() <= 7, "{t:?} is wider than seven cells");
+            }
+            let unique: std::collections::BTreeSet<&str> = titles.iter().copied().collect();
+            assert_eq!(unique.len(), titles.len(), "{titles:?}");
+        }
     }
     #[test]
     fn an_unavailable_face_blocks_the_lace_row() {
