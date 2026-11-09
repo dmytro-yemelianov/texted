@@ -1633,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "texted-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "bytemuck",
@@ -1659,14 +1659,14 @@ dependencies = [
 
 [[package]]
 name = "texted-buffer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ropey",
 ]
 
 [[package]]
 name = "texted-io"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "encoding_rs",
  "ropey",
@@ -1674,14 +1674,14 @@ dependencies = [
 
 [[package]]
 name = "texted-kernel"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crossbeam-channel",
 ]
 
 [[package]]
 name = "texted-layout"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "texted-buffer",
  "texted-kernel",

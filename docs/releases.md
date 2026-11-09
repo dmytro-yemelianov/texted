@@ -12,6 +12,19 @@ Each macOS release contains a universal application for Apple Silicon and Intel:
 
 The build deployment target is macOS 11.0. The workflows execute native tests on macOS 15 on both architectures; older OS versions are not tested by CI. Package metadata records the current ad-hoc signature.
 
+## v0.3.0 preview
+
+[Texted v0.3.0 Preview](https://github.com/dmytro-yemelianov/texted/releases/tag/v0.3.0) integrates PRs #7–#16:
+
+- Themes, typography and a Style/Appearance panel with dropdowns; bundled Ukrainian bitmap fonts and the local Verba library.
+- Native macOS menus and a context menu; fixed platform framebuffers with aspect-fit scaling.
+- Tabs, the F1–F12 command panel, 10% text scale and in-app file dialogs.
+- `texted-tui` / `texted --terminal` with ANSI cells or Kitty graphics, sharing the GUI's controller.
+- Windows-1251, KOI8-U and UTF-16 files, disk-change detection, restored sessions, case/whole-word search, word wrap after spaces, line tools and Go to line.
+- A Visuals page with ShaderWallpaper machines, Pixel SSH's CRT pass and looks, and ditherGL's pixel separation, bloom and vignette.
+
+Text still uses Unicode scalar columns; complex-script/grapheme shaping, IME composition and syntax highlighting remain future work.
+
 ## v0.2.0 preview
 
 [Texted v0.2.0 Preview](https://github.com/dmytro-yemelianov/texted/releases/tag/v0.2.0) integrates PRs #1–#6:
@@ -54,15 +67,15 @@ Update the workspace Cargo version, refresh the lockfile if necessary, commit al
 
 ```sh
 # The tag must exactly match the Cargo version, including any prerelease suffix.
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 The tagged source is tested and packaged again before publication. A mismatched tag fails before delivery. Rerunning the tag workflow updates the existing release assets.
 
 ## Terminal executable in development packages
 
-Packages built from `feat/terminal-cell-grid` include `Contents/MacOS/texted-tui` as a universal executable, verified after ZIP restoration. The GUI executable also accepts `--terminal`. The published v0.2.0 assets predate this work. To run a locally installed development build:
+Packages since v0.3.0 include `Contents/MacOS/texted-tui` as a universal executable, verified after ZIP restoration. The GUI executable also accepts `--terminal`. To run an installed build:
 
 ```sh
 /Applications/Texted.app/Contents/MacOS/texted-tui path/to/file.txt
@@ -70,4 +83,4 @@ Packages built from `feat/terminal-cell-grid` include `Contents/MacOS/texted-tui
 
 Both modes share the application controller, cell scene, tab state, command panel and in-app dialogs. See [terminal delivery](terminal-cell-grid.md) for controls and the JSON format.
 
-Development terminal builds now support `--render=auto|kitty|ansi`, including Texted bitmap fonts and 10% zoom through Kitty graphics. CI also runs the graphics PTY peer in both pixel-mouse and cell-mouse modes; see [graphics delivery](terminal-graphics.md). Published v0.2.0 assets remain unchanged.
+Terminal builds support `--render=auto|kitty|ansi`, including Texted bitmap fonts and 10% zoom through Kitty graphics. CI also runs the graphics PTY peer in both pixel-mouse and cell-mouse modes; see [graphics delivery](terminal-graphics.md).

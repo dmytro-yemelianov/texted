@@ -34,7 +34,7 @@ Snapshots do not flatten the document. Search streams across rope chunks. Text c
 
 ## Controls
 
-Development builds include native **Texted / File / Edit / Search / View / Window** menus. Right-click the document, or press **Shift+F10**, for editing and Style actions, including Duplicate line, Trim trailing spaces (spaces and tabs only; a raw `\r` is kept) and Go to line. Right-clicking inside a selection preserves it; clicking outside positions the caret first. Unavailable actions are disabled, and View options reflect the current editor state. Native Window actions include minimize, zoom and fullscreen. The published v0.2.0 preview predates these menus.
+Texted has native **Texted / File / Edit / Search / View / Window** menus. Right-click the document, or press **Shift+F10**, for editing and Style actions, including Duplicate line, Trim trailing spaces (spaces and tabs only; a raw `\r` is kept) and Go to line. Right-clicking inside a selection preserves it; clicking outside positions the caret first. Unavailable actions are disabled, and View options reflect the current editor state. Native Window actions include minimize, zoom and fullscreen.
 
 | Action | Shortcut |
 |---|---|
@@ -78,8 +78,6 @@ Buttons highlight on hover and briefly when invoked by mouse or keyboard. Hover 
 The one-line panel can be hidden with F1. F-keys work while hidden: **F2 Save · F3 Find · F4 Replace · F5 Open · F6 New · F7 Previous tab · F8 Next tab · F9 Appearance · F10 Close tab · F11 Wrap · F12 Details**. Labels adapt to editor, search and Appearance context. While searching, F5 switches case matching (**Case** must match, **NoCs** ignores it, including Cyrillic capitals) and F6 switches whole words (**Word** only, **Part** also inside words); Replace and Replace All follow the same rules. Narrow framebuffers prioritize the active task; the Ctrl layer keeps zoom and counts visible. Hold **Cmd / Option / Control / Shift** on the keyboard for alternate actions; no modifier controls are drawn. Shift offers Save As, previous match and Replace All; Cmd exposes undo/redo, quit and diagnostics; Option exposes clipboard and selection actions. Shift+F10 retains the context menu. On keyboards reserving F-keys for media, use Fn or click the buttons while holding the modifier.
 
 ## Themes and typography
-
-Available in `main` development builds; the published v0.2.0 preview predates this feature.
 
 Appearance offers Modern Dark/Light, VGA, EGA, Atari, Commander, C64, ZX Spectrum, Amber, Green CRT, and ShaderWallpaper's Mac System 2.0 and Game Boy palettes. The theme applies to the document, selection/search highlights, gutter, status, search and appearance panels. Palettes and editor fonts are independent.
 
