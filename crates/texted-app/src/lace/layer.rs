@@ -235,7 +235,9 @@ fn run(rows: &[Row], tables: &Tables, s: &Settings) -> (Selection, usize) {
                 grid.add(Relation::Dl, (r, c), (r + 1, c - 1));
             }
         }
-        grid.accept(&mut used, density, &mut placed);
+        // Each band claims against the in-row claims and its own only.
+        let mut band_used = used.clone();
+        grid.accept(&mut band_used, density, &mut placed);
     }
 
     let missing = grid.missing.into_iter().collect();
@@ -333,10 +335,14 @@ mod tests {
     ];
 
     fn settings(density: f32, spacing: u8) -> Settings {
+        settings_seed(density, spacing, 3)
+    }
+
+    fn settings_seed(density: f32, spacing: u8, seed: u32) -> Settings {
         Settings {
             density,
             spacing,
-            seed: 3,
+            seed,
         }
     }
 
@@ -390,30 +396,72 @@ mod tests {
 
     #[test]
     fn same_text_same_lace_when_scrolled() {
-        let text = fill_grid(&WORDS, 48, 17, 3);
         let mut t = tables();
-        let s = settings(0.6, 1);
-        let top = rows_from(&text, 0, 14, 0);
-        let low = rows_from(&text, 3, 17, 0);
-        let (a, _) = settle(&mut t, &top, &s);
-        let (b, _) = settle(&mut t, &low, &s);
-        let inside = |p: &Placed, rows: &[Row]| (3..13).contains(&rows[p.row].line);
-        let mut x: Vec<_> = a
-            .placed
-            .iter()
-            .filter(|p| inside(p, &top))
-            .map(|p| key_of(p, &top))
-            .collect();
-        let mut y: Vec<_> = b
-            .placed
-            .iter()
-            .filter(|p| inside(p, &low))
-            .map(|p| key_of(p, &low))
-            .collect();
-        x.sort_by_key(|k| (k.0, k.1, format!("{:?}", k.2)));
-        y.sort_by_key(|k| (k.0, k.1, format!("{:?}", k.2)));
-        assert!(x.len() > 5);
-        assert_eq!(x, y);
+        for seed in 1..=8 {
+            let text = fill_grid(&WORDS, 48, 17, seed);
+            let s = Settings {
+                density: 0.6,
+                spacing: 1,
+                seed,
+            };
+            let top = rows_from(&text, 0, 14, 0);
+            let low = rows_from(&text, 3, 17, 0);
+            let (a, _) = settle(&mut t, &top, &s);
+            let (b, _) = settle(&mut t, &low, &s);
+            // In-row placements for document rows 3..13, band placements whose
+            // upper row is 3..12.
+            let inside = |p: &Placed, rows: &[Row]| {
+                let line = rows[p.row].line;
+                if matches!(p.rel, Relation::H | Relation::S(_)) {
+                    (3..13).contains(&line)
+                } else {
+                    (3..12).contains(&line)
+                }
+            };
+            let pick = |sel: &Selection, rows: &[Row]| {
+                let mut v: Vec<_> = sel
+                    .placed
+                    .iter()
+                    .filter(|p| inside(p, rows))
+                    .map(|p| key_of(p, rows))
+                    .collect();
+                v.sort_by_key(|k| (k.0, k.1, format!("{:?}", k.2)));
+                v
+            };
+            let (x, y) = (pick(&a, &top), pick(&b, &low));
+            assert!(x.len() > 5, "seed {seed}");
+            assert_eq!(x, y, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn bands_never_claim_the_same_connector() {
+        let mut t = tables();
+        for seed in 1..=8 {
+            let text = fill_grid(&WORDS, 48, 14, seed);
+            let rows = rows_from(&text, 0, 14, 0);
+            let (sel, _) = settle(&mut t, &rows, &settings_seed(1.0, 1, seed));
+            // Which group (in-row, or the band under row r) claimed each key.
+            let mut owner: BTreeMap<String, Option<usize>> = BTreeMap::new();
+            for p in &sel.placed {
+                let group = match p.rel {
+                    Relation::H | Relation::S(_) => None,
+                    _ => Some(p.row),
+                };
+                let (g, h) = ((p.row, p.col), h_cell(p));
+                for &k in &p.entry.keys {
+                    let id = match key_res(k, g, h) {
+                        Res::Key(kind, cell, i, e) => format!("{kind}{cell:?}{i}.{e}"),
+                        _ => unreachable!(),
+                    };
+                    let prev = owner.insert(id.clone(), group);
+                    assert!(
+                        prev.is_none_or(|o| o == group),
+                        "seed {seed}: {id} claimed by {prev:?} and {group:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
