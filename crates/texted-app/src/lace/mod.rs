@@ -9,4 +9,6 @@ pub mod geom;
 pub mod ligatures;
 #[cfg(test)]
 pub mod model_font;
+pub mod sprite;
+pub mod table;
 pub mod vectorize;
