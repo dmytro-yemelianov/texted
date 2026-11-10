@@ -5,8 +5,9 @@ use crate::{
     horizontal_scroll::{HorizontalScroll, Scrollbar, BAR_HEIGHT},
 };
 use std::time::{Duration, Instant};
+use texted_app::lace::layer::Row;
 use texted_buffer::BufferSnapshot;
-use texted_layout::{LayoutEngine, ViewportConfig, ViewportLayout};
+use texted_layout::{LayoutEngine, ViewportConfig, ViewportLayout, VisibleLine};
 pub(crate) struct Frame {
     pub layout: ViewportLayout,
     pub config: ViewportConfig,
@@ -203,9 +204,250 @@ impl Viewport {
     }
 }
 
+/// How many hidden rows lace selects over beyond each edge of the drawn rows. A
+/// connection touching a drawn row depends on the in-row choices of the row next to
+/// it, and those on the ink of the row after that (the clearance check), so two rows
+/// keep the edges' connections exactly as they are when those rows are on screen.
+pub(crate) const LACE_MARGIN: usize = 2;
+
+/// Up to `margin` rows above `drawn` (top to bottom) and below it, laid out as
+/// `compute_layout` lays out visible rows, one line height apart. Lace selects over
+/// them too, so connections across the window's top and bottom edges stay put while
+/// rows scroll in and out.
+pub(crate) fn edge_rows(
+    snap: &BufferSnapshot,
+    config: &ViewportConfig,
+    drawn: &[VisibleLine],
+    margin: usize,
+) -> [Vec<VisibleLine>; 2] {
+    // Wrap row `wrap` of `line`, as `compute_layout` builds it.
+    let row = |line: usize, wrap: usize, y_px: f32| {
+        let rows = config.wrap_rows(snap, line);
+        let text = snap.line(line);
+        let len = text.len_chars();
+        let (start, end) = if config.word_wrap {
+            (rows.start(wrap), rows.end(wrap))
+        } else {
+            let end = config.left_col.saturating_add(config.columns()).min(len);
+            (config.left_col, end)
+        };
+        VisibleLine {
+            line_index: line,
+            is_continuation: wrap > 0,
+            continues: wrap + 1 < rows.count(),
+            start_col: start,
+            end_col: end,
+            text: text.slice(start.min(len)..end).to_string(),
+            y_px,
+        }
+    };
+    // Which wrap row of its line a drawn row is; without wrapping every line is one row.
+    let wrap_of = |l: &VisibleLine| {
+        if config.word_wrap {
+            config.wrap_rows(snap, l.line_index).row_of(l.start_col)
+        } else {
+            0
+        }
+    };
+    let count = |line: usize| config.wrap_rows(snap, line).count();
+    let before = |(line, wrap): (usize, usize)| match wrap {
+        0 if line == 0 => None,
+        0 => Some((line - 1, count(line - 1) - 1)),
+        wrap => Some((line, wrap - 1)),
+    };
+    let after = |(line, wrap): (usize, usize)| {
+        if wrap + 1 < count(line) {
+            Some((line, wrap + 1))
+        } else if line + 1 < snap.total_lines {
+            Some((line + 1, 0))
+        } else {
+            None
+        }
+    };
+    let step = config.line_height_px;
+    let mut above = Vec::new();
+    if let Some(first) = drawn.first() {
+        let mut at = (first.line_index, wrap_of(first));
+        for i in 1..=margin {
+            let Some(next) = before(at) else {
+                break;
+            };
+            above.push(row(next.0, next.1, first.y_px - step * i as f32));
+            at = next;
+        }
+        above.reverse();
+    }
+    let mut below = Vec::new();
+    if let Some(last) = drawn.last() {
+        let mut at = (last.line_index, wrap_of(last));
+        for i in 1..=margin {
+            let Some(next) = after(at) else {
+                break;
+            };
+            below.push(row(next.0, next.1, last.y_px + step * i as f32));
+            at = next;
+        }
+    }
+    [above, below]
+}
+
+/// The rows lace selects over, top to bottom: the hidden rows above, the drawn rows
+/// and the hidden rows below.
+pub(crate) fn lace_rows<'a>(
+    edges: &'a [Vec<VisibleLine>; 2],
+    drawn: &'a [VisibleLine],
+) -> Vec<Row<'a>> {
+    edges[0]
+        .iter()
+        .chain(drawn)
+        .chain(&edges[1])
+        .map(|l| Row {
+            line: l.line_index,
+            start_col: l.start_col,
+            text: &l.text,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lace_at_the_window_edges_does_not_depend_on_the_rows_beyond_them() {
+        use crate::lace::{
+            layer::{select, Placed, Settings},
+            table::{Relation, Tables},
+            vectorize::FaceMetrics,
+        };
+        use texted_app::{appearance::FontFamily, bitmap_fonts::face};
+        const WORDS: [&str; 12] = [
+            "листопад",
+            "щастя",
+            "ступінь",
+            "пташка",
+            "плетиво",
+            "мереживо",
+            "office",
+            "fifth",
+            "staff",
+            "lattice",
+            "thrifty",
+            "first",
+        ];
+        let text = (0..14)
+            .map(|i| {
+                (0..9)
+                    .map(|k| WORDS[(i * 5 + k * 7) % WORDS.len()])
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let snapshot = texted_buffer::TextBuffer::from_string(text).create_snapshot();
+        let font = FontEngine::new(16.0);
+        let vga = face(FontFamily::Vga);
+        let glyphs = |c| vga.glyph(c).map(<[u8]>::to_vec);
+        let metrics = FaceMetrics::measure(glyphs, vga.width, vga.height).unwrap();
+        let mut tables = Tables::new(metrics, false, [8, 16]);
+        let settings = Settings {
+            density: 1.0,
+            spacing: 1,
+            seed: 3,
+        };
+        // A frame `rows` rows tall whose top is (line, wrap row).
+        let frame = |wrap: bool, top: (usize, usize), rows: usize| {
+            let mut viewport = Viewport::new(|| {});
+            (viewport.wrap, viewport.top_line, viewport.top_wrap_row) = (wrap, top.0, top.1);
+            let bar = if wrap { 0 } else { BAR_HEIGHT };
+            viewport.prepare(&snapshot, &font, 400, rows * 16 + bar)
+        };
+        type Joined = ((usize, usize), (usize, usize), usize, Relation, usize);
+        let id = |l: &VisibleLine| (l.line_index, l.start_col);
+        // Every connection as (upper row, lower row, column, relation, entry), filling
+        // the tables until nothing is missing.
+        let joined = |f: &Frame, tables: &mut Tables| -> Vec<Joined> {
+            let edges = edge_rows(&snapshot, &f.config, &f.layout.visible_lines, LACE_MARGIN);
+            let rows = lace_rows(&edges, &f.layout.visible_lines);
+            let row_id = |r: &Row| (r.line, r.start_col);
+            loop {
+                let selection = select(&rows, tables, &settings);
+                if selection.missing.is_empty() {
+                    let below = |p: &Placed| match p.rel {
+                        Relation::H | Relation::S(_) => p.row,
+                        _ => p.row + 1,
+                    };
+                    let mut out: Vec<Joined> = selection
+                        .placed
+                        .iter()
+                        .map(|p| {
+                            (
+                                row_id(&rows[p.row]),
+                                row_id(&rows[below(p)]),
+                                p.col,
+                                p.rel,
+                                std::sync::Arc::as_ptr(&p.entry) as usize,
+                            )
+                        })
+                        .collect();
+                    out.sort();
+                    return out;
+                }
+                for need in selection.missing {
+                    tables.supply(need, &glyphs);
+                }
+            }
+        };
+        let (mut across_top, mut across_bottom) = (0, 0);
+        let m = LACE_MARGIN;
+        // Every top whose wider frame still ends before the last line.
+        let tops =
+            (0..5).flat_map(|line| [(true, (line, 0)), (true, (line, 1)), (false, (line, 0))]);
+        for (wrap, top) in tops {
+            let n = 6;
+            // `wide` shows `m` rows more above and below than `narrow`.
+            let wide = frame(wrap, top, n + 2 * m);
+            let start = &wide.layout.visible_lines[m];
+            let wrap_row = if wrap {
+                wide.config
+                    .wrap_rows(&snapshot, start.line_index)
+                    .row_of(start.start_col)
+            } else {
+                0
+            };
+            let narrow = frame(wrap, (start.line_index, wrap_row), n);
+            let rows = &narrow.layout.visible_lines;
+            assert_eq!(rows.len(), n);
+            assert_eq!(id(&rows[0]), id(start));
+            // The hidden rows are the rows `wide` shows there, line heights away.
+            let edges = edge_rows(&snapshot, &narrow.config, rows, m);
+            let shown = &wide.layout.visible_lines;
+            assert_eq!((edges[0].len(), edges[1].len()), (m, m));
+            let hidden = edges[0].iter().zip(0..).chain(edges[1].iter().zip(n + m..));
+            for (edge, at) in hidden {
+                let mut edge = edge.clone();
+                assert_eq!(edge.y_px, (at as f32 - m as f32) * 16.0);
+                edge.y_px = shown[at].y_px;
+                assert_eq!(format!("{edge:?}"), format!("{:?}", shown[at]));
+            }
+            let (first, last) = (id(&rows[0]), id(&rows[n - 1]));
+            let touching = |j: &Joined| [j.0, j.1].iter().any(|r| *r == first || *r == last);
+            let a: Vec<Joined> = joined(&narrow, &mut tables)
+                .into_iter()
+                .filter(touching)
+                .collect();
+            let b: Vec<Joined> = joined(&wide, &mut tables)
+                .into_iter()
+                .filter(touching)
+                .collect();
+            assert_eq!(a, b, "wrap {wrap}, top {top:?}");
+            across_top += a.iter().filter(|j| j.1 == first && j.0 != first).count();
+            across_bottom += a.iter().filter(|j| j.0 == last && j.1 != last).count();
+        }
+        assert!(
+            across_top > 0 && across_bottom > 0,
+            "{across_top} {across_bottom}"
+        );
+    }
     #[test]
     fn caret_at_the_end_of_a_long_word_wrapped_line_scrolls_into_view() {
         // Rows end at spaces, so this line takes more rows than characters / columns.

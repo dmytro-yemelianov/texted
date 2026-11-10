@@ -685,6 +685,53 @@ const EFFECTS_MODEL: u8 = 2;
 fn wallpaper_model() -> u8 {
     1
 }
+/// The lace layer: connecting strokes drawn below the text, off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LaceSettings {
+    pub enabled: bool,
+    /// How many of the possible connections are drawn, 0 to 1.
+    pub density: f32,
+    /// How opaque the strokes are, 0.05 to 1.
+    pub strength: f32,
+    /// Cells between connections, 1 to 3.
+    pub spacing: u8,
+    /// Whether serifs take part in connections.
+    pub serifs: bool,
+    /// Which pattern of connections, 1 to 32.
+    pub seed: u32,
+}
+impl Default for LaceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            density: 0.6,
+            strength: 0.35,
+            spacing: 1,
+            serifs: false,
+            seed: 1,
+        }
+    }
+}
+impl LaceSettings {
+    pub fn normalized(self) -> Self {
+        let d = Self::default();
+        let finite = |v: f32, low: f32, high: f32, fallback: f32| {
+            if v.is_finite() {
+                v.clamp(low, high)
+            } else {
+                fallback
+            }
+        };
+        Self {
+            density: finite(self.density, 0.0, 1.0, d.density),
+            strength: finite(self.strength, 0.05, 1.0, d.strength),
+            spacing: self.spacing.clamp(1, 3),
+            seed: self.seed.clamp(1, 32),
+            ..self
+        }
+    }
+}
 /// Everything the Visuals page sets; saved in appearance.json.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -707,6 +754,8 @@ pub struct Visuals {
     /// Chrome panel inset: room around the document text in font pixels (0 to 8).
     pub inset_x: u8,
     pub inset_y: u8,
+    /// The lace layer's settings.
+    pub lace: LaceSettings,
 }
 impl Default for Visuals {
     fn default() -> Self {
@@ -722,6 +771,7 @@ impl Default for Visuals {
             corner_inset: 16,
             inset_x: 0,
             inset_y: 0,
+            lace: LaceSettings::default(),
         }
     }
 }
@@ -758,6 +808,7 @@ impl Visuals {
             corner_inset: v.corner_inset.min(32),
             inset_x: v.inset_x.min(8),
             inset_y: v.inset_y.min(8),
+            lace: v.lace.normalized(),
             ..v
         }
     }
@@ -794,6 +845,22 @@ impl Visuals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lace_settings_are_clamped() {
+        let wild = |f: fn(&mut LaceSettings)| {
+            let mut v = Visuals::default();
+            f(&mut v.lace);
+            v.normalized().lace
+        };
+        assert_eq!(wild(|l| l.density = 3.0).density, 1.0);
+        assert_eq!(wild(|l| l.strength = 0.0).strength, 0.05);
+        assert_eq!(wild(|l| l.spacing = 9).spacing, 3);
+        assert_eq!(wild(|l| l.spacing = 0).spacing, 1);
+        assert_eq!(wild(|l| l.seed = 0).seed, 1);
+        assert_eq!(wild(|l| l.seed = 99).seed, 32);
+        assert_eq!(wild(|l| l.density = f32::NAN).density, 0.6);
+        assert_eq!(wild(|l| l.strength = f32::INFINITY).strength, 0.35);
+    }
     #[test]
     fn effect_rows_use_pixel_ssh_dithergl_and_wallpaper_ranges() {
         let rows = [

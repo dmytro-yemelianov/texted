@@ -661,6 +661,20 @@ mod tests {
         assert_eq!(again.visuals(), v);
     }
     #[test]
+    fn files_from_before_lace_load_with_it_off() {
+        use crate::visuals::LaceSettings;
+        let json = r#"{"theme":"atari","framebuffer":"mono_text","visuals":{"fps":14,"time":null,
+            "effects":{"brightness":0.96,"curvature":0.014,"chromatic_aberration":0.18,
+            "afterglow":0.12,"noise":0.55,"flicker":0.45,"scanlines":0.42},"shadow":true,
+            "shadow_x":3,"shadow_y":1,"border":"single","corner_inset":9,"inset_x":2,"inset_y":5}}"#;
+        let old: Appearance = serde_json::from_str(json).unwrap();
+        assert_eq!(old.visuals().lace, LaceSettings::default());
+        assert!(!old.visuals().lace.enabled);
+        let mut saved = old.clone();
+        saved.normalize().unwrap();
+        assert!(!saved.visuals().lace.enabled);
+    }
+    #[test]
     fn future_versions_unknown_colors_and_invalid_rgb_are_rejected() {
         let mut a = Appearance {
             version: 2,
